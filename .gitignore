@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Lean 4 / Lake / Pantograph
+.lake/
+*.olean
+*.ilean
+*.trace
+
+# Large generated model & index artifacts (keep .gitkeep & schemas)
+artifacts/*.onnx
+artifacts/*.safetensors
+artifacts/*.vdb
+artifacts/*.bin
+artifacts/*.pt
+!artifacts/.gitkeep
+!artifacts/*.schema.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
