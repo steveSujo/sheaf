@@ -38,8 +38,97 @@ pub enum CanonicalizerError {
 }
 
 /// Replace bound and local variable names with positional tokens (`_v0`, `_v1`, ...).
-pub fn normalize_alpha_vars(_hypotheses: &[String], _target: &str) -> (Vec<String>, String) {
-    todo!("TASK-M0-001: implement positional alpha-variable normalization")
+pub fn normalize_alpha_vars(hypotheses: &[String], target: &str) -> (Vec<String>, String) {
+    use std::collections::HashMap;
+
+    let mut var_map: HashMap<String, String> = HashMap::new();
+
+    // 1. Register local hypothesis names (e.g., "x : Nat" -> "x")
+    for hyp in hypotheses {
+        if let Some((lhs, _)) = hyp.split_once(':') {
+            for name in lhs.split_whitespace() {
+                if is_ident_start(name) && !var_map.contains_key(name) {
+                    let idx = var_map.len();
+                    var_map.insert(name.to_string(), format!("_v{idx}"));
+                }
+            }
+        }
+    }
+
+    // 2. Register bound variables in quantifiers like "∀ (n m : Nat), ..."
+    register_quantifier_binders(target, &mut var_map);
+
+    let norm_hyps = hypotheses
+        .iter()
+        .map(|h| replace_idents(h, &var_map))
+        .collect();
+    let norm_target = replace_idents(target, &var_map);
+    (norm_hyps, norm_target)
+}
+
+fn is_ident_start(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.' || c == '\'' || c == '✝'
+}
+
+fn register_quantifier_binders(expr: &str, var_map: &mut std::collections::HashMap<String, String>) {
+    let mut rest = expr;
+    while let Some(pos) = rest.find(['∀', '∃']) {
+        let after = &rest[pos..];
+        let mut chars = after.chars();
+        chars.next(); // skip quantifier
+        let tail = chars.as_str().trim_start();
+        if let Some(after_paren) = tail.strip_prefix('(')
+            && let Some(close) = after_paren.find(')')
+        {
+            let binder_group = &after_paren[..close];
+            if let Some((lhs, _)) = binder_group.split_once(':') {
+                for name in lhs.split_whitespace() {
+                    if is_ident_start(name) && !var_map.contains_key(name) {
+                        let idx = var_map.len();
+                        var_map.insert(name.to_string(), format!("_v{idx}"));
+                    }
+                }
+            }
+            rest = &after_paren[close + 1..];
+            continue;
+        }
+        rest = tail;
+    }
+}
+
+fn replace_idents(expr: &str, var_map: &std::collections::HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.char_indices().peekable();
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_alphabetic() || ch == '_' {
+            let mut end = start + ch.len_utf8();
+            chars.next();
+            while let Some(&(idx, next_ch)) = chars.peek() {
+                if is_ident_char(next_ch) {
+                    end = idx + next_ch.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let ident = &expr[start..end];
+            if let Some(mapped) = var_map.get(ident) {
+                out.push_str(mapped);
+            } else {
+                out.push_str(ident);
+            }
+        } else {
+            out.push(ch);
+            chars.next();
+        }
+    }
+    out
 }
 
 /// Collapse auto-generated hygienic typeclass instances (`inst✝`, `_inst_2`) to `[_]`.
@@ -94,7 +183,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-001"]
     fn test_alpha_equivalence_normalization() {
         let hyps_a = vec!["x : Nat".to_string(), "y : Nat".to_string()];
         let target_a = "Nat.add x y = Nat.add y x";
