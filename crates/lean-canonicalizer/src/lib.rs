@@ -132,8 +132,41 @@ fn replace_idents(expr: &str, var_map: &std::collections::HashMap<String, String
 }
 
 /// Collapse auto-generated hygienic typeclass instances (`inst✝`, `_inst_2`) to `[_]`.
-pub fn collapse_implicit_instances(_expr: &str) -> String {
-    todo!("TASK-M0-002: implement implicit instance collapsing")
+pub fn collapse_implicit_instances(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut chars = expr.char_indices().peekable();
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_alphabetic() || ch == '_' {
+            let mut end = start + ch.len_utf8();
+            chars.next();
+            while let Some(&(idx, next_ch)) = chars.peek() {
+                if is_ident_char(next_ch) || is_superscript_digit(next_ch) {
+                    end = idx + next_ch.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let ident = &expr[start..end];
+            if is_hygienic_instance(ident) {
+                out.push_str("[_]");
+            } else {
+                out.push_str(ident);
+            }
+        } else {
+            out.push(ch);
+            chars.next();
+        }
+    }
+    out
+}
+
+fn is_superscript_digit(c: char) -> bool {
+    matches!(c, '⁰' | '¹' | '²' | '³' | '⁴' | '⁵' | '⁶' | '⁷' | '⁸' | '⁹')
+}
+
+fn is_hygienic_instance(ident: &str) -> bool {
+    ident.starts_with("inst✝") || ident.starts_with("_inst_")
 }
 
 /// Extract the `head_symbol` of target type `T` after stripping leading `∀` / `→`.
@@ -201,7 +234,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-002"]
     fn test_collapse_implicit_instances() {
         let collapsed = collapse_implicit_instances("@HAdd.hAdd α α α inst✝ _v0 _v0 = _v0");
         assert_eq!(collapsed, "@HAdd.hAdd α α α [_] _v0 _v0 = _v0");
