@@ -170,8 +170,67 @@ fn is_hygienic_instance(ident: &str) -> bool {
 }
 
 /// Extract the `head_symbol` of target type `T` after stripping leading `∀` / `→`.
-pub fn extract_head_symbol(_target: &str) -> Result<HeadSymbol, CanonicalizerError> {
-    todo!("TASK-M0-003: implement target head_symbol extraction")
+pub fn extract_head_symbol(target: &str) -> Result<HeadSymbol, CanonicalizerError> {
+    let mut s = target.trim();
+    if s.is_empty() {
+        return Err(CanonicalizerError::EmptyTarget);
+    }
+
+    // Strip leading `∀ ...,` binders
+    loop {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with('∀')
+            && let Some(comma_idx) = trimmed.find(',')
+        {
+            s = trimmed[comma_idx + 1..].trim_start();
+            continue;
+        }
+        break;
+    }
+
+    // Strip top-level `... →` implications
+    if let Some(arrow_idx) = find_top_level_char(s, '→') {
+        s = s[arrow_idx + '→'.len_utf8()..].trim_start();
+    }
+
+    // Check top-level infix relation operators
+    for (op, name) in [
+        ('=', "Eq"),
+        ('≤', "LE.le"),
+        ('<', "LT.lt"),
+        ('≥', "GE.ge"),
+        ('>', "GT.gt"),
+        ('∈', "Membership.mem"),
+    ] {
+        if find_top_level_char(s, op).is_some() {
+            return Ok(HeadSymbol::Named(name.to_string()));
+        }
+    }
+
+    // Otherwise read leading identifier
+    let ident_end = s
+        .char_indices()
+        .find(|&(_, c)| !is_ident_char(c))
+        .map_or(s.len(), |(i, _)| i);
+    let head = &s[..ident_end];
+    if head.is_empty() || head.starts_with("_v") {
+        Ok(HeadSymbol::Polymorphic)
+    } else {
+        Ok(HeadSymbol::Named(head.to_string()))
+    }
+}
+
+fn find_top_level_char(s: &str, target: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            c if c == target && depth == 0 => return Some(idx),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Prune hypotheses in `Γ` with zero symbol overlap with `T` when token count exceeds `max_tokens`.
@@ -242,7 +301,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-003"]
     fn test_extract_head_symbol() {
         assert_eq!(
             extract_head_symbol("Nat.add _v0 _v1 = Nat.add _v1 _v0").unwrap(),
