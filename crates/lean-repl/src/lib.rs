@@ -41,13 +41,42 @@ pub enum ReplError {
 }
 
 /// Return `true` if two goals share at least one metavariable.
-pub fn are_goals_coupled(_a: &Goal, _b: &Goal) -> bool {
-    todo!("TASK-M0-005: implement metavariable intersection check")
+pub fn are_goals_coupled(a: &Goal, b: &Goal) -> bool {
+    a.metavars.iter().any(|m| b.metavars.contains(m))
 }
 
 /// Partition goals into connected components: coupled goals are `Sequential`, isolated are `Independent`.
-pub fn partition_coupled_goals(_goals: &[Goal]) -> Vec<GoalGroup> {
-    todo!("TASK-M0-005: implement metavariable coupling partition")
+pub fn partition_coupled_goals(goals: &[Goal]) -> Vec<GoalGroup> {
+    let n = goals.len();
+    let mut visited = vec![false; n];
+    let mut groups = Vec::new();
+
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = Vec::new();
+        visited[start] = true;
+
+        while let Some(u) = stack.pop() {
+            component.push(goals[u].clone());
+            for v in 0..n {
+                if !visited[v] && are_goals_coupled(&goals[u], &goals[v]) {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+
+        if component.len() == 1 {
+            groups.push(GoalGroup::Independent(component.into_iter().next().unwrap()));
+        } else {
+            groups.push(GoalGroup::Sequential(component));
+        }
+    }
+
+    groups
 }
 
 /// Generic Pantograph JSON-RPC session over buffered stdio streams.
@@ -105,7 +134,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-005"]
     fn test_metavariable_coupling_partition() {
         let g0 = Goal {
             goal_id: "g_0".into(),
