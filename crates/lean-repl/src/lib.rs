@@ -98,11 +98,26 @@ impl<R: BufRead, W: Write> PantographSession<R, W> {
     /// Execute a tactic on `(state_id, goal_id)` and return the resulting `ProofState`.
     pub fn execute_tactic(
         &mut self,
-        _state_id: u64,
-        _goal_id: &str,
-        _tactic: &str,
+        state_id: u64,
+        goal_id: &str,
+        tactic: &str,
     ) -> Result<ProofState, ReplError> {
-        todo!("TASK-M0-006: implement Pantograph JSON-RPC tactic execution")
+        let req = serde_json::json!({
+            "cmd": "goal.tactic",
+            "payload": {
+                "stateId": state_id,
+                "goalId": goal_id,
+                "tactic": tactic,
+            }
+        });
+        serde_json::to_writer(&mut self.writer, &req)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+
+        let mut line = String::new();
+        self.reader.read_line(&mut line)?;
+        let state: ProofState = serde_json::from_str(line.trim())?;
+        Ok(state)
     }
 }
 
@@ -171,7 +186,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-006"]
     fn test_pantograph_jsonrpc_state_deserialization_and_step() {
         let mock_response = b"{\"state_id\":43,\"goals\":[]}\n";
         let reader = Cursor::new(mock_response.as_slice());
