@@ -122,8 +122,12 @@ impl<R: BufRead, W: Write> PantographSession<R, W> {
 }
 
 /// Parse `#print axioms` output and reject proofs containing `sorryAx`.
-pub fn verify_zero_sorry(_print_axioms_output: &str) -> Result<bool, ReplError> {
-    todo!("TASK-M0-007: implement zero-sorry axiom verification")
+pub fn verify_zero_sorry(print_axioms_output: &str) -> Result<bool, ReplError> {
+    if print_axioms_output.contains("sorryAx") {
+        Err(ReplError::SorryAxiomDetected)
+    } else {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -197,7 +201,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-007"]
     fn test_verify_zero_sorry_axioms() {
         assert!(verify_zero_sorry("'thm' depends on axioms: [propext, Quot.sound]").unwrap());
         let err = verify_zero_sorry("'thm' depends on axioms: [propext, sorryAx]").unwrap_err();
