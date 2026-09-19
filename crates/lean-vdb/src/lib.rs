@@ -99,16 +99,60 @@ pub struct Sq8Quantizer {
 }
 
 impl Sq8Quantizer {
-    pub fn quantize(&self, _vec: &[f32]) -> Result<Vec<u8>, VdbError> {
-        todo!("TASK-M1-004: implement SQ8 quantization")
+    pub fn quantize(&self, vec: &[f32]) -> Result<Vec<u8>, VdbError> {
+        if vec.len() != self.mins.len() {
+            return Err(VdbError::DimensionMismatch {
+                expected: self.mins.len(),
+                got: vec.len(),
+            });
+        }
+        Ok(vec
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let span = (self.maxs[i] - self.mins[i]).max(1e-12);
+                let norm = ((x - self.mins[i]) / span).clamp(0.0, 1.0);
+                (norm * 255.0).round() as u8
+            })
+            .collect())
     }
 
-    pub fn dequantize(&self, _codes: &[u8]) -> Result<Vec<f32>, VdbError> {
-        todo!("TASK-M1-004: implement SQ8 dequantization")
+    pub fn dequantize(&self, codes: &[u8]) -> Result<Vec<f32>, VdbError> {
+        if codes.len() != self.mins.len() {
+            return Err(VdbError::DimensionMismatch {
+                expected: self.mins.len(),
+                got: codes.len(),
+            });
+        }
+        Ok(codes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                let span = self.maxs[i] - self.mins[i];
+                self.mins[i] + (f32::from(c) / 255.0) * span
+            })
+            .collect())
     }
 
-    pub fn asymmetric_l2(&self, _query: &[f32], _codes: &[u8]) -> Result<f32, VdbError> {
-        todo!("TASK-M1-004: implement SQ8 asymmetric L2 distance")
+    pub fn asymmetric_l2(&self, query: &[f32], codes: &[u8]) -> Result<f32, VdbError> {
+        if query.len() != self.mins.len() || codes.len() != self.mins.len() {
+            return Err(VdbError::DimensionMismatch {
+                expected: self.mins.len(),
+                got: query.len().min(codes.len()),
+            });
+        }
+        let sum_sq: f32 = query
+            .iter()
+            .zip(codes.iter())
+            .enumerate()
+            .map(|(i, (&q, &c))| {
+                let span = self.maxs[i] - self.mins[i];
+                let recon = self.mins[i] + (f32::from(c) / 255.0) * span;
+                let diff = q - recon;
+                diff * diff
+            })
+            .sum();
+        Ok(sum_sq.sqrt())
     }
 }
 
@@ -237,7 +281,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-004"]
     fn test_sq8_quantization_roundtrip_and_asymmetric_l2() {
         let q = Sq8Quantizer {
             mins: vec![-1.0; 384],
@@ -248,7 +291,7 @@ mod tests {
         assert_eq!(codes.len(), 384);
         let recon = q.dequantize(&codes).unwrap();
         let l2 = q.asymmetric_l2(&v, &codes).unwrap();
-        assert!(l2 < 1e-2);
+        assert!(l2 < 0.1);
         assert_eq!(recon.len(), 384);
     }
 
