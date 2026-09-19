@@ -80,11 +80,14 @@ impl ImportResolver {
     /// Combine syntactic closure, VDB top-16 modules, and core tactic pack, then reduce via DAG.
     pub fn resolve_preflight_modules(
         &self,
-        _theorem_stmt: &str,
-        _vdb_hit_modules: &[String],
-        _core_tactic_pack: &[String],
+        theorem_stmt: &str,
+        vdb_hit_modules: &[String],
+        core_tactic_pack: &[String],
     ) -> Vec<String> {
-        todo!("TASK-M1-003: implement two-stage pre-flight dynamic module selector")
+        let mut union = self.resolve_syntactic_modules(theorem_stmt);
+        union.extend(vdb_hit_modules.iter().cloned());
+        union.extend(core_tactic_pack.iter().cloned());
+        self.reduce_import_dag(&union)
     }
 }
 
@@ -210,7 +213,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-003"]
     fn test_preflight_dynamic_module_selection() {
         let mut resolver = ImportResolver::default();
         resolver
