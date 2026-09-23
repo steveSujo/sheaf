@@ -213,13 +213,35 @@ pub struct EpisodicCache {
 }
 
 impl EpisodicCache {
-    pub fn check_or_insert(&mut self, _state_emb: &[f32]) -> EpisodicHit {
-        todo!("TASK-M1-007: implement episodic cache >0.98 cosine loop pruning")
+    pub fn check_or_insert(&mut self, state_emb: &[f32]) -> EpisodicHit {
+        for (visited_emb, solved_script) in &self.entries {
+            if cosine_sim(state_emb, visited_emb) > EPISODIC_LOOP_THRESHOLD {
+                return match solved_script {
+                    Some(script) => EpisodicHit::Solved(script.clone()),
+                    None => EpisodicHit::PruneLoop,
+                };
+            }
+        }
+        self.entries.push((state_emb.to_vec(), None));
+        EpisodicHit::Novel
     }
 
-    pub fn mark_solved(&mut self, _state_emb: Vec<f32>, _proof_script: Vec<String>) {
-        todo!("TASK-M1-007: implement episodic cache mark_solved")
+    pub fn mark_solved(&mut self, state_emb: Vec<f32>, proof_script: Vec<String>) {
+        self.entries.push((state_emb, Some(proof_script)));
     }
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = (norm_a.sqrt() * norm_b.sqrt()).max(1e-12);
+    dot / denom
 }
 
 #[cfg(test)]
@@ -348,7 +370,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-007"]
     fn test_episodic_subgoal_cache_loop_pruning() {
         let mut cache = EpisodicCache::default();
         let s1 = vec![1.0, 0.0, 0.0];
