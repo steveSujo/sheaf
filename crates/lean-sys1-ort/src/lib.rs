@@ -106,10 +106,53 @@ pub fn encode_canonical_text(
 
 /// Apply scalar temperature calibration and route based on `max(p) >= 0.50`.
 pub fn route_with_confidence_gate(
-    _choice_logits: &[f32; 5],
-    _t_choice: f32,
+    choice_logits: &[f32; 5],
+    t_choice: f32,
 ) -> (StrategyChoice, f32, GateDecision) {
-    todo!("TASK-M3-001: implement calibrated <0.50 confidence gate")
+    let temp = t_choice.max(1e-6);
+    let mut scaled = [0.0_f32; 5];
+    let mut max_val = f32::NEG_INFINITY;
+    for (i, &logit) in choice_logits.iter().enumerate() {
+        let s = logit / temp;
+        scaled[i] = s;
+        if s > max_val {
+            max_val = s;
+        }
+    }
+
+    let mut exps = [0.0_f32; 5];
+    let mut sum_exp = 0.0_f32;
+    for (i, &s) in scaled.iter().enumerate() {
+        let e = (s - max_val).exp();
+        exps[i] = e;
+        sum_exp += e;
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_prob = -1.0_f32;
+    for (i, &e) in exps.iter().enumerate() {
+        let p = e / sum_exp;
+        if p > best_prob {
+            best_prob = p;
+            best_idx = i;
+        }
+    }
+
+    let strategy = match best_idx {
+        0 => StrategyChoice::AtomicClose,
+        1 => StrategyChoice::Rewrite,
+        2 => StrategyChoice::ApplyLemma,
+        3 => StrategyChoice::IntroduceHave,
+        _ => StrategyChoice::Induction,
+    };
+
+    let decision = if best_prob >= CONFIDENCE_GATE_THRESHOLD {
+        GateDecision::DirectExecute(strategy)
+    } else {
+        GateDecision::FallbackToLeJepa
+    };
+
+    (strategy, best_prob, decision)
 }
 
 /// Borrowed 2-layer MLP weights for the `PremiseFit` 4d interaction head.
@@ -156,7 +199,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M3-001"]
     fn test_confidence_gate_routing_decision() {
         let high = [2.5, 0.5, 0.1, -0.5, -0.5];
         let (strat, conf, decision) = route_with_confidence_gate(&high, 1.0);
