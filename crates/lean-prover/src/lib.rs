@@ -108,10 +108,15 @@ pub fn build_pda_logit_mask(
 
 /// Detect whether `required_module` is absent from `active_modules` and return the expanded module list.
 pub fn plan_prefix_replay_modules(
-    _active_modules: &[String],
-    _required_module: &str,
+    active_modules: &[String],
+    required_module: &str,
 ) -> Option<Vec<String>> {
-    todo!("TASK-M4-003: implement mid-proof missing module detection and prefix-replay plan")
+    if active_modules.iter().any(|m| m == required_module) {
+        return None;
+    }
+    let mut expanded = active_modules.to_vec();
+    expanded.push(required_module.to_string());
+    Some(expanded)
 }
 
 /// Allow at most 1 error-conditioned repair retry per branch.
@@ -162,7 +167,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M4-003"]
     fn test_mid_proof_missing_module_prefix_replay() {
         let active = vec!["Init".to_string(), "Mathlib.Data.Nat.Basic".to_string()];
         assert!(plan_prefix_replay_modules(&active, "Init").is_none());
