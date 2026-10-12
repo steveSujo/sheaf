@@ -120,8 +120,12 @@ pub fn plan_prefix_replay_modules(
 }
 
 /// Allow at most 1 error-conditioned repair retry per branch.
-pub fn evaluate_error_repair(_retry_count: u8, _diagnostic: &str) -> RepairDecision {
-    todo!("TASK-M4-004: implement single-retry error-conditioned diagnostic repair")
+pub fn evaluate_error_repair(retry_count: u8, diagnostic: &str) -> RepairDecision {
+    if retry_count == 0 {
+        RepairDecision::RetryWithDiagnostic(diagnostic.to_string())
+    } else {
+        RepairDecision::MarkBranchFailed
+    }
 }
 
 /// Run Best-First proof search with episodic memoization and zero-sorry axiom check.
@@ -175,7 +179,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M4-004"]
     fn test_error_conditioned_single_retry_repair() {
         assert_eq!(
             evaluate_error_repair(0, "type mismatch"),
