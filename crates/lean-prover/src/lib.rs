@@ -437,6 +437,55 @@ pub fn prove_and_verify_with_lean4(
     Err(ProverError::SearchBudgetExhausted)
 }
 
+/// Paths to bootstrapped runtime artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactPaths {
+    pub tokenizer_json: std::path::PathBuf,
+    pub temperatures_json: std::path::PathBuf,
+    pub mathlib_vdb: std::path::PathBuf,
+}
+
+/// Discovered `sorry` theorem inside a `.lean` file or `lake` workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredTheorem {
+    pub file: std::path::PathBuf,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub signature: String,
+}
+
+/// Summary of proving all `sorry` theorems in a `.lean` file or workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceProveSummary {
+    pub discovered: usize,
+    pub proved: usize,
+    pub failed: usize,
+    pub proved_names: Vec<String>,
+}
+
+/// Bootstrap baseline `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` into `artifact_dir`.
+pub fn init_default_artifacts(_artifact_dir: &std::path::Path) -> Result<ArtifactPaths, ProverError> {
+    todo!("TASK-M5-003: implement init_default_artifacts")
+}
+
+/// Recursively scan a `.lean` file or `lake` workspace (skipping `.lake/`) for `sorry` theorems.
+pub fn discover_sorry_theorems(_path: &std::path::Path) -> Result<Vec<DiscoveredTheorem>, ProverError> {
+    todo!("TASK-M5-004: implement discover_sorry_theorems")
+}
+
+/// Prove all discovered `sorry` theorems in `path`, kernel-verify them, and optionally write in place.
+pub fn prove_lean_path(
+    _path: &std::path::Path,
+    _write_in_place: bool,
+) -> Result<WorkspaceProveSummary, ProverError> {
+    todo!("TASK-M5-005: implement prove_lean_path")
+}
+
+/// Dispatch CLI arguments for `lean-prover` (`prove`, `check`, `init`, `doctor`, `--help`, `--version`).
+pub fn run_cli_args(_args: &[String]) -> Result<(i32, String), ProverError> {
+    todo!("TASK-M5-006: implement run_cli_args")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +548,85 @@ mod tests {
         let allowed: HashSet<String> = ["Nat.add_comm".to_string()].into_iter().collect();
         let script = prove_theorem_with_allowed_set(&allowed).unwrap();
         assert_eq!(script, vec!["rw [Nat.add_comm]", "omega"]);
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-001"]
+    fn test_orion_dependency_pinned_to_release_tag() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let vdb_toml = std::fs::read_to_string(root.join("crates/lean-vdb/Cargo.toml")).unwrap();
+        let prover_toml =
+            std::fs::read_to_string(root.join("crates/lean-prover/Cargo.toml")).unwrap();
+        assert!(vdb_toml.contains("tag = \"v0.1.0\""));
+        assert!(prover_toml.contains("tag = \"v0.1.0\""));
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-003"]
+    fn test_init_default_artifacts_bootstraps_missing_files() {
+        let dir = std::env::temp_dir().join("lean_prover_m5_init_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = init_default_artifacts(&dir).unwrap();
+        assert!(paths.tokenizer_json.exists());
+        assert!(paths.temperatures_json.exists());
+        assert!(paths.mathlib_vdb.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-004"]
+    fn test_discover_sorry_theorems_in_file_and_workspace() {
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("eval_workspace/problems");
+        let found = discover_sorry_theorems(&ws).unwrap();
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-005"]
+    fn test_prove_all_five_lean_workspace_theorems_end_to_end() {
+        let dir = std::env::temp_dir().join("lean_prover_m5_theorems_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lean_file = dir.join("Theorems.lean");
+        std::fs::write(
+            &lean_file,
+            "import Init\nnamespace LeanWorkspace\ntheorem add_zero_right (n : Nat) : n + 0 = n := by\n  sorry\ntheorem add_comm_nat (a b : Nat) : a + b = b + a := by\n  sorry\ntheorem list_length_append (xs ys : List Nat) : (xs ++ ys).length = xs.length + ys.length := by\n  sorry\ntheorem and_comm_prop (p q : Prop) (h : p ∧ q) : q ∧ p := by\n  sorry\ntheorem even_square (n : Nat) (h : ∃ k, n = 2 * k) : ∃ m, n * n = 2 * m := by\n  sorry\nend LeanWorkspace\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&lean_file, true).unwrap();
+        assert_eq!(summary.proved, 5);
+        assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-006"]
+    fn test_cli_help_doctor_init_and_prove_commands() {
+        let (code, out) = run_cli_args(&["lean-prover".into(), "--help".into()]).unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("prove"));
+        assert!(out.contains("doctor"));
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M5-007"]
+    fn test_readme_exists_and_documents_cli_commands() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert!(readme.contains("cargo run --"));
+        assert!(readme.contains("uv run python -m lean_composer.preflight"));
     }
 }
