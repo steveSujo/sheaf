@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-orion = { git = "https://github.com/steveSujo/orion.git", branch = "main" }
+orion = { git = "https://github.com/steveSujo/orion.git", tag = "v0.1.0" }

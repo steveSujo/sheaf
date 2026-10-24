@@ -551,7 +551,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M5-001"]
     fn test_orion_dependency_pinned_to_release_tag() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
