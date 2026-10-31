@@ -1,3 +1,10 @@
+# Rough works
+tasks/
+LEAN4_COMPOSER_SPEC.md
+M2_COLAB_TRAINING_SPEC.md
+AGENTS.md
+ROADMAP.md
+
 # Rust
 /target/
 **/*.rs.bk
