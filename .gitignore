@@ -5,6 +5,7 @@ Cargo.lock
 
 # Python / uv
 .venv/
+uv.lock
 __pycache__/
 *.py[cod]
 *$py.class
@@ -21,11 +22,18 @@ build/
 *.trace
 
 # Large generated model & index artifacts (keep .gitkeep & schemas)
+artifacts/shards/
+artifacts/*.jsonl
+artifacts/tokenizer.json
+artifacts/temperatures*.json
 artifacts/*.onnx
 artifacts/*.safetensors
 artifacts/*.vdb
 artifacts/*.bin
 artifacts/*.pt
+*.npy
+*.npz
+*.ckpt
 !artifacts/.gitkeep
 !artifacts/*.schema.json
 

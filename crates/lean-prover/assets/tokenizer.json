@@ -1,0 +1,328 @@
+{
+  "version": "1.0",
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "<pad>",
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<unk>",
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "<s>",
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "</s>",
+      "special": true
+    },
+    {
+      "id": 4,
+      "content": "⊢",
+      "special": true
+    },
+    {
+      "id": 5,
+      "content": "→",
+      "special": true
+    },
+    {
+      "id": 6,
+      "content": "∀",
+      "special": true
+    },
+    {
+      "id": 7,
+      "content": "∃",
+      "special": true
+    },
+    {
+      "id": 8,
+      "content": "=",
+      "special": true
+    },
+    {
+      "id": 9,
+      "content": "≤",
+      "special": true
+    },
+    {
+      "id": 10,
+      "content": "[_]",
+      "special": true
+    },
+    {
+      "id": 11,
+      "content": "_v0",
+      "special": true
+    },
+    {
+      "id": 12,
+      "content": "_v1",
+      "special": true
+    },
+    {
+      "id": 13,
+      "content": "_v2",
+      "special": true
+    },
+    {
+      "id": 14,
+      "content": "_v3",
+      "special": true
+    },
+    {
+      "id": 15,
+      "content": "_v4",
+      "special": true
+    },
+    {
+      "id": 16,
+      "content": "_v5",
+      "special": true
+    },
+    {
+      "id": 17,
+      "content": "_v6",
+      "special": true
+    },
+    {
+      "id": 18,
+      "content": "_v7",
+      "special": true
+    },
+    {
+      "id": 19,
+      "content": "_v8",
+      "special": true
+    },
+    {
+      "id": 20,
+      "content": "_v9",
+      "special": true
+    },
+    {
+      "id": 21,
+      "content": "_v10",
+      "special": true
+    },
+    {
+      "id": 22,
+      "content": "_v11",
+      "special": true
+    },
+    {
+      "id": 23,
+      "content": "_v12",
+      "special": true
+    },
+    {
+      "id": 24,
+      "content": "_v13",
+      "special": true
+    },
+    {
+      "id": 25,
+      "content": "_v14",
+      "special": true
+    },
+    {
+      "id": 26,
+      "content": "_v15",
+      "special": true
+    },
+    {
+      "id": 27,
+      "content": "_v16",
+      "special": true
+    },
+    {
+      "id": 28,
+      "content": "_v17",
+      "special": true
+    },
+    {
+      "id": 29,
+      "content": "_v18",
+      "special": true
+    },
+    {
+      "id": 30,
+      "content": "_v19",
+      "special": true
+    },
+    {
+      "id": 31,
+      "content": "_v20",
+      "special": true
+    },
+    {
+      "id": 32,
+      "content": "_v21",
+      "special": true
+    },
+    {
+      "id": 33,
+      "content": "_v22",
+      "special": true
+    },
+    {
+      "id": 34,
+      "content": "_v23",
+      "special": true
+    },
+    {
+      "id": 35,
+      "content": "_v24",
+      "special": true
+    },
+    {
+      "id": 36,
+      "content": "_v25",
+      "special": true
+    },
+    {
+      "id": 37,
+      "content": "_v26",
+      "special": true
+    },
+    {
+      "id": 38,
+      "content": "_v27",
+      "special": true
+    },
+    {
+      "id": 39,
+      "content": "_v28",
+      "special": true
+    },
+    {
+      "id": 40,
+      "content": "_v29",
+      "special": true
+    },
+    {
+      "id": 41,
+      "content": "_v30",
+      "special": true
+    },
+    {
+      "id": 42,
+      "content": "_v31",
+      "special": true
+    },
+    {
+      "id": 43,
+      "content": "omega",
+      "special": true
+    },
+    {
+      "id": 44,
+      "content": "simp",
+      "special": true
+    },
+    {
+      "id": 45,
+      "content": "aesop",
+      "special": true
+    },
+    {
+      "id": 46,
+      "content": "rw",
+      "special": true
+    },
+    {
+      "id": 47,
+      "content": "apply",
+      "special": true
+    },
+    {
+      "id": 48,
+      "content": "exact",
+      "special": true
+    },
+    {
+      "id": 49,
+      "content": "have",
+      "special": true
+    },
+    {
+      "id": 50,
+      "content": "suffices",
+      "special": true
+    },
+    {
+      "id": 51,
+      "content": "induction",
+      "special": true
+    }
+  ],
+  "model": {
+    "type": "BPE",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<pad>": 0,
+      "<unk>": 1,
+      "<s>": 2,
+      "</s>": 3,
+      "⊢": 4,
+      "→": 5,
+      "∀": 6,
+      "∃": 7,
+      "=": 8,
+      "≤": 9,
+      "[_]": 10,
+      "_v0": 11,
+      "_v1": 12,
+      "_v2": 13,
+      "_v3": 14,
+      "_v4": 15,
+      "_v5": 16,
+      "_v6": 17,
+      "_v7": 18,
+      "_v8": 19,
+      "_v9": 20,
+      "_v10": 21,
+      "_v11": 22,
+      "_v12": 23,
+      "_v13": 24,
+      "_v14": 25,
+      "_v15": 26,
+      "_v16": 27,
+      "_v17": 28,
+      "_v18": 29,
+      "_v19": 30,
+      "_v20": 31,
+      "_v21": 32,
+      "_v22": 33,
+      "_v23": 34,
+      "_v24": 35,
+      "_v25": 36,
+      "_v26": 37,
+      "_v27": 38,
+      "_v28": 39,
+      "_v29": 40,
+      "_v30": 41,
+      "_v31": 42,
+      "omega": 43,
+      "simp": 44,
+      "aesop": 45,
+      "rw": 46,
+      "apply": 47,
+      "exact": 48,
+      "have": 49,
+      "suffices": 50,
+      "induction": 51,
+      ":": 52,
+      "Nat": 53,
+      "+": 54,
+      "0": 55
+    },
+    "merges": []
+  }
+}
