@@ -10,9 +10,13 @@ ROADMAP.md
 **/*.rs.bk
 Cargo.lock
 
-# Python / uv
+# Python / uv / Training
 .venv/
 uv.lock
+pyproject.toml
+python/
+tests/
+scripts/
 __pycache__/
 *.py[cod]
 *$py.class
