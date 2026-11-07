@@ -226,6 +226,99 @@ impl StaticVdbIndex {
         }
         Ok(hits)
     }
+
+    /// Deserialize a `mathlib_sq8.vdb` binary payload (`LVDB` magic, SQ8 scales, codes, and metadata).
+    pub fn from_lvdb_bytes(bytes: &[u8]) -> Result<(Self, ImportResolver), VdbError> {
+        if bytes.len() < 16 || &bytes[0..4] != b"LVDB" {
+            return Err(VdbError::InvalidHeader);
+        }
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let dim = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        if version != 1 || dim == 0 {
+            return Err(VdbError::InvalidHeader);
+        }
+        let mut pos = 16usize;
+        let mut mins = Vec::with_capacity(dim);
+        let mut maxs = Vec::with_capacity(dim);
+        let mut codes = Vec::with_capacity(count);
+        if count > 0 {
+            let scale_bytes = dim * 4;
+            if pos + 2 * scale_bytes > bytes.len() {
+                return Err(VdbError::InvalidHeader);
+            }
+            for chunk in bytes[pos..pos + scale_bytes].chunks_exact(4) {
+                mins.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            pos += scale_bytes;
+            for chunk in bytes[pos..pos + scale_bytes].chunks_exact(4) {
+                maxs.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            pos += scale_bytes;
+            if pos + count * dim > bytes.len() {
+                return Err(VdbError::InvalidHeader);
+            }
+            for _ in 0..count {
+                codes.push(bytes[pos..pos + dim].to_vec());
+                pos += dim;
+            }
+        } else {
+            mins.resize(dim, 0.0);
+            maxs.resize(dim, 1.0);
+        }
+
+        let mut metadata = Vec::new();
+        let mut resolver = ImportResolver::default();
+        if pos + 4 <= bytes.len() {
+            let meta_len =
+                u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            pos += 4;
+            if pos + meta_len <= bytes.len() {
+                let meta_val: serde_json::Value = serde_json::from_slice(&bytes[pos..pos + meta_len])
+                    .map_err(|_| VdbError::InvalidHeader)?;
+                if let Some(entries) = meta_val.get("entries") {
+                    metadata = serde_json::from_value(entries.clone())
+                        .map_err(|_| VdbError::InvalidHeader)?;
+                }
+                if let Some(s2m) = meta_val.get("symbol_to_module") {
+                    resolver.symbol_to_module = serde_json::from_value(s2m.clone())
+                        .map_err(|_| VdbError::InvalidHeader)?;
+                }
+                if let Some(dag) = meta_val.get("import_dag") {
+                    resolver.import_dag = serde_json::from_value(dag.clone())
+                        .map_err(|_| VdbError::InvalidHeader)?;
+                }
+            }
+        }
+
+        Ok((
+            Self {
+                dim,
+                quantizer: Sq8Quantizer { mins, maxs },
+                metadata,
+                codes,
+            },
+            resolver,
+        ))
+    }
+
+    /// Build an `orion::database::VectorDatabase` populated with all dequantized vectors in this index.
+    pub fn build_orion_db(
+        &self,
+        db_path: &std::path::Path,
+    ) -> Result<orion::database::VectorDatabase, VdbError> {
+        use orion::database::Database;
+
+        let _ = std::fs::remove_dir_all(db_path);
+        let mut db = orion::database::VectorDatabase::open(db_path, None)?;
+        for (idx, code) in self.codes.iter().enumerate() {
+            let vec = self.quantizer.dequantize(code)?;
+            db.insert(idx as u64, orion::types::Vector { data: vec })
+                .map_err(|_| VdbError::InvalidHeader)?;
+        }
+        Ok(db)
+    }
 }
 
 /// Outcome of checking the per-theorem episodic subgoal cache.
