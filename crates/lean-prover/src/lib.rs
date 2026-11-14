@@ -1030,8 +1030,14 @@ fn synthesize_from_model_and_vdb(
                 scripts.push(vec![format!("simp [{context_list}]")]);
             }
         }
-    } else if !context_list.is_empty() {
-        scripts.push(vec![format!("simp [{context_list}]")]);
+    } else {
+        // When no local definition appears in the signature, try bare closers first so
+        // unrelated preceding local theorems do not trigger unused simp argument warnings.
+        scripts.push(vec!["simp".to_string()]);
+        scripts.push(vec!["omega".to_string()]);
+        if !context_list.is_empty() {
+            scripts.push(vec![format!("simp [{context_list}]")]);
+        }
     }
 
     // 2. Structural induction over List or local inductive binders (or when Sys1 predicts Induction)
@@ -1084,17 +1090,10 @@ fn synthesize_from_model_and_vdb(
                 .collect();
 
             if !ind_ctx_list.is_empty() {
-                scripts.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
-                scripts.push(vec![format!(
-                    "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> try omega"
-                )]);
                 if !other_vars.is_empty() {
                     let gen_all = other_vars.join(" ");
                     scripts.push(vec![format!(
                         "induction {v_ind} generalizing {gen_all} <;> simp_all [{ind_ctx_list}]"
-                    )]);
-                    scripts.push(vec![format!(
-                        "induction {v_ind} generalizing {gen_all} <;> all_goals (repeat (first | rfl | simp_all [{ind_ctx_list}] | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
                     )]);
                     if let Some(&last_var) = other_vars.last() {
                         if other_vars.len() > 1 {
@@ -1104,11 +1103,18 @@ fn synthesize_from_model_and_vdb(
                         }
                         if is_list {
                             scripts.push(vec![format!(
-                                "induction {v_ind} generalizing {last_var} with | nil => simp_all [{ind_ctx_list}] | cons hd tl ih => cases hd <;> simp_all [{ind_ctx_list}] <;> try (cases {last_var} <;> simp_all [{ind_ctx_list}] <;> try (rename_i _ tl2; cases tl2 <;> simp_all [{ind_ctx_list}]))"
+                                "induction {v_ind} generalizing {last_var} with | nil => simp_all [{ind_ctx_list}] | cons hd tl ih => cases hd <;> simp_all [{ind_ctx_list}] <;> cases {last_var} with | nil => simp_all [{ind_ctx_list}] | cons _ tl2 => cases tl2 <;> simp_all [{ind_ctx_list}]"
                             )]);
                         }
                     }
+                    scripts.push(vec![format!(
+                        "induction {v_ind} generalizing {gen_all} <;> all_goals (repeat (first | rfl | simp_all [{ind_ctx_list}] | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
+                    )]);
                 }
+                scripts.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
+                scripts.push(vec![format!(
+                    "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> try omega"
+                )]);
             } else {
                 scripts.push(vec![format!("induction {v_ind} <;> simp_all <;> try omega")]);
             }
@@ -1164,7 +1170,13 @@ fn synthesize_from_model_and_vdb(
         }
     }
 
-    scripts
+    let mut unique_scripts = Vec::with_capacity(scripts.len());
+    for s in scripts {
+        if !unique_scripts.contains(&s) {
+            unique_scripts.push(s);
+        }
+    }
+    unique_scripts
 }
 
 fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> String {
@@ -1676,6 +1688,31 @@ mod tests {
         assert_eq!(summary.discovered, 2);
         assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
         assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_nested_multi_argument_list_induction_and_clean_simp_ordering() {
+        let dir = std::env::temp_dir().join("lean_prover_m10_nested_list_ind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("NestedListVm.lean");
+        std::fs::write(
+            &f,
+            "import Init\ntheorem unrelated_local (n : Nat) : n + 0 = n := by\n  sorry\ntheorem clean_list_len (xs ys : List Nat) : (xs ++ ys).length = xs.length + ys.length := by\n  sorry\ninductive Op where\n  | lit : Nat → Op\n  | combine : Op\ndef stepAll : List Op → List Nat → List Nat\n  | [], st => st\n  | .lit n :: rest, st => stepAll rest (n :: st)\n  | .combine :: rest, a :: b :: st => stepAll rest ((a + b) :: st)\n  | .combine :: rest, st => stepAll rest st\ntheorem stepAll_append (p1 p2 : List Op) (st : List Nat) : stepAll (p1 ++ p2) st = stepAll p2 (stepAll p1 st) := by\n  sorry\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 3);
+        assert_eq!(summary.proved, 3, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 0);
+        let len_script = summary
+            .proved_scripts
+            .iter()
+            .find(|(name, _)| name == "clean_list_len")
+            .map(|(_, s)| s.join("; "))
+            .unwrap();
+        assert_eq!(len_script, "simp");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
