@@ -165,9 +165,128 @@ pub struct StaticVdbIndex {
     pub quantizer: Sq8Quantizer,
     pub metadata: Vec<LemmaMetadata>,
     pub codes: Vec<Vec<u8>>,
+    pub neighbors: Vec<Vec<u32>>,
+}
+
+fn sq8_code_l2_sq(a: &[u8], b: &[u8]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = i32::from(x) - i32::from(y);
+            (d * d) as u32
+        })
+        .sum()
+}
+
+fn build_sq8_neighbors(codes: &[Vec<u8>], max_deg: usize) -> Vec<Vec<u32>> {
+    let n = codes.len();
+    let mut adj = vec![Vec::new(); n];
+    if n <= 1 || max_deg == 0 {
+        return adj;
+    }
+    for i in 0..n {
+        let mut cands: Vec<(u32, u32)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (sq8_code_l2_sq(&codes[i], &codes[j]), j as u32))
+            .collect();
+        cands.sort_unstable_by_key(|&(d, _)| d);
+        cands.truncate(max_deg);
+        adj[i] = cands.into_iter().map(|(_, j)| j).collect();
+    }
+    adj
 }
 
 impl StaticVdbIndex {
+    /// Query top-k lemmas directly over SQ8 `u8` codes using the in-memory small-world graph,
+    /// dequantizing only the `top_k` surviving hits.
+    pub fn search_sq8_hnsw(
+        &self,
+        query: &[f32],
+        target_head_symbol: &str,
+        top_k: usize,
+    ) -> Result<Vec<VdbSearchHit>, VdbError> {
+        if query.len() != self.dim {
+            return Err(VdbError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        if self.codes.is_empty() || top_k == 0 {
+            return Ok(Vec::new());
+        }
+        if self.neighbors.len() != self.codes.len() {
+            return self.search_top_k(query, target_head_symbol, top_k);
+        }
+
+        let n = self.codes.len();
+        let ef = (top_k * 4).max(32).min(n);
+        let mut visited = vec![false; n];
+        let mut frontier: Vec<(f32, usize)> = Vec::new();
+        let mut results: Vec<(f32, usize)> = Vec::new();
+
+        // Seed greedy/beam traversal from evenly spaced entry points so disconnected head_symbol clusters are reached.
+        let step = (n / ef.clamp(1, 8)).max(1);
+        for entry in (0..n).step_by(step) {
+            visited[entry] = true;
+            let dist = self.quantizer.asymmetric_l2(query, &self.codes[entry])?;
+            frontier.push((dist, entry));
+            if let Some(meta) = self.metadata.get(entry)
+                && (meta.head_symbol == target_head_symbol || meta.head_symbol == "POLYMORPHIC")
+            {
+                results.push((dist, entry));
+            }
+        }
+
+        let mut explored = 0usize;
+        while !frontier.is_empty() && explored < ef {
+            frontier.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (_, u) = frontier.remove(0);
+            explored += 1;
+            for &nb in &self.neighbors[u] {
+                let nb_idx = nb as usize;
+                if nb_idx >= n || visited[nb_idx] {
+                    continue;
+                }
+                visited[nb_idx] = true;
+                let dist = self.quantizer.asymmetric_l2(query, &self.codes[nb_idx])?;
+                frontier.push((dist, nb_idx));
+                if let Some(meta) = self.metadata.get(nb_idx)
+                    && (meta.head_symbol == target_head_symbol
+                        || meta.head_symbol == "POLYMORPHIC")
+                {
+                    results.push((dist, nb_idx));
+                }
+            }
+        }
+
+        // If the graph neighborhood around entry points missed rare filtered lemmas, scan remaining unvisited matching codes.
+        if results.len() < top_k {
+            for (idx, meta) in self.metadata.iter().enumerate() {
+                if visited[idx] {
+                    continue;
+                }
+                if meta.head_symbol == target_head_symbol || meta.head_symbol == "POLYMORPHIC" {
+                    let dist = self.quantizer.asymmetric_l2(query, &self.codes[idx])?;
+                    results.push((dist, idx));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
+        results.truncate(top_k);
+
+        let mut hits = Vec::with_capacity(results.len());
+        for (distance, idx) in results {
+            if let (Some(meta), Some(code)) = (self.metadata.get(idx), self.codes.get(idx)) {
+                hits.push(VdbSearchHit {
+                    metadata: meta.clone(),
+                    distance,
+                    embedding: self.quantizer.dequantize(code)?,
+                });
+            }
+        }
+        Ok(hits)
+    }
     /// Query top-k lemmas matching `target_head_symbol` or `"POLYMORPHIC"`.
     pub fn search_top_k(
         &self,
@@ -292,12 +411,14 @@ impl StaticVdbIndex {
             }
         }
 
+        let neighbors = build_sq8_neighbors(&codes, 8);
         Ok((
             Self {
                 dim,
                 quantizer: Sq8Quantizer { mins, maxs },
                 metadata,
                 codes,
+                neighbors,
             },
             resolver,
         ))
@@ -477,10 +598,57 @@ mod tests {
                 },
             ],
             codes: vec![vec![200, 200, 200, 200], vec![180, 180, 180, 180]],
+            neighbors: vec![vec![1], vec![0]],
         };
         let hits = idx.search_top_k(&[0.5, 0.5, 0.5, 0.5], "Eq", 16).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].metadata.name, "Nat.add_comm");
+    }
+
+    #[test]
+    fn test_sq8_hnsw_direct_search_without_corpus_dequantization() {
+        let codes = vec![
+            vec![200, 200, 200, 200],
+            vec![180, 180, 180, 180],
+            vec![10, 10, 10, 10],
+        ];
+        let neighbors = build_sq8_neighbors(&codes, 2);
+        let idx = StaticVdbIndex {
+            dim: 4,
+            quantizer: Sq8Quantizer {
+                mins: vec![-1.0; 4],
+                maxs: vec![1.0; 4],
+            },
+            metadata: vec![
+                LemmaMetadata {
+                    name: "Nat.le_refl".into(),
+                    head_symbol: "LE.le".into(),
+                    module: "Init".into(),
+                    arity: 1,
+                    signature: "n ≤ n".into(),
+                },
+                LemmaMetadata {
+                    name: "Nat.add_comm".into(),
+                    head_symbol: "Eq".into(),
+                    module: "Init".into(),
+                    arity: 2,
+                    signature: "a + b = b + a".into(),
+                },
+                LemmaMetadata {
+                    name: "Poly.refl".into(),
+                    head_symbol: "POLYMORPHIC".into(),
+                    module: "Init".into(),
+                    arity: 1,
+                    signature: "x = x".into(),
+                },
+            ],
+            codes,
+            neighbors,
+        };
+        let hits = idx.search_sq8_hnsw(&[0.45, 0.45, 0.45, 0.45], "Eq", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].metadata.name, "Nat.add_comm");
+        assert_eq!(hits[1].metadata.name, "Poly.refl");
     }
 
     #[test]

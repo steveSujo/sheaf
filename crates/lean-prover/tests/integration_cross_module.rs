@@ -85,6 +85,7 @@ fn make_test_vdb() -> (StaticVdbIndex, VectorDatabase) {
             quantizer,
             metadata,
             codes,
+            neighbors: Vec::new(),
         },
         db,
     )

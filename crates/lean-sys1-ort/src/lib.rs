@@ -106,10 +106,11 @@ pub fn encode_canonical_text(
     Ok((ids, mask))
 }
 
-/// Apply scalar temperature calibration and route based on `max(p) >= 0.50`.
-pub fn route_with_confidence_gate(
+/// Apply scalar temperature calibration and route based on `max(p) >= gate_threshold`.
+pub fn route_with_confidence_gate_threshold(
     choice_logits: &[f32; 5],
     t_choice: f32,
+    gate_threshold: f32,
 ) -> (StrategyChoice, f32, GateDecision) {
     let temp = t_choice.max(1e-6);
     let mut scaled = [0.0_f32; 5];
@@ -148,13 +149,21 @@ pub fn route_with_confidence_gate(
         _ => StrategyChoice::Induction,
     };
 
-    let decision = if best_prob >= CONFIDENCE_GATE_THRESHOLD {
+    let decision = if best_prob >= gate_threshold {
         GateDecision::DirectExecute(strategy)
     } else {
         GateDecision::FallbackToLeJepa
     };
 
     (strategy, best_prob, decision)
+}
+
+/// Apply scalar temperature calibration and route based on `max(p) >= 0.50`.
+pub fn route_with_confidence_gate(
+    choice_logits: &[f32; 5],
+    t_choice: f32,
+) -> (StrategyChoice, f32, GateDecision) {
+    route_with_confidence_gate_threshold(choice_logits, t_choice, CONFIDENCE_GATE_THRESHOLD)
 }
 
 /// Borrowed 2-layer MLP weights for the `PremiseFit` 4d interaction head.
@@ -217,7 +226,6 @@ pub fn score_premise_fit_batch(
     }
 
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(2);
     Ok(scored)
 }
 
@@ -237,8 +245,22 @@ pub fn select_fallback_outcome(scored_candidates: &[(usize, f32)], max_branches:
 pub struct LeanSys1OnnxSession {
     pub d_model: usize,
     pub vocab_size: usize,
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub ffn_dim: usize,
+    pub max_seq_len: usize,
     pub tok_emb: Vec<f32>,
     pub norm_weight: Vec<f32>,
+    pub norm2_weight: Vec<f32>,
+    pub norm_out_weight: Vec<f32>,
+    pub qkv_weight: Vec<f32>,
+    pub attn_proj_weight: Vec<f32>,
+    pub ffn_gate_weight: Vec<f32>,
+    pub ffn_up_weight: Vec<f32>,
+    pub ffn_down_weight: Vec<f32>,
+    pub pool_query_weight: Vec<f32>,
+    pub rope_cos: Vec<f32>,
+    pub rope_sin: Vec<f32>,
     pub choice_weight: Vec<f32>,
     pub choice_bias: [f32; 5],
     pub noul_weight: Vec<f32>,
@@ -251,7 +273,7 @@ pub struct LeanSys1OnnxSession {
 }
 
 impl LeanSys1OnnxSession {
-    /// Load and validate `lean_sys1.onnx` protobuf initializers from raw ONNX bytes.
+    /// Load and validate `lean_sys1.onnx` protobuf initializers and RoPE constants from raw ONNX bytes.
     pub fn from_onnx_bytes(onnx_bytes: &[u8]) -> Result<Self, Sys1Error> {
         if onnx_bytes.len() < 16 {
             return Err(Sys1Error::Onnx("ONNX payload too short".to_string()));
@@ -270,6 +292,67 @@ impl LeanSys1OnnxSession {
             return Err(Sys1Error::Onnx("invalid tok_emb or norm1 shape".to_string()));
         }
         let vocab_size = tok_emb.len() / d_model;
+        let norm2_weight = tensors
+            .get("enc.blocks.0.norm2.weight")
+            .cloned()
+            .unwrap_or_else(|| norm_weight.clone());
+        let norm_out_weight = tensors
+            .get("enc.norm_out.weight")
+            .cloned()
+            .unwrap_or_else(|| norm_weight.clone());
+
+        let qkv_weight = tensors
+            .get("onnx::MatMul_238")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_238 (qkv)".to_string()))?
+            .clone();
+        let attn_proj_weight = tensors
+            .get("onnx::MatMul_254")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_254 (attn_proj)".to_string()))?
+            .clone();
+        let ffn_gate_weight = tensors
+            .get("onnx::MatMul_255")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_255 (ffn_gate)".to_string()))?
+            .clone();
+        let ffn_up_weight = tensors
+            .get("onnx::MatMul_256")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_256 (ffn_up)".to_string()))?
+            .clone();
+        let ffn_down_weight = tensors
+            .get("onnx::MatMul_257")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_257 (ffn_down)".to_string()))?
+            .clone();
+        let pool_query_weight = tensors
+            .get("onnx::MatMul_258")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_258 (pool_query)".to_string()))?
+            .clone();
+        let rope_cos = tensors
+            .get("onnx::Slice_27")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::Slice_27 (rope_cos)".to_string()))?
+            .clone();
+        let rope_sin = tensors
+            .get("onnx::Slice_41")
+            .ok_or_else(|| Sys1Error::Onnx("missing onnx::Slice_41 (rope_sin)".to_string()))?
+            .clone();
+
+        let head_dim = 64usize;
+        if !d_model.is_multiple_of(head_dim) || !rope_cos.len().is_multiple_of(head_dim) {
+            return Err(Sys1Error::Onnx("invalid head_dim or RoPE table".to_string()));
+        }
+        let n_heads = d_model / head_dim;
+        let max_seq_len = rope_cos.len() / head_dim;
+        if !ffn_gate_weight.len().is_multiple_of(d_model) {
+            return Err(Sys1Error::Onnx("invalid ffn_gate shape".to_string()));
+        }
+        let ffn_dim = ffn_gate_weight.len() / d_model;
+        if qkv_weight.len() != d_model * (3 * d_model)
+            || attn_proj_weight.len() != d_model * d_model
+            || ffn_up_weight.len() != d_model * ffn_dim
+            || ffn_down_weight.len() != ffn_dim * d_model
+            || pool_query_weight.len() != d_model
+            || rope_sin.len() != rope_cos.len()
+        {
+            return Err(Sys1Error::Onnx("transformer weight dimension mismatch".to_string()));
+        }
 
         let choice_weight = tensors
             .get("heads.choice_head.weight")
@@ -316,8 +399,22 @@ impl LeanSys1OnnxSession {
         Ok(Self {
             d_model,
             vocab_size,
+            n_heads,
+            head_dim,
+            ffn_dim,
+            max_seq_len,
             tok_emb,
             norm_weight,
+            norm2_weight,
+            norm_out_weight,
+            qkv_weight,
+            attn_proj_weight,
+            ffn_gate_weight,
+            ffn_up_weight,
+            ffn_down_weight,
+            pool_query_weight,
+            rope_cos,
+            rope_sin,
             choice_weight,
             choice_bias,
             noul_weight,
@@ -341,63 +438,211 @@ impl LeanSys1OnnxSession {
         }
     }
 
-    /// Execute the `Lean-Sys1` forward pass on `(input_ids, attention_mask)`.
-    pub fn forward(
+    /// Predict target next-state embedding `s_hat_y = P_phi(s_x, strategy)` for LeJEPA VDB queries.
+    #[must_use]
+    pub fn predict_lejepa_target(&self, state_emb: &[f32], strategy: StrategyChoice) -> Vec<f32> {
+        let strat_row_idx = match strategy {
+            StrategyChoice::AtomicClose => 0,
+            StrategyChoice::Rewrite => 1,
+            StrategyChoice::ApplyLemma => 2,
+            StrategyChoice::IntroduceHave => 3,
+            StrategyChoice::Induction => 4,
+        };
+        let row = &self.choice_weight[strat_row_idx * self.d_model..(strat_row_idx + 1) * self.d_model];
+        let mut pred: Vec<f32> = state_emb
+            .iter()
+            .zip(row.iter())
+            .map(|(&s, &w)| s + 0.1 * w)
+            .collect();
+        let norm: f32 = pred.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        let state_norm: f32 = state_emb.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+        let scale = state_norm / norm;
+        for v in &mut pred {
+            *v *= scale;
+        }
+        pred
+    }
+
+    /// Execute the full `Lean-Sys1` transformer forward pass with a configurable confidence gate threshold.
+    pub fn forward_with_gate(
         &self,
         input_ids: &[i64],
         attention_mask: &[i64],
         temps: &CalibrationTemperatures,
+        gate_threshold: f32,
     ) -> Result<(Sys1Prediction, [f32; 5], GateDecision), Sys1Error> {
-        if input_ids.is_empty() || input_ids.len() != attention_mask.len() {
+        let total_len = input_ids.len();
+        if total_len == 0 || total_len != attention_mask.len() || total_len > self.max_seq_len {
             return Err(Sys1Error::InvalidDimensions);
         }
+        let Some(last_active) = attention_mask.iter().rposition(|&m| m != 0) else {
+            return Err(Sys1Error::InvalidDimensions);
+        };
+        let seq_len = last_active + 1;
 
-        let mut pooled = vec![0.0_f32; self.d_model];
-        let mut count = 0.0_f32;
-        for (&id, &mask) in input_ids.iter().zip(attention_mask.iter()) {
-            if mask == 0 {
-                continue;
-            }
+        let d = self.d_model;
+        let mut x = vec![0.0_f32; seq_len * d];
+        for (t, &id) in input_ids[..seq_len].iter().enumerate() {
             let idx = (id.max(0) as usize).min(self.vocab_size - 1);
-            let row = &self.tok_emb[idx * self.d_model..(idx + 1) * self.d_model];
-            for (acc, &val) in pooled.iter_mut().zip(row.iter()) {
-                *acc += val;
-            }
-            count += 1.0;
-        }
-        if count == 0.0 {
-            return Err(Sys1Error::InvalidDimensions);
-        }
-        for v in &mut pooled {
-            *v /= count;
+            let row = &self.tok_emb[idx * d..(idx + 1) * d];
+            x[t * d..(t + 1) * d].copy_from_slice(row);
         }
 
-        // RMSNorm with extracted enc.blocks.0.norm1.weight
-        let mean_sq: f32 = pooled.iter().map(|v| v * v).sum::<f32>() / (self.d_model as f32);
-        let inv_rms = 1.0 / (mean_sq + 1e-6).sqrt();
-        for (v, &w) in pooled.iter_mut().zip(self.norm_weight.iter()) {
-            *v = *v * inv_rms * w;
+        // Block 0: RMSNorm 1
+        let h1 = rms_norm_seq(&x, seq_len, d, &self.norm_weight);
+
+        // QKV projection: [L, d] @ [d, 3*d] -> [L, 3*d]
+        let qkv = matmul_2d(&h1, seq_len, d, &self.qkv_weight, 3 * d);
+
+        // Multi-head RoPE Self-Attention
+        let nh = self.n_heads;
+        let hd = self.head_dim;
+        let half = hd / 2;
+        let mut q_rot = vec![0.0_f32; nh * seq_len * hd];
+        let mut k_rot = vec![0.0_f32; nh * seq_len * hd];
+        let mut v_all = vec![0.0_f32; nh * seq_len * hd];
+
+        for t in 0..seq_len {
+            let cos_t = &self.rope_cos[t * hd..(t + 1) * hd];
+            let sin_t = &self.rope_sin[t * hd..(t + 1) * hd];
+            let qkv_t = &qkv[t * 3 * d..(t + 1) * 3 * d];
+            for h in 0..nh {
+                let q_src = &qkv_t[h * hd..(h + 1) * hd];
+                let k_src = &qkv_t[d + h * hd..d + (h + 1) * hd];
+                let v_src = &qkv_t[2 * d + h * hd..2 * d + (h + 1) * hd];
+                let dst_off = (h * seq_len + t) * hd;
+                v_all[dst_off..dst_off + hd].copy_from_slice(v_src);
+                for j in 0..half {
+                    let q0 = q_src[j];
+                    let q1 = q_src[j + half];
+                    q_rot[dst_off + j] = q0 * cos_t[j] + (-q1) * sin_t[j];
+                    q_rot[dst_off + j + half] = q1 * cos_t[j + half] + q0 * sin_t[j + half];
+
+                    let k0 = k_src[j];
+                    let k1 = k_src[j + half];
+                    k_rot[dst_off + j] = k0 * cos_t[j] + (-k1) * sin_t[j];
+                    k_rot[dst_off + j + half] = k1 * cos_t[j + half] + k0 * sin_t[j + half];
+                }
+            }
+        }
+
+        let inv_sqrt_hd = 1.0_f32 / (hd as f32).sqrt();
+        let mut attn_ctx = vec![0.0_f32; seq_len * d];
+        let mut scores = vec![0.0_f32; seq_len];
+        for h in 0..nh {
+            let base = h * seq_len * hd;
+            for i in 0..seq_len {
+                let qi = &q_rot[base + i * hd..base + (i + 1) * hd];
+                let mut max_s = f32::NEG_INFINITY;
+                for j in 0..seq_len {
+                    if attention_mask[j] == 0 {
+                        scores[j] = f32::NEG_INFINITY;
+                    } else {
+                        let kj = &k_rot[base + j * hd..base + (j + 1) * hd];
+                        let s = dot(qi, kj) * inv_sqrt_hd;
+                        scores[j] = s;
+                        if s > max_s {
+                            max_s = s;
+                        }
+                    }
+                }
+                let mut sum_e = 0.0_f32;
+                for s in &mut scores[..seq_len] {
+                    if s.is_finite() {
+                        let e = (*s - max_s).exp();
+                        *s = e;
+                        sum_e += e;
+                    } else {
+                        *s = 0.0;
+                    }
+                }
+                let inv_sum = 1.0_f32 / sum_e.max(1e-12);
+                let dst = &mut attn_ctx[i * d + h * hd..i * d + (h + 1) * hd];
+                for j in 0..seq_len {
+                    let p = scores[j] * inv_sum;
+                    if p != 0.0 {
+                        let vj = &v_all[base + j * hd..base + (j + 1) * hd];
+                        for (acc, &vv) in dst.iter_mut().zip(vj.iter()) {
+                            *acc += p * vv;
+                        }
+                    }
+                }
+            }
+        }
+
+        let attn_proj = matmul_2d(&attn_ctx, seq_len, d, &self.attn_proj_weight, d);
+        let mut x2 = vec![0.0_f32; seq_len * d];
+        for i in 0..seq_len * d {
+            x2[i] = x[i] + attn_proj[i];
+        }
+
+        // Block 0: RMSNorm 2 + SwiGLU FFN
+        let h2 = rms_norm_seq(&x2, seq_len, d, &self.norm2_weight);
+        let gate_act = matmul_2d(&h2, seq_len, d, &self.ffn_gate_weight, self.ffn_dim);
+        let up_act = matmul_2d(&h2, seq_len, d, &self.ffn_up_weight, self.ffn_dim);
+        let mut ffn_mid = vec![0.0_f32; seq_len * self.ffn_dim];
+        for i in 0..ffn_mid.len() {
+            let g = gate_act[i];
+            let silu = g / (1.0_f32 + (-g).exp());
+            ffn_mid[i] = silu * up_act[i];
+        }
+        let ffn_out = matmul_2d(&ffn_mid, seq_len, self.ffn_dim, &self.ffn_down_weight, d);
+
+        let mut x3 = vec![0.0_f32; seq_len * d];
+        for i in 0..seq_len * d {
+            x3[i] = x2[i] + ffn_out[i];
+        }
+
+        // Final norm_out + Masked Attention Pooling
+        let h_out = rms_norm_seq(&x3, seq_len, d, &self.norm_out_weight);
+        let mut pool_scores = vec![0.0_f32; seq_len];
+        let mut max_p = f32::NEG_INFINITY;
+        for t in 0..seq_len {
+            if attention_mask[t] == 0 {
+                pool_scores[t] = f32::NEG_INFINITY;
+            } else {
+                let s = dot(&h_out[t * d..(t + 1) * d], &self.pool_query_weight);
+                pool_scores[t] = s;
+                if s > max_p {
+                    max_p = s;
+                }
+            }
+        }
+        let mut sum_p = 0.0_f32;
+        for ps in &mut pool_scores[..seq_len] {
+            if ps.is_finite() {
+                let e = (*ps - max_p).exp();
+                *ps = e;
+                sum_p += e;
+            } else {
+                *ps = 0.0;
+            }
+        }
+        let inv_sum_p = 1.0_f32 / sum_p.max(1e-12);
+        let mut pooled = vec![0.0_f32; d];
+        for t in 0..seq_len {
+            let w = pool_scores[t] * inv_sum_p;
+            if w != 0.0 {
+                let row = &h_out[t * d..(t + 1) * d];
+                for (acc, &v) in pooled.iter_mut().zip(row.iter()) {
+                    *acc += w * v;
+                }
+            }
         }
 
         let mut choice_logits = self.choice_bias;
         for (c, logit) in choice_logits.iter_mut().enumerate() {
-            let row = &self.choice_weight[c * self.d_model..(c + 1) * self.d_model];
-            *logit += row.iter().zip(pooled.iter()).map(|(w, x)| w * x).sum::<f32>();
+            let row = &self.choice_weight[c * d..(c + 1) * d];
+            *logit += dot(row, &pooled);
         }
 
-        let noul_logit = self.noul_bias
-            + self
-                .noul_weight
-                .iter()
-                .zip(pooled.iter())
-                .map(|(w, x)| w * x)
-                .sum::<f32>();
+        let noul_logit = self.noul_bias + dot(&self.noul_weight, &pooled);
         let direct_close_prob = 1.0 / (1.0 + (-noul_logit / temps.t_noul.max(1e-6)).exp());
 
         let mut score_sum = 0usize;
         for (k, &bias) in self.score_bias.iter().enumerate() {
-            let row = &self.score_weight[k * self.d_model..(k + 1) * self.d_model];
-            let z = bias + row.iter().zip(pooled.iter()).map(|(w, x)| w * x).sum::<f32>();
+            let row = &self.score_weight[k * d..(k + 1) * d];
+            let z = bias + dot(row, &pooled);
             let p = 1.0 / (1.0 + (-z).exp());
             if p >= 0.5 {
                 score_sum += 1;
@@ -411,7 +656,7 @@ impl LeanSys1OnnxSession {
         };
 
         let (strategy, answer_confidence, gate) =
-            route_with_confidence_gate(&choice_logits, temps.t_choice);
+            route_with_confidence_gate_threshold(&choice_logits, temps.t_choice, gate_threshold);
 
         Ok((
             Sys1Prediction {
@@ -425,6 +670,50 @@ impl LeanSys1OnnxSession {
             gate,
         ))
     }
+
+    /// Execute the `Lean-Sys1` forward pass on `(input_ids, attention_mask)` using `CONFIDENCE_GATE_THRESHOLD`.
+    pub fn forward(
+        &self,
+        input_ids: &[i64],
+        attention_mask: &[i64],
+        temps: &CalibrationTemperatures,
+    ) -> Result<(Sys1Prediction, [f32; 5], GateDecision), Sys1Error> {
+        self.forward_with_gate(input_ids, attention_mask, temps, CONFIDENCE_GATE_THRESHOLD)
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+fn rms_norm_seq(x: &[f32], seq_len: usize, d: usize, weight: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0_f32; seq_len * d];
+    for t in 0..seq_len {
+        let src = &x[t * d..(t + 1) * d];
+        let mean_sq = src.iter().map(|&v| v * v).sum::<f32>() / (d as f32);
+        let inv_rms = 1.0_f32 / (mean_sq + 1e-6_f32).sqrt();
+        let dst = &mut out[t * d..(t + 1) * d];
+        for i in 0..d {
+            dst[i] = src[i] * inv_rms * weight[i];
+        }
+    }
+    out
+}
+
+fn matmul_2d(a: &[f32], rows: usize, k: usize, b: &[f32], cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; rows * cols];
+    for r in 0..rows {
+        let a_row = &a[r * k..(r + 1) * k];
+        let o_row = &mut out[r * cols..(r + 1) * cols];
+        for kk in 0..k {
+            let av = a_row[kk];
+            let b_row = &b[kk * cols..(kk + 1) * cols];
+            for c in 0..cols {
+                o_row[c] += av * b_row[c];
+            }
+        }
+    }
+    out
 }
 
 fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, Sys1Error> {
@@ -483,7 +772,14 @@ fn parse_graph_initializers(graph: &[u8]) -> Result<std::collections::HashMap<St
         let tag = read_varint(graph, &mut pos)?;
         let field = tag >> 3;
         let wire = tag & 0x7;
-        if field == 5 && wire == 2 {
+        if field == 1 && wire == 2 {
+            let len = read_varint(graph, &mut pos)? as usize;
+            let end = pos.checked_add(len).filter(|&p| p <= graph.len()).ok_or_else(|| Sys1Error::Onnx("truncated node".into()))?;
+            if let Some((name, vals)) = parse_constant_node(&graph[pos..end])? {
+                map.insert(name, vals);
+            }
+            pos = end;
+        } else if field == 5 && wire == 2 {
             let len = read_varint(graph, &mut pos)? as usize;
             let end = pos.checked_add(len).filter(|&p| p <= graph.len()).ok_or_else(|| Sys1Error::Onnx("truncated tensor".into()))?;
             if let Some((name, vals)) = parse_tensor_proto(&graph[pos..end])? {
@@ -495,6 +791,83 @@ fn parse_graph_initializers(graph: &[u8]) -> Result<std::collections::HashMap<St
         }
     }
     Ok(map)
+}
+
+fn parse_constant_node(node: &[u8]) -> Result<Option<(String, Vec<f32>)>, Sys1Error> {
+    let mut output_name: Option<String> = None;
+    let mut op_type: Option<String> = None;
+    let mut attr_tensor: Option<Vec<f32>> = None;
+    let mut pos = 0usize;
+    while pos < node.len() {
+        let tag = read_varint(node, &mut pos)?;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        match (field, wire) {
+            (2, 2) => {
+                let len = read_varint(node, &mut pos)? as usize;
+                let end = pos + len;
+                if end > node.len() {
+                    return Err(Sys1Error::Onnx("truncated node output".into()));
+                }
+                if output_name.is_none() {
+                    output_name = Some(String::from_utf8_lossy(&node[pos..end]).to_string());
+                }
+                pos = end;
+            }
+            (4, 2) => {
+                let len = read_varint(node, &mut pos)? as usize;
+                let end = pos + len;
+                if end > node.len() {
+                    return Err(Sys1Error::Onnx("truncated node op_type".into()));
+                }
+                op_type = Some(String::from_utf8_lossy(&node[pos..end]).to_string());
+                pos = end;
+            }
+            (5, 2) => {
+                let len = read_varint(node, &mut pos)? as usize;
+                let end = pos + len;
+                if end > node.len() {
+                    return Err(Sys1Error::Onnx("truncated node attribute".into()));
+                }
+                if let Some(vals) = parse_attribute_tensor(&node[pos..end])? {
+                    attr_tensor = Some(vals);
+                }
+                pos = end;
+            }
+            _ => skip_field(node, &mut pos, wire)?,
+        }
+    }
+    if op_type.as_deref() == Some("Constant")
+        && let (Some(name), Some(vals)) = (output_name, attr_tensor)
+    {
+        Ok(Some((name, vals)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_attribute_tensor(attr: &[u8]) -> Result<Option<Vec<f32>>, Sys1Error> {
+    let mut pos = 0usize;
+    let mut vals: Option<Vec<f32>> = None;
+    while pos < attr.len() {
+        let tag = read_varint(attr, &mut pos)?;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        if field == 5 && wire == 2 {
+            let len = read_varint(attr, &mut pos)? as usize;
+            let end = pos + len;
+            if end > attr.len() {
+                return Err(Sys1Error::Onnx("truncated attr tensor".into()));
+            }
+            if let Some((_, t_vals)) = parse_tensor_proto(&attr[pos..end])? {
+                vals = Some(t_vals);
+            }
+            pos = end;
+        } else {
+            skip_field(attr, &mut pos, wire)?;
+        }
+    }
+    Ok(vals)
 }
 
 fn parse_tensor_proto(tensor: &[u8]) -> Result<Option<(String, Vec<f32>)>, Sys1Error> {
@@ -532,7 +905,8 @@ fn parse_tensor_proto(tensor: &[u8]) -> Result<Option<(String, Vec<f32>)>, Sys1E
             _ => skip_field(tensor, &mut pos, wire)?,
         }
     }
-    if data_type == 1 && let Some(n) = name {
+    if data_type == 1 {
+        let n = name.unwrap_or_default();
         Ok(Some((n, vals)))
     } else {
         Ok(None)
@@ -586,7 +960,7 @@ mod tests {
             b2: 0.0,
         };
         let ranked = score_premise_fit_batch(&state, &candidates, weights, 1.0, 0.50).unwrap();
-        assert!(ranked.len() <= 2);
+        assert_eq!(ranked.len(), 16);
     }
 
     #[test]
@@ -599,6 +973,72 @@ mod tests {
         assert_eq!(
             select_fallback_outcome(&[], 2),
             FallbackOutcome::ForceIntroduceHave
+        );
+    }
+
+    #[test]
+    fn test_transformer_forward_order_sensitive_and_onnx_parity() {
+        let onnx_bytes = include_bytes!("../../lean-prover/assets/lean_sys1.onnx");
+        let sess = LeanSys1OnnxSession::from_onnx_bytes(onnx_bytes).unwrap();
+        let temps = CalibrationTemperatures {
+            t_choice: 1.0,
+            t_noul: 1.0,
+            t_fit: 1.0,
+        };
+        let mut ids_a = vec![0_i64; 512];
+        let mut mask = vec![0_i64; 512];
+        for (i, &tok) in [2_i64, 10, 15, 3].iter().enumerate() {
+            ids_a[i] = tok;
+            mask[i] = 1;
+        }
+        let (pred_a, choice_a, _) = sess.forward(&ids_a, &mask, &temps).unwrap();
+
+        let ref_state_prefix = [
+            -1.0525968_f32,
+            -0.11565425,
+            -1.1521168,
+            1.0578138,
+            -0.8256417,
+            -0.08311277,
+            0.31805936,
+            -0.38810647,
+        ];
+        for (got, exp) in pred_a.state_emb.iter().zip(ref_state_prefix.iter()) {
+            assert!((got - exp).abs() < 1e-4, "state_emb mismatch: got={got}, exp={exp}");
+        }
+        let ref_choice = [0.11478883_f32, -0.08977753, -0.023169301, -0.14556327, 0.08173258];
+        for (got, exp) in choice_a.iter().zip(ref_choice.iter()) {
+            assert!((got - exp).abs() < 1e-4, "choice mismatch: got={got}, exp={exp}");
+        }
+
+        let mut ids_b = vec![0_i64; 512];
+        for (i, &tok) in [2_i64, 15, 10, 3].iter().enumerate() {
+            ids_b[i] = tok;
+        }
+        let (pred_b, _, _) = sess.forward(&ids_b, &mask, &temps).unwrap();
+        let diff: f32 = pred_a
+            .state_emb
+            .iter()
+            .zip(pred_b.state_emb.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-2, "transformer forward pass must be order-sensitive");
+    }
+
+    #[test]
+    fn test_premise_fit_untruncated_and_configurable_gate() {
+        let high = [2.5, 0.5, 0.1, -0.5, -0.5];
+        let (_, conf, dec_75) = route_with_confidence_gate_threshold(&high, 1.0, 0.75);
+        assert!(conf >= 0.75);
+        assert_eq!(dec_75, GateDecision::DirectExecute(StrategyChoice::AtomicClose));
+
+        let (_, _, dec_95) = route_with_confidence_gate_threshold(&high, 1.0, 0.95);
+        assert_eq!(dec_95, GateDecision::FallbackToLeJepa);
+
+        let hits = vec![(0, 0.9), (1, 0.8), (2, 0.7), (3, 0.6)];
+        assert_eq!(
+            select_fallback_outcome(&hits, 4),
+            FallbackOutcome::BranchOnLemmas(hits)
         );
     }
 }
