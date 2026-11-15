@@ -62,6 +62,14 @@ Once satisfied, pass `--write` to update the `.lean` files in place:
 ./target/release/lean-prover prove ../lean-workspace --write
 ```
 
+### Diagnostic Modes (`--gate-pct`, `--max-branches`, `--premise-tau`)
+
+Three instant diagnostic modes are available from the command line:
+
+- **Default balanced run:** `lean-prover prove problem.lean --gate-pct 50 --max-branches 4`
+- **Fast-path only (ablation):** `lean-prover prove problem.lean --gate-pct 0` bypasses VDB fallback completely to measure pure System 1 accuracy.
+- **Force VDB + branching (stress test):** `lean-prover prove problem.lean --gate-pct 100 --max-branches 6` forces every theorem through HNSW + `PremiseFit` to benchmark retrieval recall and branch latency.
+
 ### Exit Codes & Error Diagnostics
 
 - `0`: All discovered `sorry` theorems proved and kernel-verified (or `check` found zero `sorry`s).
@@ -75,7 +83,7 @@ Once satisfied, pass `--write` to update the `.lean` files in place:
 - `lean-prover doctor` checks `lean --version`, embedded ONNX readiness, and `artifacts/` status.
 - `lean-prover init [--dir <PATH>]` writes the embedded `lean_sys1.onnx`, `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` to disk.
 - `lean-prover check <PATH>` lists every remaining `sorry` theorem (`file:line: theorem`).
-- `lean-prover prove <PATH> [--write]` runs the 5-stage model + VDB prover and kernel verifier.
+- `lean-prover prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>] [--premise-tau <0..1>]` runs the 5-stage model + VDB prover and kernel verifier.
 
 ## Verification
 
