@@ -1588,18 +1588,18 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
         "--help" | "-h" | "help" => Ok((
             0,
             concat!(
-                "lean-prover ",
+                "sheaf ",
                 env!("CARGO_PKG_VERSION"),
                 "\n\nUsage:\n",
-                "  lean-prover prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
-                "  lean-prover check <PATH>             List remaining sorry theorems in a file or workspace\n",
-                "  lean-prover init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
-                "  lean-prover doctor                   Verify Lean 4, Lake, and artifact readiness\n",
-                "  lean-prover --version                Print version\n",
+                "  sheaf prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
+                "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
+                "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
+                "  sheaf doctor                   Verify Lean 4, Lake, and artifact readiness\n",
+                "  sheaf --version                Print version\n",
             )
             .to_string(),
         )),
-        "--version" | "-V" => Ok((0, format!("lean-prover {}", env!("CARGO_PKG_VERSION")))),
+        "--version" | "-V" => Ok((0, format!("sheaf {}", env!("CARGO_PKG_VERSION")))),
         "doctor" => {
             let lean_out = std::process::Command::new("lean").arg("--version").output();
             let lean_ver = match lean_out {
@@ -1691,7 +1691,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
         }
         other => Ok((
             2,
-            format!("Unknown command '{other}'. Run `lean-prover --help` for usage."),
+            format!("Unknown command '{other}'. Run `sheaf --help` for usage."),
         )),
     }
 }
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_cli_help_doctor_init_and_prove_commands() {
-        let (code, out) = run_cli_args(&["lean-prover".into(), "--help".into()]).unwrap();
+        let (code, out) = run_cli_args(&["sheaf".into(), "--help".into()]).unwrap();
         assert_eq!(code, 0);
         assert!(out.contains("prove"));
         assert!(out.contains("doctor"));
@@ -1830,7 +1830,7 @@ mod tests {
             .parent()
             .unwrap();
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("./target/release/lean-prover"));
+        assert!(readme.contains("./target/release/sheaf"));
     }
 
     #[test]
@@ -1914,7 +1914,7 @@ mod tests {
             .unwrap();
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
         assert!(readme.contains("cargo build --release"));
-        assert!(readme.contains("./target/release/lean-prover"));
+        assert!(readme.contains("./target/release/sheaf"));
         assert!(readme.contains("## How to Use"));
     }
 
