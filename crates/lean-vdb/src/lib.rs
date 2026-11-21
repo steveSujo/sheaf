@@ -169,11 +169,32 @@ impl StaticVdbIndex {
     /// Query top-k lemmas matching `target_head_symbol` or `"POLYMORPHIC"`.
     pub fn search_top_k(
         &self,
-        _query: &[f32],
-        _target_head_symbol: &str,
-        _top_k: usize,
+        query: &[f32],
+        target_head_symbol: &str,
+        top_k: usize,
     ) -> Result<Vec<VdbSearchHit>, VdbError> {
-        todo!("TASK-M1-006: implement filtered HNSW+SQ8 top-k search")
+        if query.len() != self.dim {
+            return Err(VdbError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
+        let mut hits = Vec::new();
+        for (meta, code) in self.metadata.iter().zip(self.codes.iter()) {
+            if meta.head_symbol != target_head_symbol && meta.head_symbol != "POLYMORPHIC" {
+                continue;
+            }
+            let distance = self.quantizer.asymmetric_l2(query, code)?;
+            let embedding = self.quantizer.dequantize(code)?;
+            hits.push(VdbSearchHit {
+                metadata: meta.clone(),
+                distance,
+                embedding,
+            });
+        }
+        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        hits.truncate(top_k);
+        Ok(hits)
     }
 }
 
@@ -296,7 +317,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-006"]
     fn test_hnsw_filtered_head_symbol_search() {
         let idx = StaticVdbIndex {
             dim: 4,
