@@ -235,11 +235,33 @@ fn find_top_level_char(s: &str, target: char) -> Option<usize> {
 
 /// Prune hypotheses in `Γ` with zero symbol overlap with `T` when token count exceeds `max_tokens`.
 pub fn prune_disjoint_hypotheses(
-    _hypotheses: &[String],
-    _target: &str,
-    _max_tokens: usize,
+    hypotheses: &[String],
+    target: &str,
+    max_tokens: usize,
 ) -> Vec<String> {
-    todo!("TASK-M0-004: implement zero-overlap hypothesis pruning")
+    use std::collections::HashSet;
+
+    let total_tokens: usize = hypotheses
+        .iter()
+        .map(|h| h.split_whitespace().count())
+        .sum::<usize>()
+        + target.split_whitespace().count();
+
+    if total_tokens <= max_tokens {
+        return hypotheses.to_vec();
+    }
+
+    let target_idents: HashSet<&str> = extract_ident_slices(target).collect();
+    hypotheses
+        .iter()
+        .filter(|h| extract_ident_slices(h).any(|id| target_idents.contains(id)))
+        .cloned()
+        .collect()
+}
+
+fn extract_ident_slices(expr: &str) -> impl Iterator<Item = &str> {
+    expr.split(|c: char| !is_ident_char(c))
+        .filter(|s| !s.is_empty() && is_ident_start(s))
 }
 
 /// Full canonicalization pipeline for a Lean 4 goal.
@@ -321,10 +343,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M0-004"]
     fn test_prune_disjoint_hypotheses_over_budget() {
         let mut hyps = vec!["_v0 : Nat".to_string(), "_v1 : Nat".to_string()];
-        for i in 0..40 {
+        for i in 0..70 {
             hyps.push(format!("_h{i} : String.length _s{i} = 42"));
         }
         let target = "Nat.add _v0 _v1 = _v0";
