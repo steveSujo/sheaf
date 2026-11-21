@@ -40,8 +40,14 @@ pub struct ImportResolver {
 
 impl ImportResolver {
     /// Extract identifiers from theorem text and resolve defining modules.
-    pub fn resolve_syntactic_modules(&self, _theorem_stmt: &str) -> HashSet<String> {
-        todo!("TASK-M1-001: implement syntactic closure symbol_to_module lookup")
+    pub fn resolve_syntactic_modules(&self, theorem_stmt: &str) -> HashSet<String> {
+        let mut modules = HashSet::new();
+        for token in theorem_stmt.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')) {
+            if let Some(module) = self.symbol_to_module.get(token) {
+                modules.insert(module.clone());
+            }
+        }
+        modules
     }
 
     /// Collapse candidate modules through `import_dag` to remove transitively implied modules.
@@ -136,7 +142,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-001"]
     fn test_syntactic_closure_symbol_to_module() {
         let mut resolver = ImportResolver::default();
         resolver
