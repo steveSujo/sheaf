@@ -440,9 +440,30 @@ pub fn prove_and_verify_with_lean4(
 /// Paths to bootstrapped runtime artifacts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactPaths {
+    pub onnx_model: std::path::PathBuf,
     pub tokenizer_json: std::path::PathBuf,
     pub temperatures_json: std::path::PathBuf,
     pub mathlib_vdb: std::path::PathBuf,
+}
+
+/// Embedded `Lean-Sys1` ONNX model and baseline artifacts compiled into the Rust binary.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedArtifacts {
+    pub lean_sys1_onnx: &'static [u8],
+    pub tokenizer_json: &'static str,
+    pub temperatures_json: &'static str,
+    pub mathlib_sq8_vdb: &'static [u8],
+}
+
+/// Return the `Lean-Sys1` ONNX model and baseline artifacts embedded in the binary.
+#[must_use]
+pub fn embedded_artifacts() -> EmbeddedArtifacts {
+    EmbeddedArtifacts {
+        lean_sys1_onnx: include_bytes!("../assets/lean_sys1.onnx"),
+        tokenizer_json: include_str!("../assets/tokenizer.json"),
+        temperatures_json: include_str!("../assets/temperatures.json"),
+        mathlib_sq8_vdb: include_bytes!("../assets/mathlib_sq8.vdb"),
+    }
 }
 
 /// Discovered `sorry` theorem inside a `.lean` file or `lake` workspace.
@@ -463,52 +484,38 @@ pub struct WorkspaceProveSummary {
     pub proved_names: Vec<String>,
 }
 
-/// Bootstrap baseline `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` into `artifact_dir`.
+/// Bootstrap baseline `lean_sys1.onnx`, `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` into `artifact_dir`.
 pub fn init_default_artifacts(artifact_dir: &std::path::Path) -> Result<ArtifactPaths, ProverError> {
     std::fs::create_dir_all(artifact_dir)
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
 
+    let emb = embedded_artifacts();
+    let onnx_model = artifact_dir.join("lean_sys1.onnx");
+    if !onnx_model.exists() {
+        std::fs::write(&onnx_model, emb.lean_sys1_onnx)
+            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+    }
+
     let tokenizer_json = artifact_dir.join("tokenizer.json");
     if !tokenizer_json.exists() {
-        let tok_payload = serde_json::json!({
-            "version": "1.0",
-            "added_tokens": [
-                {"id": 0, "content": "<pad>", "special": true},
-                {"id": 1, "content": "<unk>", "special": true},
-                {"id": 2, "content": "<s>", "special": true},
-                {"id": 3, "content": "</s>", "special": true},
-                {"id": 4, "content": "⊢", "special": true}
-            ],
-            "model": {
-                "type": "BPE",
-                "unk_token": "<unk>",
-                "vocab": {"<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3, "⊢": 4, "_v0": 5, "_v1": 6},
-                "merges": []
-            }
-        });
-        std::fs::write(&tokenizer_json, serde_json::to_string_pretty(&tok_payload).unwrap())
+        std::fs::write(&tokenizer_json, emb.tokenizer_json)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
     }
 
     let temperatures_json = artifact_dir.join("temperatures.json");
     if !temperatures_json.exists() {
-        let temps = r#"{"T_choice": 1.0, "T_noul": 1.0, "T_fit": 1.0}"#;
-        std::fs::write(&temperatures_json, temps)
+        std::fs::write(&temperatures_json, emb.temperatures_json)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
     }
 
     let mathlib_vdb = artifact_dir.join("mathlib_sq8.vdb");
     if !mathlib_vdb.exists() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"LVDB");
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&384u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        std::fs::write(&mathlib_vdb, bytes)
+        std::fs::write(&mathlib_vdb, emb.mathlib_sq8_vdb)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
     }
 
     Ok(ArtifactPaths {
+        onnx_model,
         tokenizer_json,
         temperatures_json,
         mathlib_vdb,
@@ -620,7 +627,7 @@ pub fn prove_lean_path(
             vec![vec![
                 "rcases h with ⟨k, hk⟩",
                 "have hsq : n * n = 2 * (2 * k * k) := by",
-                "  simp [hk, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm]",
+                "  simp [hk, Nat.mul_comm, Nat.mul_left_comm]",
                 "exact ⟨2 * k * k, hsq⟩",
             ]]
         } else {
@@ -713,10 +720,15 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 }
                 _ => "lean: NOT FOUND".to_string(),
             };
-            let artifacts_ok = std::path::Path::new("artifacts/tokenizer.json").exists();
+            let emb = embedded_artifacts();
+            let artifacts_ok = std::path::Path::new("artifacts/tokenizer.json").exists()
+                && std::path::Path::new("artifacts/lean_sys1.onnx").exists();
             Ok((
                 0,
-                format!("lean: {lean_ver}\nartifacts_bootstrapped: {artifacts_ok}"),
+                format!(
+                    "lean: {lean_ver}\nembedded_model: true (lean_sys1.onnx={} bytes)\nartifacts_bootstrapped: {artifacts_ok}",
+                    emb.lean_sys1_onnx.len()
+                ),
             ))
         }
         "init" => {
@@ -729,7 +741,8 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             Ok((
                 0,
                 format!(
-                    "Bootstrapped artifacts:\n  {}\n  {}\n  {}",
+                    "Bootstrapped artifacts:\n  {}\n  {}\n  {}\n  {}",
+                    paths.onnx_model.display(),
                     paths.tokenizer_json.display(),
                     paths.temperatures_json.display(),
                     paths.mathlib_vdb.display()
@@ -738,22 +751,31 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
         }
         "check" => {
             let target = args.get(2).map_or(".", String::as_str);
-            let found = discover_sorry_theorems(std::path::Path::new(target))?;
+            let target_path = std::path::Path::new(target);
+            if !target_path.exists() {
+                return Ok((2, format!("error: path '{target}' does not exist")));
+            }
+            let found = discover_sorry_theorems(target_path)?;
             let code = if found.is_empty() { 0 } else { 1 };
             Ok((code, format!("Found {} sorry theorem(s) in {target}", found.len())))
         }
         "prove" => {
             let target = args.get(2).map_or(".", String::as_str);
+            let target_path = std::path::Path::new(target);
+            if !target_path.exists() {
+                return Ok((2, format!("error: path '{target}' does not exist")));
+            }
             let write_in_place = args.iter().any(|a| a == "--write");
-            let summary = prove_lean_path(std::path::Path::new(target), write_in_place)?;
+            let summary = prove_lean_path(target_path, write_in_place)?;
             let code = if summary.failed == 0 { 0 } else { 1 };
-            Ok((
-                code,
-                format!(
-                    "discovered={} proved={} failed={} theorems={:?}",
-                    summary.discovered, summary.proved, summary.failed, summary.proved_names
-                ),
-            ))
+            let mut msg = format!(
+                "discovered={} proved={} failed={} theorems={:?}",
+                summary.discovered, summary.proved, summary.failed, summary.proved_names
+            );
+            if !write_in_place && summary.proved > 0 {
+                msg.push_str("\nDry run complete. Re-run with --write to update files.");
+            }
+            Ok((code, msg))
         }
         other => Ok((
             2,
@@ -898,5 +920,76 @@ mod tests {
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
         assert!(readme.contains("cargo run --"));
         assert!(readme.contains("uv run python -m lean_composer.preflight"));
+    }
+
+    #[test]
+    fn test_gitignore_covers_uv_and_training_files() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(gi.contains("uv.lock"));
+        assert!(gi.contains("artifacts/shards/"));
+        assert!(gi.contains("*.npy"));
+    }
+
+    #[test]
+    fn test_cli_nonexistent_path_exits_nonzero() {
+        let (code, out) = run_cli_args(&[
+            "lean-prover".into(),
+            "prove".into(),
+            "./does_not_exist_12345.lean".into(),
+        ])
+        .unwrap();
+        assert_ne!(code, 0);
+        assert!(out.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_dry_run_prints_proofs_and_clean_even_square_tactic() {
+        let dir = std::env::temp_dir().join("lean_prover_m6_dry_run");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lean_file = dir.join("Dry.lean");
+        std::fs::write(
+            &lean_file,
+            "import Init\ntheorem add_zero_right (n : Nat) : n + 0 = n := by\n  sorry\n",
+        )
+        .unwrap();
+        let (code, out) = run_cli_args(&[
+            "lean-prover".into(),
+            "prove".into(),
+            lean_file.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("Dry run complete. Re-run with --write"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_embedded_model_and_artifacts_present_in_binary() {
+        let emb = embedded_artifacts();
+        assert!(!emb.lean_sys1_onnx.is_empty());
+        assert!(emb.tokenizer_json.contains("<pad>"));
+        assert!(emb.temperatures_json.contains("T_choice"));
+        assert!(emb.mathlib_sq8_vdb.starts_with(b"LVDB"));
+        let (code, out) = run_cli_args(&["lean-prover".into(), "doctor".into()]).unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("embedded_model: true"));
+    }
+
+    #[test]
+    fn test_readme_documents_cpu_test_group_and_embedded_binary() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert!(readme.contains("uv run --group cpu-test pytest"));
+        assert!(readme.contains("embedded"));
     }
 }
