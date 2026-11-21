@@ -51,8 +51,30 @@ impl ImportResolver {
     }
 
     /// Collapse candidate modules through `import_dag` to remove transitively implied modules.
-    pub fn reduce_import_dag(&self, _candidates: &HashSet<String>) -> Vec<String> {
-        todo!("TASK-M1-002: implement <5ms transitive import_dag reduction")
+    pub fn reduce_import_dag(&self, candidates: &HashSet<String>) -> Vec<String> {
+        let mut implied = HashSet::new();
+        for root in candidates {
+            let mut stack: Vec<&str> = self
+                .import_dag
+                .get(root)
+                .map(|deps| deps.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            while let Some(dep) = stack.pop() {
+                if implied.insert(dep.to_string())
+                    && let Some(next_deps) = self.import_dag.get(dep)
+                {
+                    stack.extend(next_deps.iter().map(String::as_str));
+                }
+            }
+        }
+
+        let mut reduced: Vec<String> = candidates
+            .iter()
+            .filter(|m| !implied.contains(*m))
+            .cloned()
+            .collect();
+        reduced.sort();
+        reduced
     }
 
     /// Combine syntactic closure, VDB top-16 modules, and core tactic pack, then reduce via DAG.
@@ -161,7 +183,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M1-002"]
     fn test_import_dag_transitive_reduction() {
         let mut resolver = ImportResolver::default();
         resolver
