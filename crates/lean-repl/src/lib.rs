@@ -130,6 +130,207 @@ pub fn verify_zero_sorry(print_axioms_output: &str) -> Result<bool, ReplError> {
     }
 }
 
+/// Result of running the real `lean --json` compiler kernel on a theorem + tactic script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeanKernelCheckResult {
+    pub success: bool,
+    pub has_unsolved_goals: bool,
+    pub diagnostics: Vec<String>,
+    pub axioms: Vec<String>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Deserialize)]
+struct LeanJsonDiagnostic {
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    data: String,
+}
+
+/// Verify a Lean 4 theorem and tactic script using the real `lean --json` compiler.
+pub fn verify_theorem_with_lean4_kernel(
+    theorem_name: &str,
+    theorem_decl: &str,
+    tactics: &[String],
+) -> Result<LeanKernelCheckResult, ReplError> {
+    use std::process::Command;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp_path = std::env::temp_dir().join(format!("lean_proof_check_{theorem_name}_{unique}.lean"));
+
+    let mut source = format!("{theorem_decl} := by\n");
+    for tac in tactics {
+        source.push_str("  ");
+        source.push_str(tac);
+        source.push('\n');
+    }
+    source.push_str(&format!("#print axioms {theorem_name}\n"));
+    std::fs::write(&tmp_path, source)?;
+
+    let start = Instant::now();
+    let output = Command::new("lean").arg("--json").arg(&tmp_path).output();
+    let elapsed_ms = start.elapsed().as_millis();
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let output = output?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut diagnostics = Vec::new();
+    let mut axioms = Vec::new();
+    let mut has_error = !output.status.success();
+    let mut has_unsolved_goals = false;
+
+    for line in stdout.lines().chain(stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(diag) = serde_json::from_str::<LeanJsonDiagnostic>(trimmed) {
+            if diag.severity == "error" {
+                has_error = true;
+            }
+            if diag.data.contains("unsolved goals") {
+                has_unsolved_goals = true;
+            }
+            if diag.data.contains("depends on axioms:") || diag.data.contains("does not depend on any axioms") {
+                verify_zero_sorry(&diag.data)?;
+                if let Some((_, rhs)) = diag.data.split_once("depends on axioms:") {
+                    for ax in rhs.split([',', ' ']) {
+                        let ax = ax.trim().trim_matches(|c| c == '[' || c == ']');
+                        if !ax.is_empty() {
+                            axioms.push(ax.to_string());
+                        }
+                    }
+                }
+            }
+            diagnostics.push(diag.data);
+        } else {
+            diagnostics.push(trimmed.to_string());
+        }
+    }
+
+    Ok(LeanKernelCheckResult {
+        success: !has_error && !has_unsolved_goals,
+        has_unsolved_goals,
+        diagnostics,
+        axioms,
+        elapsed_ms,
+    })
+}
+
+/// Standard Lean 4 axioms permitted in verified solutions.
+pub const ALLOWED_LEAN_AXIOMS: &[&str] = &["propext", "Classical.choice", "Quot.sound"];
+
+/// Verify `#print axioms` output contains no `sorryAx` or non-standard axioms.
+pub fn verify_allowed_axioms(print_axioms_output: &str) -> Result<Vec<String>, ReplError> {
+    verify_zero_sorry(print_axioms_output)?;
+    let mut axioms = Vec::new();
+    if let Some((_, rhs)) = print_axioms_output.split_once("depends on axioms:") {
+        let inner = rhs.trim().trim_start_matches('[').trim_end_matches(']');
+        for ax in inner.split(',') {
+            let ax = ax.trim();
+            if ax.is_empty() {
+                continue;
+            }
+            if !ALLOWED_LEAN_AXIOMS.contains(&ax) {
+                return Err(ReplError::TacticError(format!("illegal axiom: {ax}")));
+            }
+            axioms.push(ax.to_string());
+        }
+    }
+    Ok(axioms)
+}
+
+fn extract_normalized_signature(lean_src: &str, short_name: &str) -> Result<String, ReplError> {
+    let needle = format!("theorem {short_name}");
+    let start = lean_src
+        .find(&needle)
+        .ok_or_else(|| ReplError::TacticError(format!("signature for {short_name} not found")))?;
+    let rest = &lean_src[start..];
+    let end = rest
+        .find(":= by")
+        .ok_or_else(|| ReplError::TacticError(format!("':= by' for {short_name} not found")))?;
+    Ok(rest[..end].split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Run Gate 1 (Signature Lock) + Gate 2 & 3 (Lean 4 Kernel + Axiom Audit) on `solutions/<id>.lean`.
+pub fn verify_solution_file_in_workspace(
+    workspace_dir: &std::path::Path,
+    problem_rel_path: &str,
+    solution_rel_path: &str,
+    theorem_full_name: &str,
+) -> Result<LeanKernelCheckResult, ReplError> {
+    use std::process::Command;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    let prob_src = std::fs::read_to_string(workspace_dir.join(problem_rel_path))?;
+    let sol_src = std::fs::read_to_string(workspace_dir.join(solution_rel_path))?;
+    let short_name = theorem_full_name.rsplit('.').next().unwrap_or(theorem_full_name);
+
+    // Gate 1: Signature Lock
+    let prob_sig = extract_normalized_signature(&prob_src, short_name)?;
+    let sol_sig = extract_normalized_signature(&sol_src, short_name)?;
+    if prob_sig != sol_sig {
+        return Err(ReplError::TacticError(
+            "Signature mismatch: theorem statement was modified".to_string(),
+        ));
+    }
+
+    // Gate 2 & 3: Kernel Elaboration + Axiom Audit
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp_path = workspace_dir.join(format!("_audit_{short_name}_{unique}.lean"));
+    std::fs::write(&tmp_path, format!("{sol_src}\n\n#print axioms {theorem_full_name}\n"))?;
+
+    let start = Instant::now();
+    let output = Command::new("lean").arg("--json").arg(&tmp_path).output();
+    let elapsed_ms = start.elapsed().as_millis();
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let output = output?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut diagnostics = Vec::new();
+    let mut axioms = Vec::new();
+    let mut has_error = !output.status.success();
+    let mut has_unsolved_goals = false;
+
+    for line in stdout.lines().chain(stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(diag) = serde_json::from_str::<LeanJsonDiagnostic>(trimmed) {
+            if diag.severity == "error" {
+                has_error = true;
+            }
+            if diag.data.contains("unsolved goals") {
+                has_unsolved_goals = true;
+            }
+            if diag.data.contains("depends on axioms:") || diag.data.contains("does not depend on any axioms") {
+                axioms = verify_allowed_axioms(&diag.data)?;
+            }
+            diagnostics.push(diag.data);
+        } else {
+            diagnostics.push(trimmed.to_string());
+        }
+    }
+
+    Ok(LeanKernelCheckResult {
+        success: !has_error && !has_unsolved_goals,
+        has_unsolved_goals,
+        diagnostics,
+        axioms,
+        elapsed_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

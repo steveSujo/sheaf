@@ -1,0 +1,17 @@
+name = "EvalWorkspace"
+defaultTargets = ["Verify"]
+testDriver = "Verify"
+
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "Problems"
+srcDir = "problems"
+
+[[lean_lib]]
+name = "Solutions"
+srcDir = "solutions"
+
+[[lean_lib]]
+name = "Verify"

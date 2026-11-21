@@ -1,0 +1,3 @@
+{"id": "P001_nat_add_comm", "file": "problems/tier0_atomic/P001_nat_add_comm.lean", "theorem": "Eval.P001.nat_add_comm", "imports": ["Init"], "tier": 0, "timeout_s": 10, "max_ram_mb": 512}
+{"id": "P010_list_len_append", "file": "problems/tier1_rewrite/P010_list_len_append.lean", "theorem": "Eval.P010.list_len_append", "imports": ["Init.Data.List.Lemmas"], "tier": 1, "timeout_s": 15, "max_ram_mb": 512}
+{"id": "P020_have_cutpoint", "file": "problems/tier2_compositional/P020_have_cutpoint.lean", "theorem": "Eval.P020.even_square", "imports": ["Init"], "tier": 2, "timeout_s": 30, "max_ram_mb": 768}

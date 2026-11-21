@@ -9,5 +9,7 @@ lean-canonicalizer = { path = "../lean-canonicalizer" }
 lean-repl = { path = "../lean-repl" }
 lean-sys1-ort = { path = "../lean-sys1-ort" }
 lean-vdb = { path = "../lean-vdb" }
+orion = { git = "https://github.com/steveSujo/orion.git", branch = "main" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
