@@ -220,8 +220,14 @@ pub fn score_premise_fit_batch(
 }
 
 /// Decide between branching on top-2 surviving lemmas or forcing `introduce_have`.
-pub fn select_fallback_outcome(_scored_candidates: &[(usize, f32)], _max_branches: usize) -> FallbackOutcome {
-    todo!("TASK-M3-003: implement LeJEPA fallback branching or introduce_have trigger")
+pub fn select_fallback_outcome(scored_candidates: &[(usize, f32)], max_branches: usize) -> FallbackOutcome {
+    if scored_candidates.is_empty() || max_branches == 0 {
+        return FallbackOutcome::ForceIntroduceHave;
+    }
+    let mut top: Vec<(usize, f32)> = scored_candidates.to_vec();
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    top.truncate(max_branches);
+    FallbackOutcome::BranchOnLemmas(top)
 }
 
 #[cfg(test)]
@@ -275,7 +281,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M3-003"]
     fn test_lejepa_next_state_prediction_and_fallback_have() {
         let hits = vec![(3, 0.88), (7, 0.72), (1, 0.61)];
         assert_eq!(
