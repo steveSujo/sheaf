@@ -71,12 +71,39 @@ pub fn project_soft_tokens(
 
 /// Build a dynamic PDA/trie logit mask allowing only hypotheses, top-k lemmas, and core tactics.
 pub fn build_pda_logit_mask(
-    _vocab_tokens: &[String],
-    _hypotheses: &[String],
-    _top_k_lemmas: &[String],
-    _partial_prefix: &str,
+    vocab_tokens: &[String],
+    hypotheses: &[String],
+    top_k_lemmas: &[String],
+    partial_prefix: &str,
 ) -> Vec<f32> {
-    todo!("TASK-M4-002: implement dynamic PDA trie logit mask")
+    let mut allowed: HashSet<&str> = HashSet::new();
+    for h in hypotheses {
+        allowed.insert(h.as_str());
+    }
+    for l in top_k_lemmas {
+        allowed.insert(l.as_str());
+    }
+    for &kw in CORE_TACTIC_KEYWORDS {
+        allowed.insert(kw);
+    }
+
+    let ident_prefix = partial_prefix
+        .rsplit([' ', '[', '(', ',', '\n', '\t'])
+        .next()
+        .unwrap_or("");
+
+    vocab_tokens
+        .iter()
+        .map(|tok| {
+            let is_allowed = allowed.contains(tok.as_str())
+                && (ident_prefix.is_empty() || tok.starts_with(ident_prefix));
+            if is_allowed {
+                0.0_f32
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect()
 }
 
 /// Detect whether `required_module` is absent from `active_modules` and return the expanded module list.
@@ -117,7 +144,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M4-002"]
     fn test_pda_trie_identifier_logit_mask_zero_hallucination() {
         let vocab = vec![
             "Nat.add_comm".to_string(),
