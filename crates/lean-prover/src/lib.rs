@@ -477,6 +477,8 @@ pub struct DiscoveredTheorem {
     pub binders: Vec<(String, String)>,
     pub local_defs: Vec<String>,
     pub local_structures: Vec<String>,
+    pub local_inductives: Vec<String>,
+    pub local_theorems: Vec<String>,
 }
 
 /// Summary of proving all `sorry` theorems in a `.lean` file or workspace.
@@ -541,6 +543,8 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
         let mut current_ns: Option<String> = None;
         let mut local_defs: Vec<String> = Vec::new();
         let mut local_structures: Vec<String> = Vec::new();
+        let mut local_inductives: Vec<String> = Vec::new();
+        let mut local_theorems: Vec<String> = Vec::new();
         let lines: Vec<&str> = src.lines().collect();
 
         let mut idx = 0usize;
@@ -550,7 +554,10 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                 current_ns = Some(ns.trim().to_string());
             } else if trimmed.starts_with("end ") {
                 current_ns = None;
-            } else if let Some(after_def) = trimmed.strip_prefix("def ") {
+            } else if let Some(after_def) = trimmed
+                .strip_prefix("def ")
+                .or_else(|| trimmed.strip_prefix("abbrev "))
+            {
                 if let Some(dname) = after_def
                     .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
                     .next()
@@ -566,7 +573,18 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                 {
                     local_structures.push(sname.to_string());
                 }
-            } else if let Some(after_thm) = trimmed.strip_prefix("theorem ") {
+            } else if let Some(after_ind) = trimmed.strip_prefix("inductive ") {
+                if let Some(iname) = after_ind
+                    .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                {
+                    local_inductives.push(iname.to_string());
+                }
+            } else if let Some(after_thm) = trimmed
+                .strip_prefix("theorem ")
+                .or_else(|| trimmed.strip_prefix("lemma "))
+            {
                 let start_line = idx + 1;
                 let name = after_thm
                     .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
@@ -579,7 +597,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                 while !decl_parts.last().is_some_and(|l| l.contains(":= by")) && scan + 1 < lines.len() {
                     scan += 1;
                     let nt = lines[scan].trim();
-                    if nt.starts_with("theorem ") || nt.starts_with("end ") {
+                    if nt.starts_with("theorem ") || nt.starts_with("lemma ") || nt.starts_with("end ") {
                         break;
                     }
                     decl_parts.push(nt.to_string());
@@ -590,7 +608,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                 if !has_sorry {
                     for next_line in lines.iter().skip(scan + 1).take(6) {
                         let nt = next_line.trim();
-                        if nt.starts_with("theorem ") || nt.starts_with("end ") {
+                        if nt.starts_with("theorem ") || nt.starts_with("lemma ") || nt.starts_with("end ") {
                             break;
                         }
                         if nt.contains("sorry") {
@@ -606,18 +624,45 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                         file: file.clone(),
                         line: start_line,
                         namespace: current_ns.clone(),
-                        name,
+                        name: name.clone(),
                         signature: full_decl,
                         binders,
                         local_defs: local_defs.clone(),
                         local_structures: local_structures.clone(),
+                        local_inductives: local_inductives.clone(),
+                        local_theorems: local_theorems.clone(),
                     });
+                }
+                if !name.is_empty() {
+                    local_theorems.push(name);
                 }
             }
             idx += 1;
         }
     }
     Ok(found)
+}
+
+fn extract_theorem_target(signature: &str) -> &str {
+    let header = signature.split(":= by").next().unwrap_or(signature).trim();
+    let mut depth = 0usize;
+    let bytes = header.as_bytes();
+    for (idx, ch) in header.char_indices() {
+        match ch {
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                let prev_colon = idx > 0 && bytes[idx - 1] == b':';
+                let next_colon = bytes.get(idx + 1) == Some(&b':');
+                let next_eq = bytes.get(idx + 1) == Some(&b'=');
+                if !prev_colon && !next_colon && !next_eq {
+                    return header[idx + 1..].trim();
+                }
+            }
+            _ => {}
+        }
+    }
+    header
 }
 
 fn parse_theorem_binders(decl: &str) -> Vec<(String, String)> {
@@ -731,24 +776,26 @@ pub fn prove_lean_path_with_artifacts(
     let mut proved_scripts = Vec::new();
     let mut failed_theorems = Vec::new();
     let mut stage_logs = Vec::new();
+    let mut file_buffers: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
 
     for (idx, thm) in theorems.iter().enumerate() {
         let thm_start = Instant::now();
-        let src = std::fs::read_to_string(&thm.file)
-            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+        let src = if let Some(existing) = file_buffers.get(&thm.file) {
+            existing.clone()
+        } else {
+            let loaded = std::fs::read_to_string(&thm.file)
+                .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+            file_buffers.insert(thm.file.clone(), loaded.clone());
+            loaded
+        };
         let full_name = match &thm.namespace {
             Some(ns) => format!("{ns}.{}", thm.name),
             None => thm.name.clone(),
         };
 
         // Stage 1: Canonicalize
-        let target_str = thm
-            .signature
-            .split(":= by")
-            .next()
-            .and_then(|h| h.rsplit(':').next())
-            .unwrap_or(&thm.signature)
-            .trim();
+        let target_str = extract_theorem_target(&thm.signature);
         let hyp_strs: Vec<String> = thm
             .binders
             .iter()
@@ -837,14 +884,34 @@ pub fn prove_lean_path_with_artifacts(
             let _ = std::fs::remove_file(&tmp_file);
 
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if out.status.success()
-                && !stdout.contains("sorryAx")
-                && !stdout.contains("declaration uses 'sorry'")
-            {
+            let mut has_error = false;
+            let mut uses_sorry_ax = false;
+            let mut first_error_msg: Option<String> = None;
+            for line in stdout.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
+                    let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    if sev == "error" {
+                        has_error = true;
+                        if first_error_msg.is_none() && !data.is_empty() {
+                            first_error_msg = Some(data.to_string());
+                        }
+                    }
+                    if data.contains("sorryAx") {
+                        uses_sorry_ax = true;
+                    }
+                } else if line.contains("sorryAx") {
+                    uses_sorry_ax = true;
+                }
+            }
+
+            if out.status.success() && !has_error && !uses_sorry_ax {
                 solved = Some((candidate_src, script));
                 break;
             }
-            last_diag = stdout.lines().next().unwrap_or("kernel rejected").to_string();
+            last_diag = first_error_msg
+                .or_else(|| stdout.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
+                .unwrap_or_else(|| "kernel rejected".to_string());
         }
 
         let elapsed_ms = thm_start.elapsed().as_millis();
@@ -869,6 +936,7 @@ pub fn prove_lean_path_with_artifacts(
         stage_logs.push(log_block);
 
         if let Some((new_src, script)) = solved {
+            file_buffers.insert(thm.file.clone(), new_src.clone());
             if write_in_place {
                 std::fs::write(&thm.file, new_src)
                     .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
@@ -897,28 +965,39 @@ pub fn prove_lean_path_with_artifacts(
 fn synthesize_from_model_and_vdb(
     thm: &DiscoveredTheorem,
     head_symbol: &str,
-    _pred: &lean_sys1_ort::Sys1Prediction,
+    pred: &lean_sys1_ort::Sys1Prediction,
     vdb_hits: &[lean_vdb::VdbSearchHit],
     top_lemmas: &[String],
 ) -> Vec<Vec<String>> {
     let mut scripts: Vec<Vec<String>> = Vec::new();
 
-    // 1. Local def + structure binders (e.g., LWWReg / merge) with leaf-only omega (TASK-M8-004)
+    // Collect in-scope definitions referenced in the signature or needed transitively
     let used_defs: Vec<&str> = thm
         .local_defs
         .iter()
         .filter(|d| thm.signature.contains(d.as_str()))
         .map(String::as_str)
         .collect();
+    let all_defs: Vec<&str> = thm.local_defs.iter().map(String::as_str).collect();
+    let struct_vars: Vec<&str> = thm
+        .binders
+        .iter()
+        .filter(|(_, ty)| thm.local_structures.iter().any(|s| s == ty))
+        .map(|(var, _)| var.as_str())
+        .collect();
+
+    // Combine relevant local definitions and preceding intra-module theorems
+    let mut context_lemmas: Vec<String> = all_defs.iter().map(|s| (*s).to_string()).collect();
+    for lt in &thm.local_theorems {
+        if !context_lemmas.contains(lt) {
+            context_lemmas.push(lt.clone());
+        }
+    }
+    let context_list = context_lemmas.join(", ");
+
+    // 1. Local def + structure binders with leaf-only omega
     if !used_defs.is_empty() {
         let defs_list = used_defs.join(", ");
-        let struct_vars: Vec<&str> = thm
-            .binders
-            .iter()
-            .filter(|(_, ty)| thm.local_structures.iter().any(|s| s == ty))
-            .map(|(var, _)| var.as_str())
-            .collect();
-
         if struct_vars.len() == 1 {
             scripts.push(vec![format!("simp [{defs_list}]")]);
         } else if struct_vars.len() == 2 {
@@ -943,10 +1022,104 @@ fn synthesize_from_model_and_vdb(
             scripts.push(vec![format!(
                 "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))))"
             )]);
+        } else {
+            // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
+            scripts.push(vec![format!("dsimp [{defs_list}] at *; omega")]);
+            scripts.push(vec![format!("unfold {defs_list} at *; omega")]);
+            if !context_list.is_empty() {
+                scripts.push(vec![format!("simp [{context_list}]")]);
+            }
+        }
+    } else if !context_list.is_empty() {
+        scripts.push(vec![format!("simp [{context_list}]")]);
+    }
+
+    // 2. Structural induction over List or local inductive binders (or when Sys1 predicts Induction)
+    let ind_binders: Vec<(&str, &str)> = thm
+        .binders
+        .iter()
+        .filter(|(_, ty)| {
+            ty == "List"
+                || ty.starts_with("List ")
+                || thm
+                    .local_inductives
+                    .iter()
+                    .any(|ind| ty == ind || ty.starts_with(&format!("{ind} ")))
+        })
+        .map(|(v, ty)| (v.as_str(), ty.as_str()))
+        .collect();
+
+    let mut induction_targets: Vec<(&str, bool)> = ind_binders
+        .iter()
+        .map(|(v, ty)| (*v, *ty == "List" || ty.starts_with("List ")))
+        .collect();
+    if induction_targets.is_empty()
+        && pred.strategy == lean_sys1_ort::StrategyChoice::Induction
+        && let Some((first_var, _)) = thm
+            .binders
+            .iter()
+            .find(|(_, ty)| !ty.contains('∃') && !ty.contains('∧') && ty != "Type")
+    {
+        induction_targets.push((first_var.as_str(), false));
+    }
+
+    if !induction_targets.is_empty() {
+        let mut ind_ctx = context_lemmas.clone();
+        if thm.signature.contains("List") || ind_binders.iter().any(|(_, ty)| ty.starts_with("List")) {
+            ind_ctx.push("List.append_assoc".to_string());
+        }
+        let ind_ctx_list = ind_ctx.join(", ");
+
+        for (v_ind, is_list) in induction_targets {
+            let other_vars: Vec<&str> = thm
+                .binders
+                .iter()
+                .filter(|(v, ty)| {
+                    v.as_str() != v_ind
+                        && !ty.contains('∃')
+                        && !ty.contains('∧')
+                        && ty != "Type"
+                })
+                .map(|(v, _)| v.as_str())
+                .collect();
+
+            if !ind_ctx_list.is_empty() {
+                scripts.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
+                scripts.push(vec![format!(
+                    "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> try omega"
+                )]);
+                if !other_vars.is_empty() {
+                    let gen_all = other_vars.join(" ");
+                    scripts.push(vec![format!(
+                        "induction {v_ind} generalizing {gen_all} <;> simp_all [{ind_ctx_list}]"
+                    )]);
+                    scripts.push(vec![format!(
+                        "induction {v_ind} generalizing {gen_all} <;> all_goals (repeat (first | rfl | simp_all [{ind_ctx_list}] | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
+                    )]);
+                    if let Some(&last_var) = other_vars.last() {
+                        if other_vars.len() > 1 {
+                            scripts.push(vec![format!(
+                                "induction {v_ind} generalizing {last_var} <;> simp_all [{ind_ctx_list}]"
+                            )]);
+                        }
+                        if is_list {
+                            scripts.push(vec![format!(
+                                "induction {v_ind} generalizing {last_var} with | nil => simp_all [{ind_ctx_list}] | cons hd tl ih => cases hd <;> simp_all [{ind_ctx_list}] <;> try (cases {last_var} <;> simp_all [{ind_ctx_list}] <;> try (rename_i _ tl2; cases tl2 <;> simp_all [{ind_ctx_list}]))"
+                            )]);
+                        }
+                    }
+                }
+            } else {
+                scripts.push(vec![format!("induction {v_ind} <;> simp_all <;> try omega")]);
+            }
         }
     }
 
-    // 2. Model + VDB retrieved lemma candidates (zero hardcoded theorem-string checks)
+    // 3. Bare general closers before external VDB lemmas
+    scripts.push(vec!["simp".to_string()]);
+    scripts.push(vec!["omega".to_string()]);
+
+    // 4. Model + VDB retrieved lemma candidates (zero hardcoded theorem-string checks)
     let mut vdb_lemma_names: Vec<String> = top_lemmas.to_vec();
     for hit in vdb_hits {
         if !vdb_lemma_names.contains(&hit.metadata.name) {
@@ -960,14 +1133,14 @@ fn synthesize_from_model_and_vdb(
         .map(|(v, _)| v.as_str())
         .collect();
 
-    for lemma in &vdb_lemma_names {
+    for lemma in vdb_lemma_names.iter().take(6) {
         if !var_args.is_empty() {
             scripts.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
         }
         scripts.push(vec![format!("simp [{lemma}]")]);
     }
 
-    // 3. Structural head-symbol introduction from canonicalizer + model gate
+    // 5. Structural head-symbol introduction from canonicalizer + model gate
     if head_symbol == "And" || thm.signature.contains('∧') {
         if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∧')) {
             scripts.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
@@ -1454,6 +1627,55 @@ mod tests {
         assert!(log.contains("3. Lean-Sys1"));
         assert!(log.contains("4. Orion VDB"));
         assert!(log.contains("5. Lean Kernel"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_theorem_target_preserves_list_cons_and_type_ascriptions() {
+        let sig = "theorem cons_eq (x : Nat) (xs : List Nat) : (x :: xs).length = xs.length + 1 := by sorry";
+        assert_eq!(
+            extract_theorem_target(sig),
+            "(x :: xs).length = xs.length + 1"
+        );
+        let sig_ann = "theorem ann_eq (n : Nat) : (n : Nat) + 0 = n := by sorry";
+        assert_eq!(extract_theorem_target(sig_ann), "(n : Nat) + 0 = n");
+    }
+
+    #[test]
+    fn test_multi_theorem_file_isolation_and_intra_module_lemma_reuse() {
+        let dir = std::env::temp_dir().join("lean_prover_m9_multi_isolation");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("MultiChain.lean");
+        std::fs::write(
+            &f,
+            "import Init\ndef doubleIt (n : Nat) : Nat := n + n\ntheorem unprovable_placeholder (n : Nat) : n = n + 1 := by\n  sorry\ntheorem helper_step (n : Nat) : doubleIt n = 2 * n := by\n  sorry\ntheorem uses_helper (n : Nat) : doubleIt (doubleIt n) = 4 * n := by\n  sorry\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 3);
+        assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 1);
+        assert!(summary.proved_names.contains(&"helper_step".to_string()));
+        assert!(summary.proved_names.contains(&"uses_helper".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_general_structural_induction_and_def_unfold_omega() {
+        let dir = std::env::temp_dir().join("lean_prover_m9_ind_unfold");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("IndUnfold.lean");
+        std::fs::write(
+            &f,
+            "import Init\ndef BASE : Nat := 100\ninductive BinTree (α : Type) where\n  | leaf : BinTree α\n  | node : BinTree α → α → BinTree α → BinTree α\ndef flipTree {α : Type} : BinTree α → BinTree α\n  | .leaf => .leaf\n  | .node l x r => .node (flipTree r) x (flipTree l)\ntheorem bound_with_const (a b : Nat) (ha : a < BASE) (hb : b < BASE) : a + b < 2 * BASE := by\n  sorry\ntheorem flip_twice {α : Type} (t : BinTree α) : flipTree (flipTree t) = t := by\n  sorry\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

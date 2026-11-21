@@ -120,6 +120,12 @@ fn replace_idents(expr: &str, var_map: &std::collections::HashMap<String, String
             let ident = &expr[start..end];
             if let Some(mapped) = var_map.get(ident) {
                 out.push_str(mapped);
+            } else if let Some((base, rest)) = ident.split_once('.')
+                && let Some(mapped) = var_map.get(base)
+            {
+                out.push_str(mapped);
+                out.push('.');
+                out.push_str(rest);
             } else {
                 out.push_str(ident);
             }
@@ -312,6 +318,18 @@ mod tests {
 
         let (_, quant_norm) = normalize_alpha_vars(&[], "∀ (n m : Nat), n + m = m + n");
         assert_eq!(quant_norm, "∀ (_v0 _v1 : Nat), _v0 + _v1 = _v1 + _v0");
+    }
+
+    #[test]
+    fn test_normalize_alpha_vars_with_dot_projections() {
+        let hyps = vec!["xs : List Nat".to_string(), "ys : List Nat".to_string()];
+        let target = "List.length (xs ++ ys) = xs.length + ys.length";
+        let (norm_hyps, norm_target) = normalize_alpha_vars(&hyps, target);
+        assert_eq!(norm_hyps, vec!["_v0 : List Nat", "_v1 : List Nat"]);
+        assert_eq!(
+            norm_target,
+            "List.length (_v0 ++ _v1) = _v0.length + _v1.length"
+        );
     }
 
     #[test]
