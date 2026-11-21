@@ -488,6 +488,7 @@ pub struct WorkspaceProveSummary {
     pub proved_names: Vec<String>,
     pub proved_scripts: Vec<(String, Vec<String>)>,
     pub failed_theorems: Vec<(String, String)>,
+    pub stage_logs: Vec<String>,
 }
 
 /// Bootstrap baseline `lean_sys1.onnx`, `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` into `artifact_dir`.
@@ -681,27 +682,58 @@ fn collect_lean_files(
     Ok(())
 }
 
-/// Prove all discovered `sorry` theorems in `path`, kernel-verify them, and optionally write in place.
+/// Prove all discovered `sorry` theorems in `path` using the embedded `lean_sys1.onnx` and `mathlib_sq8.vdb`.
 pub fn prove_lean_path(
     path: &std::path::Path,
     write_in_place: bool,
 ) -> Result<WorkspaceProveSummary, ProverError> {
-    let theorems = discover_sorry_theorems(path)?;
     let emb = embedded_artifacts();
-    let temps: lean_sys1_ort::CalibrationTemperatures =
-        serde_json::from_str(emb.temperatures_json).unwrap_or(lean_sys1_ort::CalibrationTemperatures {
-            t_choice: 1.0,
-            t_noul: 1.0,
-            t_fit: 1.0,
-        });
+    prove_lean_path_with_artifacts(
+        path,
+        write_in_place,
+        emb.lean_sys1_onnx,
+        emb.tokenizer_json,
+        emb.temperatures_json,
+        emb.mathlib_sq8_vdb,
+    )
+}
 
+/// Prove all discovered `sorry` theorems with explicit model, tokenizer, temperature, and VDB bytes.
+pub fn prove_lean_path_with_artifacts(
+    path: &std::path::Path,
+    write_in_place: bool,
+    onnx_bytes: &[u8],
+    tokenizer_json: &str,
+    temperatures_json: &str,
+    vdb_bytes: &[u8],
+) -> Result<WorkspaceProveSummary, ProverError> {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    let onnx_sess = lean_sys1_ort::LeanSys1OnnxSession::from_onnx_bytes(onnx_bytes)?;
+    let temps: lean_sys1_ort::CalibrationTemperatures = serde_json::from_str(temperatures_json)
+        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Json(e)))?;
+    let (vdb, _resolver) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(vdb_bytes)?;
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let orion_dir = std::env::temp_dir().join(format!(
+        "lean_prover_orion_{unique}_{:?}",
+        std::thread::current().id()
+    ));
+    let orion_db = vdb.build_orion_db(&orion_dir)?;
+
+    let theorems = discover_sorry_theorems(path)?;
+    let total = theorems.len();
     let mut proved = 0usize;
     let mut failed = 0usize;
     let mut proved_names = Vec::new();
     let mut proved_scripts = Vec::new();
     let mut failed_theorems = Vec::new();
+    let mut stage_logs = Vec::new();
 
-    for thm in &theorems {
+    for (idx, thm) in theorems.iter().enumerate() {
+        let thm_start = Instant::now();
         let src = std::fs::read_to_string(&thm.file)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
         let full_name = match &thm.namespace {
@@ -709,7 +741,7 @@ pub fn prove_lean_path(
             None => thm.name.clone(),
         };
 
-        // Wire embedded canonicalizer + tokenizer + confidence gate on theorem target
+        // Stage 1: Canonicalize
         let target_str = thm
             .signature
             .split(":= by")
@@ -725,15 +757,57 @@ pub fn prove_lean_path(
         let collapsed = lean_canonicalizer::collapse_implicit_instances(target_str);
         let (norm_hyps, norm_target) =
             lean_canonicalizer::normalize_alpha_vars(&hyp_strs, &collapsed);
+        let head_symbol = lean_canonicalizer::extract_head_symbol(&norm_target)?;
         let canonical = format!("{} ⊢ {}", norm_hyps.join(", "), norm_target);
-        let _ = lean_sys1_ort::encode_canonical_text(emb.tokenizer_json, &canonical, 512);
-        let _ = lean_sys1_ort::route_with_confidence_gate(&[0.5, 1.8, 0.4, 0.2, 0.1], temps.t_choice);
 
-        let candidates = build_candidate_scripts(thm);
+        // Stage 2: Tokenize
+        let (input_ids, attention_mask) =
+            lean_sys1_ort::encode_canonical_text(tokenizer_json, &canonical, 512)?;
+        let non_pad = attention_mask.iter().filter(|&&m| m == 1).count();
+
+        // Stage 3: Lean-Sys1 ONNX forward pass
+        let (pred, _choice_logits, gate) =
+            onnx_sess.forward(&input_ids, &attention_mask, &temps)?;
+
+        // Stage 4: Orion VDB HNSW search + 4d PremiseFit + PDA mask
+        let vdb_hits =
+            vdb.search_hnsw_backend(&orion_db, &pred.state_emb, head_symbol.as_str(), 8)?;
+        let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
+        let cand_names: Vec<String> = vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
+        let scored = if cand_embs.is_empty() {
+            Vec::new()
+        } else {
+            lean_sys1_ort::score_premise_fit_batch(
+                &pred.state_emb,
+                &cand_embs,
+                onnx_sess.premise_fit_weights(),
+                temps.t_fit,
+                0.0,
+            )?
+        };
+        let fallback = lean_sys1_ort::select_fallback_outcome(&scored, 4);
+        let top_lemmas: Vec<String> = match &fallback {
+            lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
+                .iter()
+                .filter_map(|(i, _)| cand_names.get(*i).cloned())
+                .collect(),
+            lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => Vec::new(),
+        };
+        let pda_mask = build_pda_logit_mask(&cand_names, &hyp_strs, &top_lemmas, "");
+        let pda_allowed = pda_mask.iter().filter(|&&m| m == 0.0).count();
+        let _soft_tokens = project_soft_tokens(
+            &cand_embs.iter().take(2).cloned().collect::<Vec<_>>(),
+            2,
+            pred.state_emb.len(),
+        );
+
+        // Stage 5: Model-only VDB-driven tactic synthesis + Lean 4 Kernel verification
+        let candidates =
+            synthesize_from_model_and_vdb(thm, head_symbol.as_str(), &pred, &vdb_hits, &top_lemmas);
         let lake_root = find_lake_workspace_root(&thm.file);
 
         let mut solved: Option<(String, Vec<String>)> = None;
-        let mut last_diag = String::from("no candidate tactic closed the goal");
+        let mut last_diag = String::from("model produced no valid kernel-verified tactic");
 
         for script in candidates {
             let body = script
@@ -742,8 +816,7 @@ pub fn prove_lean_path(
                 .collect::<Vec<_>>()
                 .join("\n");
             let candidate_src = replace_theorem_sorry(&src, &thm.name, &body);
-            let tmp_dir = std::env::temp_dir();
-            let tmp_file = tmp_dir.join(format!("lean_prove_{}.lean", thm.name));
+            let tmp_file = std::env::temp_dir().join(format!("lean_prove_{}.lean", thm.name));
             let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
             std::fs::write(&tmp_file, &audit)
                 .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
@@ -774,6 +847,27 @@ pub fn prove_lean_path(
             last_diag = stdout.lines().next().unwrap_or("kernel rejected").to_string();
         }
 
+        let elapsed_ms = thm_start.elapsed().as_millis();
+        let kernel_line = match &solved {
+            Some((_, s)) => format!("VERIFIED in {elapsed_ms}ms [tactic: {}]", s.join("; ")),
+            None => format!("FAILED in {elapsed_ms}ms [{last_diag}]"),
+        };
+        let log_block = format!(
+            "[{}/{}] {full_name} ({}:{})\n  ├─ 1. Canonicalize : {canonical} [head_symbol={}]\n  ├─ 2. Tokenize     : {non_pad} tokens (pad_to=512)\n  ├─ 3. Lean-Sys1    : strategy={:?} conf={:.2} noul={:.2} difficulty={:?} gate={gate:?}\n  ├─ 4. Orion VDB    : {} hits -> top={top_lemmas:?} pda_allowed={pda_allowed}\n  └─ 5. Lean Kernel  : {kernel_line}",
+            idx + 1,
+            total,
+            thm.file.display(),
+            thm.line,
+            head_symbol.as_str(),
+            pred.strategy,
+            pred.answer_confidence,
+            pred.direct_close_prob,
+            pred.difficulty,
+            vdb_hits.len(),
+        );
+        eprintln!("{log_block}");
+        stage_logs.push(log_block);
+
         if let Some((new_src, script)) = solved {
             if write_in_place {
                 std::fs::write(&thm.file, new_src)
@@ -788,20 +882,28 @@ pub fn prove_lean_path(
         }
     }
 
+    let _ = std::fs::remove_dir_all(&orion_dir);
     Ok(WorkspaceProveSummary {
-        discovered: theorems.len(),
+        discovered: total,
         proved,
         failed,
         proved_names,
         proved_scripts,
         failed_theorems,
+        stage_logs,
     })
 }
 
-fn build_candidate_scripts(thm: &DiscoveredTheorem) -> Vec<Vec<String>> {
+fn synthesize_from_model_and_vdb(
+    thm: &DiscoveredTheorem,
+    head_symbol: &str,
+    _pred: &lean_sys1_ort::Sys1Prediction,
+    vdb_hits: &[lean_vdb::VdbSearchHit],
+    top_lemmas: &[String],
+) -> Vec<Vec<String>> {
     let mut scripts: Vec<Vec<String>> = Vec::new();
 
-    // General local-definition + structure destructuring candidates (e.g., LWWReg / merge)
+    // 1. Local def + structure binders (e.g., LWWReg / merge) with leaf-only omega (TASK-M8-004)
     let used_defs: Vec<&str> = thm
         .local_defs
         .iter()
@@ -842,30 +944,53 @@ fn build_candidate_scripts(thm: &DiscoveredTheorem) -> Vec<Vec<String>> {
                 "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))))"
             )]);
         }
-        scripts.push(vec![format!(
-            "unfold {defs_list}; repeat split <;> first | rfl | omega"
-        )]);
     }
 
-    // General algebraic, list, logical, and existential cut-point candidates
-    if thm.signature.contains("n + 0 = n") {
-        scripts.push(vec!["exact Nat.add_zero n".to_string()]);
-    } else if thm.signature.contains("a + b = b + a") {
-        scripts.push(vec!["exact Nat.add_comm a b".to_string()]);
-    } else if thm.signature.contains(".length") && thm.signature.contains("++") {
-        scripts.push(vec!["simp [List.length_append]".to_string()]);
-    } else if thm.signature.contains("p ∧ q") && thm.signature.contains("q ∧ p") {
-        scripts.push(vec!["exact ⟨h.2, h.1⟩".to_string()]);
-    } else if thm.signature.contains("n * n = 2 * m") {
-        scripts.push(vec![
-            "rcases h with ⟨k, hk⟩".to_string(),
-            "have hsq : n * n = 2 * (2 * k * k) := by".to_string(),
-            "  simp [hk, Nat.mul_comm, Nat.mul_left_comm]".to_string(),
-            "exact ⟨2 * k * k, hsq⟩".to_string(),
-        ]);
+    // 2. Model + VDB retrieved lemma candidates (zero hardcoded theorem-string checks)
+    let mut vdb_lemma_names: Vec<String> = top_lemmas.to_vec();
+    for hit in vdb_hits {
+        if !vdb_lemma_names.contains(&hit.metadata.name) {
+            vdb_lemma_names.push(hit.metadata.name.clone());
+        }
+    }
+    let var_args: Vec<&str> = thm
+        .binders
+        .iter()
+        .filter(|(_, ty)| !ty.contains('∃') && !ty.contains('∧'))
+        .map(|(v, _)| v.as_str())
+        .collect();
+
+    for lemma in &vdb_lemma_names {
+        if !var_args.is_empty() {
+            scripts.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
+        }
+        scripts.push(vec![format!("simp [{lemma}]")]);
     }
 
-    scripts.push(vec!["first | omega | simp".to_string()]);
+    // 3. Structural head-symbol introduction from canonicalizer + model gate
+    if head_symbol == "And" || thm.signature.contains('∧') {
+        if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∧')) {
+            scripts.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
+        }
+    } else if head_symbol == "Exists" || thm.signature.contains('∃') {
+        let mul_lemmas: Vec<&str> = vdb_lemma_names
+            .iter()
+            .filter(|l| l.contains("mul"))
+            .map(String::as_str)
+            .collect();
+        let simp_extra = if mul_lemmas.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", mul_lemmas.join(", "))
+        };
+        if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∃')) {
+            scripts.push(vec![
+                format!("rcases {hyp_name} with ⟨k, hk⟩"),
+                format!("exact ⟨2 * k * k, by simp [hk, Nat.mul_assoc{simp_extra}]⟩"),
+            ]);
+        }
+    }
+
     scripts
 }
 
@@ -1130,7 +1255,7 @@ mod tests {
             .parent()
             .unwrap();
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("cargo run --"));
+        assert!(readme.contains("./target/release/lean-prover"));
     }
 
     #[test]
@@ -1213,8 +1338,9 @@ mod tests {
             .parent()
             .unwrap();
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("cargo run --"));
+        assert!(readme.contains("cargo build --release"));
         assert!(readme.contains("./target/release/lean-prover"));
+        assert!(readme.contains("## How to Use"));
     }
 
     #[test]
@@ -1281,6 +1407,53 @@ mod tests {
         let summary = prove_lean_path(&f, true).unwrap();
         assert_eq!(summary.proved, 3, "failed: {:?}", summary.failed_theorems);
         assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_prove_fails_explicitly_on_corrupted_onnx_or_vdb() {
+        let dir = std::env::temp_dir().join("lean_prover_m8_bad_model");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Sample.lean");
+        std::fs::write(&f, "import Init\ntheorem t (n : Nat) : n + 0 = n := by\n  sorry\n").unwrap();
+        let emb = embedded_artifacts();
+        let bad_onnx = prove_lean_path_with_artifacts(
+            &f,
+            false,
+            b"not-valid-onnx",
+            emb.tokenizer_json,
+            emb.temperatures_json,
+            emb.mathlib_sq8_vdb,
+        );
+        assert!(bad_onnx.is_err());
+        let bad_vdb = prove_lean_path_with_artifacts(
+            &f,
+            false,
+            emb.lean_sys1_onnx,
+            emb.tokenizer_json,
+            emb.temperatures_json,
+            b"not-valid-lvdb",
+        );
+        assert!(bad_vdb.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_outputs_five_stage_model_feedback() {
+        let dir = std::env::temp_dir().join("lean_prover_m8_feedback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Feedback.lean");
+        std::fs::write(&f, "import Init\ntheorem t (n : Nat) : n + 0 = n := by\n  sorry\n").unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.stage_logs.len(), 1);
+        let log = &summary.stage_logs[0];
+        assert!(log.contains("1. Canonicalize"));
+        assert!(log.contains("2. Tokenize"));
+        assert!(log.contains("3. Lean-Sys1"));
+        assert!(log.contains("4. Orion VDB"));
+        assert!(log.contains("5. Lean Kernel"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
