@@ -166,13 +166,57 @@ pub struct PremiseFitWeights<'a> {
 
 /// Batched 4d PremiseFit scorer: `[s_x || e_L || |s_x - e_L| || (s_x * e_L)]`.
 pub fn score_premise_fit_batch(
-    _state_emb: &[f32],
-    _candidate_embs: &[Vec<f32>],
-    _weights: PremiseFitWeights<'_>,
-    _t_fit: f32,
-    _tau: f32,
+    state_emb: &[f32],
+    candidate_embs: &[Vec<f32>],
+    weights: PremiseFitWeights<'_>,
+    t_fit: f32,
+    tau: f32,
 ) -> Result<Vec<(usize, f32)>, Sys1Error> {
-    todo!("TASK-M3-002: implement <0.2ms batched 4d PremiseFit scorer")
+    let d = state_emb.len();
+    let hidden = weights.b1.len();
+    if d == 0 || hidden == 0 || weights.w2.len() != hidden || weights.w1.len() != hidden * 4 * d {
+        return Err(Sys1Error::InvalidDimensions);
+    }
+
+    let temp = t_fit.max(1e-6);
+    let mut scored: Vec<(usize, f32)> = Vec::new();
+    let mut feat = vec![0.0_f32; 4 * d];
+
+    for (idx, cand) in candidate_embs.iter().enumerate() {
+        if cand.len() != d {
+            return Err(Sys1Error::InvalidDimensions);
+        }
+
+        for j in 0..d {
+            let s = state_emb[j];
+            let e = cand[j];
+            feat[j] = s;
+            feat[d + j] = e;
+            feat[2 * d + j] = (s - e).abs();
+            feat[3 * d + j] = s * e;
+        }
+
+        let mut logit = weights.b2;
+        for h in 0..hidden {
+            let row = &weights.w1[h * 4 * d..(h + 1) * 4 * d];
+            let mut acc = weights.b1[h];
+            for (w, f) in row.iter().zip(feat.iter()) {
+                acc += w * f;
+            }
+            if acc > 0.0 {
+                logit += acc * weights.w2[h];
+            }
+        }
+
+        let prob = 1.0_f32 / (1.0_f32 + (-logit / temp).exp());
+        if prob >= tau {
+            scored.push((idx, prob));
+        }
+    }
+
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored.truncate(2);
+    Ok(scored)
 }
 
 /// Decide between branching on top-2 surviving lemmas or forcing `introduce_have`.
@@ -213,7 +257,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M3-002"]
     fn test_batched_premise_fit_4d_mlp_latency_and_ranking() {
         let d = 384;
         let state = vec![0.1_f32; d];
