@@ -1,4 +1,8 @@
-//! Best-First Prover Search Loop, Soft-Token Adapter, PDA Identifier Mask, and Prefix-Replay Reloader.
+//! Best-First Prover Search Loop, Content-Addressed VFS, Deep Tree Search, and Hybrid Kernel Evaluator.
+
+pub mod kernel_eval;
+pub mod search;
+pub mod vfs;
 
 use std::collections::HashSet;
 use thiserror::Error;
@@ -727,7 +731,7 @@ fn collect_lean_files(
     Ok(())
 }
 
-/// Parsed CLI arguments for `lean-prover prove`.
+/// Parsed CLI arguments for `sheaf prove`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProveArgs {
     pub target: String,
@@ -735,6 +739,10 @@ pub struct ProveArgs {
     pub gate_pct: f32,
     pub max_branches: usize,
     pub premise_tau: f32,
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub max_workers: usize,
+    pub max_heartbeats: usize,
 }
 
 impl Default for ProveArgs {
@@ -745,6 +753,10 @@ impl Default for ProveArgs {
             gate_pct: 50.0,
             max_branches: 4,
             premise_tau: 0.50,
+            max_depth: 4,
+            max_nodes: 64,
+            max_workers: 2,
+            max_heartbeats: 200_000,
         }
     }
 }
@@ -768,7 +780,7 @@ fn parse_unit_interval(s: &str) -> Result<f32, String> {
 }
 
 impl ProveArgs {
-    /// Parse and validate `lean-prover prove` CLI arguments.
+    /// Parse and validate `sheaf prove` CLI arguments.
     pub fn try_from_args(args: &[String]) -> Result<Self, String> {
         let mut parsed = Self::default();
         if let Some(target) = args.get(2)
@@ -824,6 +836,58 @@ impl ProveArgs {
                         parse_unit_interval(raw).map_err(|e| format!("error: {e}"))?;
                     i += 1;
                 }
+                "--max-depth" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --max-depth requires a value".to_string())?;
+                    let d = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("error: invalid --max-depth '{raw}'"))?;
+                    if !(1..=16).contains(&d) {
+                        return Err("error: --max-depth must be in 1..=16".to_string());
+                    }
+                    parsed.max_depth = d;
+                    i += 1;
+                }
+                "--max-nodes" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --max-nodes requires a value".to_string())?;
+                    let n = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("error: invalid --max-nodes '{raw}'"))?;
+                    if !(1..=1024).contains(&n) {
+                        return Err("error: --max-nodes must be in 1..=1024".to_string());
+                    }
+                    parsed.max_nodes = n;
+                    i += 1;
+                }
+                "--max-workers" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --max-workers requires a value".to_string())?;
+                    let w = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("error: invalid --max-workers '{raw}'"))?;
+                    if !(1..=8).contains(&w) {
+                        return Err("error: --max-workers must be in 1..=8".to_string());
+                    }
+                    parsed.max_workers = w;
+                    i += 1;
+                }
+                "--max-heartbeats" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --max-heartbeats requires a value".to_string())?;
+                    let hb = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("error: invalid --max-heartbeats '{raw}'"))?;
+                    if hb < 10_000 {
+                        return Err("error: --max-heartbeats must be >= 10000".to_string());
+                    }
+                    parsed.max_heartbeats = hb;
+                    i += 1;
+                }
                 _ => {}
             }
             i += 1;
@@ -832,13 +896,17 @@ impl ProveArgs {
     }
 }
 
-/// Runtime configuration derived from `ProveArgs` for `lean-prover prove`.
+/// Runtime configuration derived from `ProveArgs` for `sheaf prove`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProverConfig {
     pub write_in_place: bool,
     pub gate_threshold: f32,
     pub max_branches: usize,
     pub premise_tau: f32,
+    pub max_depth: usize,
+    pub max_nodes: usize,
+    pub max_workers: usize,
+    pub max_heartbeats: usize,
 }
 
 pub type ProveOptions = ProverConfig;
@@ -856,6 +924,10 @@ impl From<&ProveArgs> for ProverConfig {
             gate_threshold: args.gate_pct / 100.0,
             max_branches: args.max_branches,
             premise_tau: args.premise_tau,
+            max_depth: args.max_depth,
+            max_nodes: args.max_nodes,
+            max_workers: args.max_workers,
+            max_heartbeats: args.max_heartbeats,
         }
     }
 }
@@ -936,19 +1008,25 @@ pub fn prove_lean_path_with_artifacts_and_options(
     let mut proved_scripts = Vec::new();
     let mut failed_theorems = Vec::new();
     let mut stage_logs = Vec::new();
-    let mut file_buffers: std::collections::HashMap<std::path::PathBuf, String> =
-        std::collections::HashMap::new();
+    let mut blob_store = vfs::BlobStore::default();
+    let mut initial_files = std::collections::BTreeMap::new();
+    for thm in &theorems {
+        if !initial_files.contains_key(&thm.file) {
+            let loaded = std::fs::read_to_string(&thm.file)
+                .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+            let h = blob_store.put(&loaded);
+            initial_files.insert(thm.file.clone(), h);
+        }
+    }
+    let initial_tree = vfs::TreeSnapshot::from_map(initial_files);
+    let mut root_tree = initial_tree.clone();
 
     for (idx, thm) in theorems.iter().enumerate() {
         let thm_start = Instant::now();
-        let src = if let Some(existing) = file_buffers.get(&thm.file) {
-            existing.clone()
-        } else {
-            let loaded = std::fs::read_to_string(&thm.file)
-                .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-            file_buffers.insert(thm.file.clone(), loaded.clone());
-            loaded
-        };
+        let src = root_tree
+            .read_file(&blob_store, &thm.file)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let full_name = match &thm.namespace {
             Some(ns) => format!("{ns}.{}", thm.name),
             None => thm.name.clone(),
@@ -1010,7 +1088,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
             (Vec::new(), Vec::new())
         };
 
-        // Stage 5: Model-only VDB-driven tactic synthesis + Batched Lean 4 Kernel verification + Axiom Allowlist
+        // Stage 5: Model-only VDB-driven tactic synthesis + Deep Best-First Search & Hybrid Kernel Verification
         let candidates = synthesize_from_model_and_vdb(
             thm,
             head_symbol.as_str(),
@@ -1022,56 +1100,154 @@ pub fn prove_lean_path_with_artifacts_and_options(
         let lake_root = find_lake_workspace_root(&thm.file);
 
         let (mut solved, mut last_diag, unsolved_diags) =
-            verify_candidates_batched(&src, thm, &full_name, &candidates, lake_root.as_deref())?;
+            kernel_eval::verify_candidates_batched_with_heartbeats(
+                &src,
+                thm,
+                &full_name,
+                &candidates,
+                lake_root.as_deref(),
+                options.max_heartbeats,
+            )?;
 
-        // Compositional 2-step subgoal recovery using EpisodicCache when unsolved goals remain
-        if solved.is_none() && !unsolved_diags.is_empty() {
-            let mut episodic_cache = lean_vdb::EpisodicCache::default();
-            let _ = episodic_cache.check_or_insert(&pred.state_emb);
-            let mut composed_candidates: Vec<Vec<String>> = Vec::new();
-            for (base_script, goal_diag) in unsolved_diags.into_iter().take(2) {
-                if let Some((sub_hyps, sub_target)) = parse_unsolved_goal_from_diag(&goal_diag) {
-                    let sub_collapsed = lean_canonicalizer::collapse_implicit_instances(&sub_target);
-                    let (sub_norm_h, sub_norm_t) =
-                        lean_canonicalizer::normalize_alpha_vars(&sub_hyps, &sub_collapsed);
-                    let sub_canonical = format!("{} ⊢ {}", sub_norm_h.join(", "), sub_norm_t);
-                    if let Ok((sub_ids, sub_mask)) =
-                        lean_sys1_ort::encode_canonical_text(tokenizer_json, &sub_canonical, 512)
-                        && let Ok((sub_pred, _, _)) = onnx_sess.forward_with_gate(
+        // Deep (>= 3-step) Best-First compositional subgoal search backed by BlobStore + TreeSnapshot
+        if solved.is_none() && !unsolved_diags.is_empty() && options.max_depth > 1 {
+            let search_res = search::run_best_first_tree_search(
+                &mut blob_store,
+                root_tree.clone(),
+                thm.file.clone(),
+                canonical.clone(),
+                options.max_depth,
+                options.max_nodes,
+                |store, node, dedup| {
+                    let cur_src = node
+                        .tree
+                        .read_file(store, &node.target_file)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| src.clone());
+                    let step_cands: Vec<Vec<String>> = if node.depth == 0 {
+                        unsolved_diags.iter().take(2).map(|(s, _)| s.clone()).collect()
+                    } else {
+                        let Ok((sub_ids, sub_mask)) = lean_sys1_ort::encode_canonical_text(
+                            tokenizer_json,
+                            &node.open_subgoal,
+                            512,
+                        ) else {
+                            return Ok(search::StepOutcome::Pruned("tokenize subgoal failed".into()));
+                        };
+                        let Ok((sub_pred, _, _)) = onnx_sess.forward_with_gate(
                             &sub_ids,
                             &sub_mask,
                             &temps,
                             options.gate_threshold,
-                        )
-                        && episodic_cache.check_or_insert(&sub_pred.state_emb)
-                            == lean_vdb::EpisodicHit::Novel
-                    {
-                        let sub_closer = match sub_pred.strategy {
-                            lean_sys1_ort::StrategyChoice::AtomicClose => "all_goals (first | rfl | simp | omega)",
-                            lean_sys1_ort::StrategyChoice::Rewrite => "all_goals (first | simp_all | omega)",
-                            _ => "all_goals (try simp_all; try omega)",
+                        ) else {
+                            return Ok(search::StepOutcome::Pruned("sys1 subgoal failed".into()));
                         };
-                        let mut step = base_script;
-                        if let Some(last) = step.last_mut() {
-                            *last = format!("{last}; {sub_closer}");
+                        if !dedup.record_sys1_and_check_tier2(&sub_pred.state_emb) {
+                            return Ok(search::StepOutcome::Pruned("semantic loop pruned".into()));
                         }
-                        composed_candidates.push(step);
+                        let sub_closers = match sub_pred.strategy {
+                            lean_sys1_ort::StrategyChoice::AtomicClose => vec![
+                                "all_goals (first | rfl | simp | omega)",
+                                "all_goals (try simp_all; try omega)",
+                            ],
+                            lean_sys1_ort::StrategyChoice::Rewrite => vec![
+                                "all_goals (first | simp_all | omega)",
+                                "all_goals (try simp; try omega)",
+                            ],
+                            _ => vec![
+                                "all_goals (try simp_all; try omega)",
+                                "all_goals omega",
+                            ],
+                        };
+                        sub_closers
+                            .into_iter()
+                            .map(|c| {
+                                let mut s = node.partial_script.clone();
+                                if let Some(last) = s.last_mut() {
+                                    *last = format!("{last}; {c}");
+                                } else {
+                                    s.push(c.to_string());
+                                }
+                                s
+                            })
+                            .collect()
+                    };
+
+                    let (step_solved, step_diag, step_unsolved) =
+                        kernel_eval::verify_candidates_batched_with_heartbeats(
+                            &cur_src,
+                            thm,
+                            &full_name,
+                            &step_cands,
+                            lake_root.as_deref(),
+                            options.max_heartbeats,
+                        )
+                        .map_err(|e| e.to_string())?;
+
+                    if let Some((win_src, win_script)) = step_solved {
+                        let next_tree =
+                            node.tree
+                                .with_updates(store, &[(node.target_file.clone(), win_src)]);
+                        return Ok(search::StepOutcome::Solved {
+                            tree: next_tree,
+                            script: win_script,
+                        });
                     }
-                }
-            }
-            if !composed_candidates.is_empty() {
-                let (comp_solved, comp_diag, _) = verify_candidates_batched(
-                    &src,
-                    thm,
-                    &full_name,
-                    &composed_candidates,
-                    lake_root.as_deref(),
-                )?;
-                if comp_solved.is_some() {
-                    solved = comp_solved;
-                } else {
-                    last_diag = comp_diag;
-                }
+
+                    let mut children = Vec::new();
+                    for (cand_script, goal_diag) in step_unsolved.into_iter().take(options.max_branches) {
+                        if let Some((sub_hyps, sub_target)) = parse_unsolved_goal_from_diag(&goal_diag)
+                        {
+                            let sub_collapsed =
+                                lean_canonicalizer::collapse_implicit_instances(&sub_target);
+                            let (sub_norm_h, sub_norm_t) =
+                                lean_canonicalizer::normalize_alpha_vars(&sub_hyps, &sub_collapsed);
+                            let sub_canon =
+                                format!("{} ⊢ {}", sub_norm_h.join(", "), sub_norm_t);
+                            let body = cand_script
+                                .iter()
+                                .map(|l| format!("  {l}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let branch_src = replace_theorem_sorry(&cur_src, &thm.name, &body);
+                            let child_tree = node
+                                .tree
+                                .with_updates(store, &[(node.target_file.clone(), branch_src)]);
+                            let prio = search::compute_node_priority(
+                                pred.difficulty,
+                                pred.answer_confidence,
+                                node.depth + 1,
+                            );
+                            children.push(search::SearchNode {
+                                id: 0,
+                                parent: Some(node.id),
+                                depth: node.depth + 1,
+                                tree: child_tree,
+                                target_file: node.target_file.clone(),
+                                open_subgoal: sub_canon,
+                                partial_script: cand_script,
+                                priority: prio,
+                            });
+                        }
+                    }
+                    if children.is_empty() {
+                        Ok(search::StepOutcome::Pruned(step_diag))
+                    } else {
+                        Ok(search::StepOutcome::Progressed(children))
+                    }
+                },
+            );
+
+            if let (Some(win_tree), Some(win_script)) =
+                (search_res.solved_tree, search_res.winning_script)
+            {
+                let win_src = win_tree
+                    .read_file(&blob_store, &thm.file)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                solved = Some((win_src, win_script));
+            } else if !search_res.last_diag.is_empty() {
+                last_diag = search_res.last_diag;
             }
         }
 
@@ -1097,17 +1273,23 @@ pub fn prove_lean_path_with_artifacts_and_options(
         stage_logs.push(log_block);
 
         if let Some((new_src, script)) = solved {
-            file_buffers.insert(thm.file.clone(), new_src.clone());
-            if options.write_in_place {
-                std::fs::write(&thm.file, new_src)
-                    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-            }
+            root_tree = root_tree.with_updates(&mut blob_store, &[(thm.file.clone(), new_src)]);
             proved += 1;
             proved_names.push(full_name.clone());
             proved_scripts.push((full_name, script));
         } else {
             failed += 1;
             failed_theorems.push((full_name, last_diag));
+        }
+    }
+
+    // Atomic commit: write all dirty files from final root_tree once at exit when --write is set
+    if options.write_in_place {
+        for dirty_path in root_tree.dirty_paths(&initial_tree) {
+            if let Some(content) = root_tree.read_file(&blob_store, dirty_path) {
+                std::fs::write(dirty_path, content.as_ref())
+                    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+            }
         }
     }
 
@@ -1120,216 +1302,6 @@ pub fn prove_lean_path_with_artifacts_and_options(
         failed_theorems,
         stage_logs,
     })
-}
-
-fn run_lean_json(file: &std::path::Path, lake_root: Option<&std::path::Path>) -> Result<std::process::Output, ProverError> {
-    if let Some(root) = lake_root {
-        std::process::Command::new("lake")
-            .args(["env", "lean", "--json"])
-            .arg(file)
-            .current_dir(root)
-            .output()
-    } else {
-        std::process::Command::new("lean")
-            .arg("--json")
-            .arg(file)
-            .output()
-    }
-    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
-}
-
-fn audit_single_candidate(
-    src: &str,
-    thm_name: &str,
-    full_name: &str,
-    script: &[String],
-    lake_root: Option<&std::path::Path>,
-) -> Result<Result<String, String>, ProverError> {
-    let body = script
-        .iter()
-        .map(|l| format!("  {l}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let candidate_src = replace_theorem_sorry(src, thm_name, &body);
-    let tmp_file = std::env::temp_dir().join(format!("lean_prove_audit_{thm_name}.lean"));
-    let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
-    std::fs::write(&tmp_file, &audit)
-        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-    let out = run_lean_json(&tmp_file, lake_root)?;
-    let _ = std::fs::remove_file(&tmp_file);
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut has_error = false;
-    let mut illegal_axiom: Option<String> = None;
-    let mut first_error_msg: Option<String> = None;
-
-    for line in stdout.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-            if sev == "error" {
-                has_error = true;
-                if first_error_msg.is_none() && !data.is_empty() {
-                    first_error_msg = Some(data.to_string());
-                }
-            }
-            if (data.contains("depends on axioms:") || data.contains("does not depend on any axioms"))
-                && let Err(e) = lean_repl::verify_allowed_axioms(data)
-            {
-                illegal_axiom = Some(e.to_string());
-            }
-        }
-    }
-
-    if out.status.success() && !has_error && illegal_axiom.is_none() {
-        Ok(Ok(candidate_src))
-    } else {
-        let diag = illegal_axiom
-            .or(first_error_msg)
-            .or_else(|| stdout.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
-            .unwrap_or_else(|| "kernel rejected".to_string());
-        Ok(Err(diag))
-    }
-}
-
-type BatchedVerifyResult = (
-    Option<(String, Vec<String>)>,
-    String,
-    Vec<(Vec<String>, String)>,
-);
-
-fn verify_candidates_batched(
-    src: &str,
-    thm: &DiscoveredTheorem,
-    full_name: &str,
-    candidates: &[Vec<String>],
-    lake_root: Option<&std::path::Path>,
-) -> Result<BatchedVerifyResult, ProverError> {
-    let mut last_diag = String::from("model produced no valid kernel-verified tactic");
-    let mut unsolved_diags: Vec<(Vec<String>, String)> = Vec::new();
-    if candidates.is_empty() {
-        return Ok((None, last_diag, unsolved_diags));
-    }
-
-    // Extract the theorem's declaration header up to `:= by` so we can clone it as `private theorem __probe_i`.
-    let needle = format!("theorem {}", thm.name);
-    let Some(thm_pos) = src.find(&needle) else {
-        for script in candidates {
-            match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                Ok(cand_src) => return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags)),
-                Err(d) => {
-                    if d.contains("unsolved goals") {
-                        unsolved_diags.push((script.clone(), d.clone()));
-                    }
-                    last_diag = d;
-                }
-            }
-        }
-        return Ok((None, last_diag, unsolved_diags));
-    };
-
-    let prefix = &src[..thm_pos];
-    let rest = &src[thm_pos..];
-    let Some(by_rel) = rest.find(":= by") else {
-        return Ok((None, last_diag, unsolved_diags));
-    };
-    let after_name = &rest[needle.len()..by_rel];
-
-    const BATCH_SIZE: usize = 8;
-    for chunk in candidates.chunks(BATCH_SIZE) {
-        let mut batch_src = String::from(prefix);
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
-        let mut cur_line = batch_src.lines().count() + if batch_src.ends_with('\n') || batch_src.is_empty() { 1 } else { 2 };
-        if !batch_src.ends_with('\n') && !batch_src.is_empty() {
-            batch_src.push('\n');
-        }
-
-        for (i, script) in chunk.iter().enumerate() {
-            let start_line = cur_line;
-            let body = script
-                .iter()
-                .map(|l| format!("  {l}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let decl = format!("private theorem __probe_{i}{after_name}:= by\n{body}\n");
-            cur_line += decl.lines().count();
-            ranges.push((start_line, cur_line.saturating_sub(1)));
-            batch_src.push_str(&decl);
-        }
-
-        let tmp_file = std::env::temp_dir().join(format!("lean_prove_batch_{}.lean", thm.name));
-        std::fs::write(&tmp_file, &batch_src)
-            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-        let out = run_lean_json(&tmp_file, lake_root)?;
-        let _ = std::fs::remove_file(&tmp_file);
-
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let mut cand_errors: Vec<Option<String>> = vec![None; chunk.len()];
-        let mut has_unmapped_error = false;
-
-        for line in stdout.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-                if sev != "error" {
-                    continue;
-                }
-                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
-                let err_line = v
-                    .get("pos")
-                    .and_then(|p| p.get("line"))
-                    .and_then(|l| l.as_u64())
-                    .map(|l| l as usize);
-                if let Some(el) = err_line
-                    && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
-                {
-                    if cand_errors[idx].is_none() {
-                        cand_errors[idx] = Some(data);
-                    }
-                } else {
-                    has_unmapped_error = true;
-                    last_diag = data;
-                }
-            }
-        }
-
-        if !has_unmapped_error {
-            for (i, err) in cand_errors.iter().enumerate() {
-                if err.is_none() {
-                    let script = &chunk[i];
-                    match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                        Ok(cand_src) => {
-                            return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags));
-                        }
-                        Err(d) => {
-                            last_diag = d;
-                        }
-                    }
-                } else if let Some(d) = err {
-                    if d.contains("unsolved goals") {
-                        unsolved_diags.push((chunk[i].clone(), d.clone()));
-                    }
-                    last_diag = d.clone();
-                }
-            }
-        } else {
-            // Fallback to individual verification if a global parse/import error occurred
-            for script in chunk {
-                match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                    Ok(cand_src) => {
-                        return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags));
-                    }
-                    Err(d) => {
-                        if d.contains("unsolved goals") {
-                            unsolved_diags.push((script.clone(), d.clone()));
-                        }
-                        last_diag = d;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((None, last_diag, unsolved_diags))
 }
 
 fn parse_unsolved_goal_from_diag(diag: &str) -> Option<(Vec<String>, String)> {
@@ -1566,7 +1538,7 @@ fn synthesize_from_model_and_vdb(
     unique_scripts
 }
 
-fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> String {
+pub(crate) fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> String {
     let needle = format!("theorem {thm_name}");
     if let Some(pos) = src.find(&needle) {
         if let Some(sorry_rel) = src[pos..].find("  sorry") {
@@ -2178,8 +2150,15 @@ mod tests {
             vec!["intro h".to_string()],
             vec!["omega".to_string()],
         ];
-        let (solved, _diag, _unsolved) =
-            verify_candidates_batched(src, &thms[0], "add_comm_batched", &cands, None).unwrap();
+        let (solved, _diag, _unsolved) = kernel_eval::verify_candidates_batched_with_heartbeats(
+            src,
+            &thms[0],
+            "add_comm_batched",
+            &cands,
+            None,
+            200_000,
+        )
+        .unwrap();
         assert!(solved.is_some());
         assert_eq!(solved.unwrap().1, vec!["omega".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2196,5 +2175,333 @@ mod tests {
         let emb = vec![1.0_f32, 0.0, 0.0];
         assert_eq!(cache.check_or_insert(&emb), lean_vdb::EpisodicHit::Novel);
         assert_eq!(cache.check_or_insert(&emb), lean_vdb::EpisodicHit::PruneLoop);
+    }
+
+    #[test]
+    fn test_blob_store_dedup_and_tree_hash() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut store = vfs::BlobStore::default();
+        let h1 = store.put("theorem t : True := by trivial\n");
+        let h2 = store.put("theorem t : True := by trivial\n");
+        assert_eq!(h1, h2);
+        assert_eq!(store.len(), 1);
+
+        let hb = store.put("def helper : Nat := 42\n");
+        let mut map_a = BTreeMap::new();
+        map_a.insert(PathBuf::from("A.lean"), h1);
+        map_a.insert(PathBuf::from("B.lean"), hb);
+        let tree_a = vfs::TreeSnapshot::from_map(map_a);
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert(PathBuf::from("B.lean"), hb);
+        map_b.insert(PathBuf::from("A.lean"), h1);
+        let tree_b = vfs::TreeSnapshot::from_map(map_b);
+
+        assert_eq!(tree_a.tree_hash, tree_b.tree_hash);
+    }
+
+    #[test]
+    fn test_snapshot_isolation_and_rollback() {
+        use std::collections::BTreeMap;
+        use std::path::{Path, PathBuf};
+
+        let mut store = vfs::BlobStore::default();
+        let h_main = store.put("theorem main_t : 1 = 1 := by sorry\n");
+        let h_defs = store.put("def base : Nat := 1\n");
+        let mut base_map = BTreeMap::new();
+        base_map.insert(PathBuf::from("Main.lean"), h_main);
+        base_map.insert(PathBuf::from("Defs.lean"), h_defs);
+        let root_tree = vfs::TreeSnapshot::from_map(base_map);
+
+        let branch_a = root_tree.with_updates(
+            &mut store,
+            &[(PathBuf::from("Main.lean"), "theorem main_t : 1 = 1 := by rfl\n".into())],
+        );
+        let branch_b = root_tree.with_updates(
+            &mut store,
+            &[(PathBuf::from("Main.lean"), "theorem main_t : 1 = 1 := by omega\n".into())],
+        );
+
+        assert_eq!(
+            root_tree.read_file(&store, Path::new("Main.lean")).unwrap().as_ref(),
+            "theorem main_t : 1 = 1 := by sorry\n"
+        );
+        assert_eq!(branch_a.dirty_paths(&root_tree), vec![Path::new("Main.lean")]);
+        assert_ne!(branch_a.tree_hash, branch_b.tree_hash);
+        // Zero-copy sharing of untouched Defs.lean
+        assert_eq!(
+            root_tree.files.get(Path::new("Defs.lean")),
+            branch_a.files.get(Path::new("Defs.lean"))
+        );
+        drop(branch_b);
+        assert_eq!(
+            branch_a.read_file(&store, Path::new("Main.lean")).unwrap().as_ref(),
+            "theorem main_t : 1 = 1 := by rfl\n"
+        );
+    }
+
+    #[test]
+    fn test_exact_dedup_short_circuits_sys1() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut store = vfs::BlobStore::default();
+        let h = store.put("theorem t : True := by sorry\n");
+        let mut map = BTreeMap::new();
+        map.insert(PathBuf::from("Main.lean"), h);
+        let root_tree = vfs::TreeSnapshot::from_map(map);
+
+        let res = search::run_best_first_tree_search(
+            &mut store,
+            root_tree.clone(),
+            PathBuf::from("Main.lean"),
+            "_v0 : Nat ⊢ _v0 = _v0".to_string(),
+            4,
+            16,
+            |_store, node, dedup| {
+                // Only called when Tier-1 exact dedup passes; record Sys1 call and spawn two identical children
+                let _ = dedup.record_sys1_and_check_tier2(&[1.0, 0.0, 0.0]);
+                if node.depth == 0 {
+                    let c1 = search::SearchNode {
+                        id: 0,
+                        parent: Some(node.id),
+                        depth: 1,
+                        tree: root_tree.clone(),
+                        target_file: node.target_file.clone(),
+                        open_subgoal: "_v0 : Nat ⊢ _v0 + 0 = _v0".to_string(),
+                        partial_script: vec!["step_a".into()],
+                        priority: 1.5,
+                    };
+                    let c2 = search::SearchNode {
+                        id: 0,
+                        parent: Some(node.id),
+                        depth: 1,
+                        tree: root_tree.clone(),
+                        target_file: node.target_file.clone(),
+                        open_subgoal: "_v0 : Nat ⊢ _v0 + 0 = _v0".to_string(),
+                        partial_script: vec!["step_b".into()],
+                        priority: 1.4,
+                    };
+                    Ok(search::StepOutcome::Progressed(vec![c1, c2]))
+                } else {
+                    Ok(search::StepOutcome::Pruned("done".into()))
+                }
+            },
+        );
+
+        assert_eq!(res.exact_dedup_hits, 1);
+        assert_eq!(res.sys1_calls, 2);
+    }
+
+    #[test]
+    fn test_deep_search_three_steps() {
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join("sheaf_m12_deep_3step");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("DeepThree.lean");
+        let init_src = "import Init\ntheorem three_step_thm (a b : Nat) (h : a = b) : a + 1 = b + 1 := by\n  sorry\n";
+        std::fs::write(&f, init_src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+
+        let run_with_depth = |max_depth: usize| -> search::DeepSearchResult {
+            let mut store = vfs::BlobStore::default();
+            let h = store.put(init_src);
+            let mut map = BTreeMap::new();
+            map.insert(f.clone(), h);
+            let root = vfs::TreeSnapshot::from_map(map);
+
+            search::run_best_first_tree_search(
+                &mut store,
+                root,
+                f.clone(),
+                "_v0 : Nat, _v1 : Nat, _v2 : _v0 = _v1 ⊢ _v0 + 1 = _v1 + 1".to_string(),
+                max_depth,
+                16,
+                |store, node, _dedup| {
+                    // Depth 0 -> step 1 (`have h1 : a = b := h`), Depth 1 -> step 2 (`rw [h1]`), Depth 2 -> step 3 (`omega`)
+                    let next_tactic = match node.depth {
+                        0 => "have h1 : a = b := h",
+                        1 => "have h2 : a + 1 = b + 1 := by rw [h1]",
+                        _ => "exact h2",
+                    };
+                    let mut script = node.partial_script.clone();
+                    script.push(next_tactic.to_string());
+
+                    if node.depth < 2 {
+                        let body = script
+                            .iter()
+                            .map(|l| format!("  {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let next_src = replace_theorem_sorry(init_src, &thms[0].name, &body);
+                        let child_tree =
+                            node.tree.with_updates(store, &[(f.clone(), next_src)]);
+                        Ok(search::StepOutcome::Progressed(vec![search::SearchNode {
+                            id: 0,
+                            parent: Some(node.id),
+                            depth: node.depth + 1,
+                            tree: child_tree,
+                            target_file: f.clone(),
+                            open_subgoal: format!("subgoal_depth_{}", node.depth + 1),
+                            partial_script: script,
+                            priority: 2.0 - 0.15 * ((node.depth + 1) as f32),
+                        }]))
+                    } else {
+                        match kernel_eval::audit_single_candidate(
+                            init_src,
+                            &thms[0].name,
+                            "three_step_thm",
+                            &script,
+                            None,
+                        )
+                        .unwrap()
+                        {
+                            Ok(win_src) => {
+                                let win_tree =
+                                    node.tree.with_updates(store, &[(f.clone(), win_src)]);
+                                Ok(search::StepOutcome::Solved {
+                                    tree: win_tree,
+                                    script,
+                                })
+                            }
+                            Err(d) => Ok(search::StepOutcome::Pruned(d)),
+                        }
+                    }
+                },
+            )
+        };
+
+        let shallow = run_with_depth(2);
+        assert!(shallow.solved_tree.is_none(), "3-step proof must not finish at max_depth=2");
+
+        let deep = run_with_depth(4);
+        assert!(deep.solved_tree.is_some(), "3-step proof must verify at max_depth=4");
+        assert_eq!(
+            deep.winning_script.unwrap(),
+            vec![
+                "have h1 : a = b := h".to_string(),
+                "have h2 : a + 1 = b + 1 := by rw [h1]".to_string(),
+                "exact h2".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batched_probe_heartbeat_isolation() {
+        let dir = std::env::temp_dir().join("sheaf_m12_hb_iso");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("HbIso.lean");
+        let src = "import Init\ntheorem hb_test (a b : Nat) : a + b = b + a := by\n  sorry\n";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![
+            vec!["rfl".to_string()],
+            vec!["omega".to_string()],
+        ];
+        let (solved, _diag, _unsolved) = kernel_eval::verify_candidates_batched_with_heartbeats(
+            src,
+            &thms[0],
+            "hb_test",
+            &cands,
+            None,
+            50_000,
+        )
+        .unwrap();
+        assert!(solved.is_some());
+        assert_eq!(solved.unwrap().1, vec!["omega".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_multifile_worktree_cleanup_and_cancel() {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut store = vfs::BlobStore::default();
+        let h_helper_base = store.put("import Init\n");
+        let h_main_base = store.put(
+            "import Init\ntheorem use_helper (n : Nat) : helperVal n = n + 1 := by\n  sorry\n",
+        );
+        let mut base_map = BTreeMap::new();
+        base_map.insert(PathBuf::from("Helper.lean"), h_helper_base);
+        base_map.insert(PathBuf::from("Main.lean"), h_main_base);
+        let base_tree = vfs::TreeSnapshot::from_map(base_map);
+
+        // Winning multi-file branch: edits Helper.lean + Main.lean
+        let win_tree = base_tree.with_updates(
+            &mut store,
+            &[
+                (
+                    PathBuf::from("Helper.lean"),
+                    "import Init\ndef helperVal (n : Nat) : Nat := n + 1\n".to_string(),
+                ),
+                (
+                    PathBuf::from("Main.lean"),
+                    "import Init\ntheorem use_helper (n : Nat) : helperVal n = n + 1 := by\n  rfl\n"
+                        .to_string(),
+                ),
+            ],
+        );
+        // Slower sibling branch that should be cancelled once win_tree succeeds
+        let slow_tree = base_tree.with_updates(
+            &mut store,
+            &[
+                (
+                    PathBuf::from("Helper.lean"),
+                    "import Init\ndef helperVal (n : Nat) : Nat := n + 1\n".to_string(),
+                ),
+                (
+                    PathBuf::from("Main.lean"),
+                    "import Init\ntheorem use_helper (n : Nat) : helperVal n = n + 1 := by\n  simp [helperVal]\n"
+                        .to_string(),
+                ),
+            ],
+        );
+
+        let win_hex = win_tree.tree_hash.hex12();
+        let slow_hex = slow_tree.tree_hash.hex12();
+
+        let candidates = vec![
+            kernel_eval::MultiFileCandidate {
+                tree: win_tree.clone(),
+                target_rel_path: PathBuf::from("Main.lean"),
+                theorem_full_name: "use_helper".to_string(),
+                script_label: vec!["rfl".to_string()],
+                simulated_delay_ms: 0,
+            },
+            kernel_eval::MultiFileCandidate {
+                tree: slow_tree,
+                target_rel_path: PathBuf::from("Main.lean"),
+                theorem_full_name: "use_helper".to_string(),
+                script_label: vec!["simp [helperVal]".to_string()],
+                simulated_delay_ms: 2500,
+            },
+        ];
+
+        let res =
+            kernel_eval::evaluate_multifile_worktree_branches(&store, &base_tree, &candidates, 2)
+                .unwrap();
+        assert!(res.is_some());
+        let (solved_tree, script) = res.unwrap();
+        assert_eq!(solved_tree.tree_hash, win_tree.tree_hash);
+        assert_eq!(script, vec!["rfl".to_string()]);
+
+        // Verify zero leftover sheaf_wt_<hex12>* directories in temp_dir
+        let leftover: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&format!("sheaf_wt_{win_hex}"))
+                    || name.starts_with(&format!("sheaf_wt_{slow_hex}"))
+            })
+            .collect();
+        assert!(leftover.is_empty(), "leftover worktree dirs: {leftover:?}");
     }
 }
