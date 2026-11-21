@@ -1,0 +1,13 @@
+[package]
+name = "lean-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lean-canonicalizer = { path = "../lean-canonicalizer" }
+lean-repl = { path = "../lean-repl" }
+lean-sys1-ort = { path = "../lean-sys1-ort" }
+lean-vdb = { path = "../lean-vdb" }
+serde.workspace = true
+thiserror.workspace = true
