@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+orion = { git = "https://github.com/steveSujo/vectordb-rs.git", branch = "main" }

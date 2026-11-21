@@ -29,6 +29,8 @@ pub enum VdbError {
     InvalidHeader,
     #[error("dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+    #[error("orion backend error: {0}")]
+    Backend(#[from] orion::error::VdbError),
 }
 
 /// Two-stage dynamic import resolver (`symbol_to_module` + `import_dag`).
@@ -196,6 +198,34 @@ impl StaticVdbIndex {
         hits.truncate(top_k);
         Ok(hits)
     }
+
+    /// Query an `orion` `VectorDatabase` using `search_with_filter` for `target_head_symbol` or `"POLYMORPHIC"`.
+    pub fn search_hnsw_backend(
+        &self,
+        db: &orion::database::VectorDatabase,
+        query: &[f32],
+        target_head_symbol: &str,
+        top_k: usize,
+    ) -> Result<Vec<VdbSearchHit>, VdbError> {
+        let raw_hits = db.search_with_filter(query, top_k, |id| {
+            self.metadata.get(id as usize).is_some_and(|meta| {
+                meta.head_symbol == target_head_symbol || meta.head_symbol == "POLYMORPHIC"
+            })
+        })?;
+
+        let mut hits = Vec::with_capacity(raw_hits.len());
+        for (id, distance) in raw_hits {
+            let idx = id as usize;
+            if let (Some(meta), Some(code)) = (self.metadata.get(idx), self.codes.get(idx)) {
+                hits.push(VdbSearchHit {
+                    metadata: meta.clone(),
+                    distance,
+                    embedding: self.quantizer.dequantize(code)?,
+                });
+            }
+        }
+        Ok(hits)
+    }
 }
 
 /// Outcome of checking the per-theorem episodic subgoal cache.
@@ -232,16 +262,7 @@ impl EpisodicCache {
 }
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0_f32;
-    let mut norm_a = 0.0_f32;
-    let mut norm_b = 0.0_f32;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = (norm_a.sqrt() * norm_b.sqrt()).max(1e-12);
-    dot / denom
+    orion::types::cosine_similarity(a, b).unwrap_or(0.0)
 }
 
 #[cfg(test)]
