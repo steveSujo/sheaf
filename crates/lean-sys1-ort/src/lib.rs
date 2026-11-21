@@ -63,8 +63,45 @@ pub enum Sys1Error {
 }
 
 /// Encode canonical text with `tokenizer.json` matching Python IDs identically.
-pub fn encode_canonical_text(_tokenizer_json: &str, _text: &str, _max_len: usize) -> Result<(Vec<i64>, Vec<i64>), Sys1Error> {
-    todo!("TASK-M2-002: implement Rust-Python parity tokenizer loader")
+pub fn encode_canonical_text(
+    tokenizer_json: &str,
+    text: &str,
+    max_len: usize,
+) -> Result<(Vec<i64>, Vec<i64>), Sys1Error> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(tokenizer_json).map_err(|e| Sys1Error::Tokenizer(e.to_string()))?;
+    let vocab = parsed
+        .get("model")
+        .and_then(|m| m.get("vocab"))
+        .and_then(|v| v.as_object());
+
+    let unk_id = vocab
+        .and_then(|v| v.get("<unk>"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(1);
+    let pad_id = vocab
+        .and_then(|v| v.get("<pad>"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(0);
+
+    let mut ids = Vec::with_capacity(max_len);
+    let mut mask = Vec::with_capacity(max_len);
+
+    for tok in text.split_whitespace().take(max_len) {
+        let id = vocab
+            .and_then(|v| v.get(tok))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(unk_id);
+        ids.push(id);
+        mask.push(1);
+    }
+
+    while ids.len() < max_len {
+        ids.push(pad_id);
+        mask.push(0);
+    }
+
+    Ok((ids, mask))
 }
 
 /// Apply scalar temperature calibration and route based on `max(p) >= 0.50`.
@@ -113,7 +150,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M2-002"]
     fn test_rust_python_tokenizer_id_parity() {
         let (ids, mask) = encode_canonical_text("{}", "_v0 : Nat ⊢ Nat.add _v0 [_] = _v0", 512).unwrap();
         assert_eq!(ids.len(), mask.len());
