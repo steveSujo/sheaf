@@ -727,22 +727,135 @@ fn collect_lean_files(
     Ok(())
 }
 
-/// Configuration options for `lean-prover prove`.
+/// Parsed CLI arguments for `lean-prover prove`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProveOptions {
+pub struct ProveArgs {
+    pub target: String,
+    pub write: bool,
+    pub gate_pct: f32,
+    pub max_branches: usize,
+    pub premise_tau: f32,
+}
+
+impl Default for ProveArgs {
+    fn default() -> Self {
+        Self {
+            target: ".".to_string(),
+            write: false,
+            gate_pct: 50.0,
+            max_branches: 4,
+            premise_tau: 0.50,
+        }
+    }
+}
+
+fn parse_gate_pct(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| format!("invalid float: {s}"))?;
+    if (0.0..=100.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err("gate-pct must be between 0.0 and 100.0".to_string())
+    }
+}
+
+fn parse_unit_interval(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| format!("invalid float: {s}"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err("value must be between 0.0 and 1.0".to_string())
+    }
+}
+
+impl ProveArgs {
+    /// Parse and validate `lean-prover prove` CLI arguments.
+    pub fn try_from_args(args: &[String]) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        if let Some(target) = args.get(2)
+            && !target.starts_with("--")
+        {
+            parsed.target = target.clone();
+        }
+        let mut i = 2usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--write" => parsed.write = true,
+                "--gate-pct" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --gate-pct requires a value".to_string())?;
+                    parsed.gate_pct = parse_gate_pct(raw).map_err(|e| format!("error: {e}"))?;
+                    i += 1;
+                }
+                "--gate-threshold" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --gate-threshold requires a value".to_string())?;
+                    let val: f32 = raw
+                        .parse()
+                        .map_err(|_| format!("error: invalid --gate-threshold '{raw}'"))?;
+                    let pct = if val > 1.0 { val } else { val * 100.0 };
+                    if !(0.0..=100.0).contains(&pct) {
+                        return Err(format!(
+                            "error: --gate-threshold '{raw}' must be in 0..1 or 0..100"
+                        ));
+                    }
+                    parsed.gate_pct = pct;
+                    i += 1;
+                }
+                "--max-branches" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --max-branches requires a value".to_string())?;
+                    let n = raw
+                        .parse::<usize>()
+                        .map_err(|_| format!("error: invalid --max-branches '{raw}'"))?;
+                    if n == 0 {
+                        return Err("error: --max-branches must be >= 1".to_string());
+                    }
+                    parsed.max_branches = n.min(16);
+                    i += 1;
+                }
+                "--premise-tau" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --premise-tau requires a value".to_string())?;
+                    parsed.premise_tau =
+                        parse_unit_interval(raw).map_err(|e| format!("error: {e}"))?;
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Ok(parsed)
+    }
+}
+
+/// Runtime configuration derived from `ProveArgs` for `lean-prover prove`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProverConfig {
     pub write_in_place: bool,
     pub gate_threshold: f32,
     pub max_branches: usize,
     pub premise_tau: f32,
 }
 
-impl Default for ProveOptions {
+pub type ProveOptions = ProverConfig;
+
+impl Default for ProverConfig {
     fn default() -> Self {
+        Self::from(&ProveArgs::default())
+    }
+}
+
+impl From<&ProveArgs> for ProverConfig {
+    fn from(args: &ProveArgs) -> Self {
         Self {
-            write_in_place: false,
-            gate_threshold: lean_sys1_ort::CONFIDENCE_GATE_THRESHOLD,
-            max_branches: 4,
-            premise_tau: 0.50,
+            write_in_place: args.write,
+            gate_threshold: args.gate_pct / 100.0,
+            max_branches: args.max_branches,
+            premise_tau: args.premise_tau,
         }
     }
 }
@@ -866,7 +979,11 @@ pub fn prove_lean_path_with_artifacts_and_options(
         // Stage 4: Gated direct-SQ8 VDB HNSW search + 4d PremiseFit
         let (vdb_hits, top_lemmas) = if gate == lean_sys1_ort::GateDecision::FallbackToLeJepa {
             let query_emb = onnx_sess.predict_lejepa_target(&pred.state_emb, pred.strategy);
-            let hits = vdb.search_sq8_hnsw(&query_emb, head_symbol.as_str(), 16)?;
+            let hits = vdb.search_sq8_hnsw(
+                &query_emb,
+                head_symbol.as_str(),
+                options.max_branches.max(16),
+            )?;
             let cand_embs: Vec<Vec<f32>> = hits.iter().map(|h| h.embedding.clone()).collect();
             let cand_names: Vec<String> = hits.iter().map(|h| h.metadata.name.clone()).collect();
             let scored = if cand_embs.is_empty() {
@@ -1474,7 +1591,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 "lean-prover ",
                 env!("CARGO_PKG_VERSION"),
                 "\n\nUsage:\n",
-                "  lean-prover prove <PATH> [--write] [--gate-threshold <VAL>] [--max-branches <N>]\n",
+                "  lean-prover prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
                 "  lean-prover check <PATH>             List remaining sorry theorems in a file or workspace\n",
                 "  lean-prover init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
                 "  lean-prover doctor                   Verify Lean 4, Lake, and artifact readiness\n",
@@ -1539,47 +1656,15 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             Ok((code, lines.join("\n")))
         }
         "prove" => {
-            let target = args.get(2).map_or(".", String::as_str);
-            let target_path = std::path::Path::new(target);
+            let prove_args = match ProveArgs::try_from_args(args) {
+                Ok(a) => a,
+                Err(msg) => return Ok((2, msg)),
+            };
+            let target_path = std::path::Path::new(&prove_args.target);
             if !target_path.exists() {
-                return Ok((2, format!("error: path '{target}' does not exist")));
+                return Ok((2, format!("error: path '{}' does not exist", prove_args.target)));
             }
-            let mut options = ProveOptions::default();
-            let mut i = 2usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--write" => options.write_in_place = true,
-                    "--gate-threshold" => {
-                        let Some(raw) = args.get(i + 1) else {
-                            return Ok((2, "error: --gate-threshold requires a value".to_string()));
-                        };
-                        let Ok(val) = raw.parse::<f32>() else {
-                            return Ok((2, format!("error: invalid --gate-threshold '{raw}'")));
-                        };
-                        let normalized = if val > 1.0 { val / 100.0 } else { val };
-                        if !(0.0..=1.0).contains(&normalized) {
-                            return Ok((
-                                2,
-                                format!("error: --gate-threshold '{raw}' must be in 0..1 or 0..100"),
-                            ));
-                        }
-                        options.gate_threshold = normalized;
-                        i += 1;
-                    }
-                    "--max-branches" => {
-                        let Some(raw) = args.get(i + 1) else {
-                            return Ok((2, "error: --max-branches requires a value".to_string()));
-                        };
-                        let Ok(n) = raw.parse::<usize>() else {
-                            return Ok((2, format!("error: invalid --max-branches '{raw}'")));
-                        };
-                        options.max_branches = n.clamp(1, 16);
-                        i += 1;
-                    }
-                    _ => {}
-                }
-                i += 1;
-            }
+            let options = ProverConfig::from(&prove_args);
             let summary = prove_lean_path_with_options(target_path, &options)?;
             let code = if summary.failed == 0 { 0 } else { 1 };
             let failed_names: Vec<&str> = summary
@@ -2037,24 +2122,41 @@ mod tests {
             "lean-prover".to_string(),
             "prove".to_string(),
             f.to_string_lossy().to_string(),
-            "--gate-threshold".to_string(),
+            "--gate-pct".to_string(),
             "75".to_string(),
             "--max-branches".to_string(),
-            "2".to_string(),
+            "6".to_string(),
+            "--premise-tau".to_string(),
+            "0.50".to_string(),
         ];
         let (code, out) = run_cli_args(&args).unwrap();
         assert_eq!(code, 0, "unexpected failure: {out}");
         assert!(out.contains("proved=1"));
 
-        let bad_args = vec![
+        let fast_args = vec![
             "lean-prover".to_string(),
             "prove".to_string(),
             f.to_string_lossy().to_string(),
-            "--gate-threshold".to_string(),
-            "150".to_string(),
+            "--gate-pct".to_string(),
+            "0".to_string(),
         ];
-        let (bad_code, _) = run_cli_args(&bad_args).unwrap();
-        assert_eq!(bad_code, 2);
+        let (fast_code, fast_out) = run_cli_args(&fast_args).unwrap();
+        assert_eq!(fast_code, 0, "fast-path ablation failed: {fast_out}");
+
+        for bad_flag in [
+            vec!["--gate-pct", "150"],
+            vec!["--max-branches", "0"],
+            vec!["--premise-tau", "1.5"],
+        ] {
+            let mut bad_args = vec![
+                "lean-prover".to_string(),
+                "prove".to_string(),
+                f.to_string_lossy().to_string(),
+            ];
+            bad_args.extend(bad_flag.into_iter().map(str::to_string));
+            let (bad_code, _) = run_cli_args(&bad_args).unwrap();
+            assert_eq!(bad_code, 2);
+        }
 
         // Strict 3-axiom allowlist rejects custom/unsafe axioms even without sorryAx
         assert!(lean_repl::verify_allowed_axioms("'t' depends on axioms: [propext, Classical.choice]").is_ok());
