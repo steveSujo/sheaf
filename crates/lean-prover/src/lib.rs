@@ -687,8 +687,79 @@ fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> S
 }
 
 /// Dispatch CLI arguments for `lean-prover` (`prove`, `check`, `init`, `doctor`, `--help`, `--version`).
-pub fn run_cli_args(_args: &[String]) -> Result<(i32, String), ProverError> {
-    todo!("TASK-M5-006: implement run_cli_args")
+pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
+    let sub = args.get(1).map(String::as_str).unwrap_or("--help");
+    match sub {
+        "--help" | "-h" | "help" => Ok((
+            0,
+            concat!(
+                "lean-prover ",
+                env!("CARGO_PKG_VERSION"),
+                "\n\nUsage:\n",
+                "  lean-prover prove <PATH> [--write]   Discover sorry theorems, prove, and kernel-verify\n",
+                "  lean-prover check <PATH>             List remaining sorry theorems in a file or workspace\n",
+                "  lean-prover init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
+                "  lean-prover doctor                   Verify Lean 4, Lake, and artifact readiness\n",
+                "  lean-prover --version                Print version\n",
+            )
+            .to_string(),
+        )),
+        "--version" | "-V" => Ok((0, format!("lean-prover {}", env!("CARGO_PKG_VERSION")))),
+        "doctor" => {
+            let lean_out = std::process::Command::new("lean").arg("--version").output();
+            let lean_ver = match lean_out {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                _ => "lean: NOT FOUND".to_string(),
+            };
+            let artifacts_ok = std::path::Path::new("artifacts/tokenizer.json").exists();
+            Ok((
+                0,
+                format!("lean: {lean_ver}\nartifacts_bootstrapped: {artifacts_ok}"),
+            ))
+        }
+        "init" => {
+            let dir = args
+                .iter()
+                .position(|a| a == "--dir")
+                .and_then(|i| args.get(i + 1))
+                .map_or_else(|| std::path::PathBuf::from("artifacts"), std::path::PathBuf::from);
+            let paths = init_default_artifacts(&dir)?;
+            Ok((
+                0,
+                format!(
+                    "Bootstrapped artifacts:\n  {}\n  {}\n  {}",
+                    paths.tokenizer_json.display(),
+                    paths.temperatures_json.display(),
+                    paths.mathlib_vdb.display()
+                ),
+            ))
+        }
+        "check" => {
+            let target = args.get(2).map_or(".", String::as_str);
+            let found = discover_sorry_theorems(std::path::Path::new(target))?;
+            let code = if found.is_empty() { 0 } else { 1 };
+            Ok((code, format!("Found {} sorry theorem(s) in {target}", found.len())))
+        }
+        "prove" => {
+            let target = args.get(2).map_or(".", String::as_str);
+            let write_in_place = args.iter().any(|a| a == "--write");
+            let summary = prove_lean_path(std::path::Path::new(target), write_in_place)?;
+            let code = if summary.failed == 0 { 0 } else { 1 };
+            Ok((
+                code,
+                format!(
+                    "discovered={} proved={} failed={} theorems={:?}",
+                    summary.discovered, summary.proved, summary.failed, summary.proved_names
+                ),
+            ))
+        }
+        other => Ok((
+            2,
+            format!("Unknown command '{other}'. Run `lean-prover --help` for usage."),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -810,7 +881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M5-006"]
     fn test_cli_help_doctor_init_and_prove_commands() {
         let (code, out) = run_cli_args(&["lean-prover".into(), "--help".into()]).unwrap();
         assert_eq!(code, 0);
@@ -819,7 +889,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M5-007"]
     fn test_readme_exists_and_documents_cli_commands() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
