@@ -483,6 +483,7 @@ pub struct DiscoveredTheorem {
     pub local_structures: Vec<String>,
     pub local_inductives: Vec<String>,
     pub local_theorems: Vec<String>,
+    pub workspace_deps: Vec<std::path::PathBuf>,
 }
 
 /// Summary of proving all `sorry` theorems in a `.lean` file or workspace.
@@ -535,20 +536,191 @@ pub fn init_default_artifacts(artifact_dir: &std::path::Path) -> Result<Artifact
     })
 }
 
-/// Recursively scan a `.lean` file or `lake` workspace (skipping `.lake/`) for `sorry` theorems.
+#[derive(Default, Clone)]
+struct ModuleExports {
+    defs: Vec<(Option<String>, String)>,
+    structures: Vec<(Option<String>, String)>,
+    inductives: Vec<(Option<String>, String)>,
+    theorems: Vec<(Option<String>, String)>,
+}
+
+fn file_module_name(file: &std::path::Path, base_root: &std::path::Path) -> String {
+    let rel = file.strip_prefix(base_root).unwrap_or(file);
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+        .collect();
+    if let Some(last) = parts.last_mut()
+        && let Some(stem) = last.strip_suffix(".lean")
+    {
+        *last = stem.to_string();
+    }
+    parts.join(".")
+}
+
+fn parse_file_imports_and_opens(src: &str) -> (Vec<String>, Vec<String>) {
+    let mut imports = Vec::new();
+    let mut opens = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for tok in rest.split_whitespace() {
+                if !tok.is_empty() {
+                    imports.push(tok.to_string());
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("open ") {
+            for tok in rest.split_whitespace() {
+                if !tok.is_empty() {
+                    opens.push(tok.to_string());
+                }
+            }
+        }
+    }
+    (imports, opens)
+}
+
+fn topo_sort_workspace_files(
+    raw_files: &[std::path::PathBuf],
+    base_root: &std::path::Path,
+) -> Result<(Vec<std::path::PathBuf>, Vec<Vec<std::path::PathBuf>>), ProverError> {
+    let mut files = raw_files.to_vec();
+    files.sort();
+    let n = files.len();
+    let mut mod_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        mod_to_idx.insert(file_module_name(f, base_root), i);
+    }
+
+    let mut direct_deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut rev_deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg = vec![0usize; n];
+
+    for (i, f) in files.iter().enumerate() {
+        let src = std::fs::read_to_string(f)
+            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+        let (imports, _) = parse_file_imports_and_opens(&src);
+        for imp in imports {
+            if let Some(&dep_idx) = mod_to_idx.get(&imp)
+                && dep_idx != i
+                && !direct_deps[i].contains(&dep_idx)
+            {
+                direct_deps[i].push(dep_idx);
+                rev_deps[dep_idx].push(i);
+                indeg[i] += 1;
+            }
+        }
+    }
+
+    let mut ready = std::collections::BTreeSet::new();
+    for (i, &d) in indeg.iter().enumerate() {
+        if d == 0 {
+            ready.insert(i);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(u) = ready.pop_first() {
+        order.push(u);
+        for &v in &rev_deps[u] {
+            indeg[v] -= 1;
+            if indeg[v] == 0 {
+                ready.insert(v);
+            }
+        }
+    }
+    for i in 0..n {
+        if !order.contains(&i) {
+            order.push(i);
+        }
+    }
+
+    let sorted_files: Vec<std::path::PathBuf> = order.iter().map(|&i| files[i].clone()).collect();
+    let mut pos_in_sorted = vec![0usize; n];
+    for (pos, &orig_idx) in order.iter().enumerate() {
+        pos_in_sorted[orig_idx] = pos;
+    }
+
+    // Compute transitive workspace dependencies in topological order for each sorted file
+    let mut trans_deps: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); n];
+    for (pos, &orig_idx) in order.iter().enumerate() {
+        let mut dep_positions = std::collections::BTreeSet::new();
+        let mut stack = direct_deps[orig_idx].clone();
+        while let Some(d_orig) = stack.pop() {
+            let d_pos = pos_in_sorted[d_orig];
+            if dep_positions.insert(d_pos) {
+                stack.extend_from_slice(&direct_deps[d_orig]);
+            }
+        }
+        trans_deps[pos] = dep_positions
+            .into_iter()
+            .map(|p| sorted_files[p].clone())
+            .collect();
+    }
+
+    Ok((sorted_files, trans_deps))
+}
+
+fn qualify_exported_symbols(
+    entries: &[(Option<String>, String)],
+    opens: &[String],
+    target: &mut Vec<String>,
+) {
+    for (ns, name) in entries {
+        if let Some(ns_name) = ns {
+            let qual = format!("{ns_name}.{name}");
+            if !target.contains(&qual) {
+                target.push(qual);
+            }
+            if opens.iter().any(|o| o == ns_name) && !target.contains(name) {
+                target.push(name.clone());
+            }
+        } else if !target.contains(name) {
+            target.push(name.clone());
+        }
+    }
+}
+
+/// Recursively scan a `.lean` file or `lake` workspace (skipping `.lake/`) for `sorry` theorems
+/// in topological import order with transitive workspace symbols.
 pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredTheorem>, ProverError> {
-    let mut files = Vec::new();
-    collect_lean_files(path, &mut files)?;
+    let mut raw_files = Vec::new();
+    collect_lean_files(path, &mut raw_files)?;
+
+    let base_root = find_lake_workspace_root(path).unwrap_or_else(|| {
+        if path.is_file() {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    });
+    let (files, file_trans_deps) = topo_sort_workspace_files(&raw_files, &base_root)?;
+    let mut exports_by_file: std::collections::HashMap<std::path::PathBuf, ModuleExports> =
+        std::collections::HashMap::new();
 
     let mut found = Vec::new();
-    for file in files {
-        let src = std::fs::read_to_string(&file)
+    for (file_idx, file) in files.iter().enumerate() {
+        let src = std::fs::read_to_string(file)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-        let mut current_ns: Option<String> = None;
+        let (_, opens) = parse_file_imports_and_opens(&src);
+        let deps = &file_trans_deps[file_idx];
+
         let mut local_defs: Vec<String> = Vec::new();
         let mut local_structures: Vec<String> = Vec::new();
         let mut local_inductives: Vec<String> = Vec::new();
         let mut local_theorems: Vec<String> = Vec::new();
+
+        for dep in deps {
+            if let Some(exp) = exports_by_file.get(dep) {
+                qualify_exported_symbols(&exp.defs, &opens, &mut local_defs);
+                qualify_exported_symbols(&exp.structures, &opens, &mut local_structures);
+                qualify_exported_symbols(&exp.inductives, &opens, &mut local_inductives);
+                qualify_exported_symbols(&exp.theorems, &opens, &mut local_theorems);
+            }
+        }
+
+        let mut file_exports = ModuleExports::default();
+        let mut current_ns: Option<String> = None;
         let lines: Vec<&str> = src.lines().collect();
 
         let mut idx = 0usize;
@@ -568,6 +740,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     .filter(|s| !s.is_empty())
                 {
                     local_defs.push(dname.to_string());
+                    file_exports.defs.push((current_ns.clone(), dname.to_string()));
                 }
             } else if let Some(after_struct) = trimmed.strip_prefix("structure ") {
                 if let Some(sname) = after_struct
@@ -576,6 +749,9 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     .filter(|s| !s.is_empty())
                 {
                     local_structures.push(sname.to_string());
+                    file_exports
+                        .structures
+                        .push((current_ns.clone(), sname.to_string()));
                 }
             } else if let Some(after_ind) = trimmed.strip_prefix("inductive ") {
                 if let Some(iname) = after_ind
@@ -584,6 +760,9 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     .filter(|s| !s.is_empty())
                 {
                     local_inductives.push(iname.to_string());
+                    file_exports
+                        .inductives
+                        .push((current_ns.clone(), iname.to_string()));
                 }
             } else if let Some(after_thm) = trimmed
                 .strip_prefix("theorem ")
@@ -635,14 +814,17 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                         local_structures: local_structures.clone(),
                         local_inductives: local_inductives.clone(),
                         local_theorems: local_theorems.clone(),
+                        workspace_deps: deps.clone(),
                     });
                 }
                 if !name.is_empty() {
-                    local_theorems.push(name);
+                    local_theorems.push(name.clone());
+                    file_exports.theorems.push((current_ns.clone(), name));
                 }
             }
             idx += 1;
         }
+        exports_by_file.insert(file.clone(), file_exports);
     }
     Ok(found)
 }
@@ -888,6 +1070,12 @@ impl ProveArgs {
                     parsed.max_heartbeats = hb;
                     i += 1;
                 }
+                "--help" | "-h" => return Err("__HELP__".to_string()),
+                unknown if unknown.starts_with("--") => {
+                    return Err(format!(
+                        "error: unknown flag '{unknown}'. Run `sheaf --help` for usage."
+                    ));
+                }
                 _ => {}
             }
             i += 1;
@@ -1011,6 +1199,14 @@ pub fn prove_lean_path_with_artifacts_and_options(
     let mut blob_store = vfs::BlobStore::default();
     let mut initial_files = std::collections::BTreeMap::new();
     for thm in &theorems {
+        for dep in &thm.workspace_deps {
+            if !initial_files.contains_key(dep)
+                && let Ok(loaded) = std::fs::read_to_string(dep)
+            {
+                let h = blob_store.put(&loaded);
+                initial_files.insert(dep.clone(), h);
+            }
+        }
         if !initial_files.contains_key(&thm.file) {
             let loaded = std::fs::read_to_string(&thm.file)
                 .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
@@ -1020,6 +1216,13 @@ pub fn prove_lean_path_with_artifacts_and_options(
     }
     let initial_tree = vfs::TreeSnapshot::from_map(initial_files);
     let mut root_tree = initial_tree.clone();
+    let base_root = find_lake_workspace_root(path).unwrap_or_else(|| {
+        if path.is_file() {
+            path.parent().unwrap_or(path).to_path_buf()
+        } else {
+            path.to_path_buf()
+        }
+    });
 
     for (idx, thm) in theorems.iter().enumerate() {
         let thm_start = Instant::now();
@@ -1027,6 +1230,13 @@ pub fn prove_lean_path_with_artifacts_and_options(
             .read_file(&blob_store, &thm.file)
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let eval_src = compose_live_eval_source(
+            &root_tree,
+            &blob_store,
+            &thm.file,
+            &thm.workspace_deps,
+            &base_root,
+        );
         let full_name = match &thm.namespace {
             Some(ns) => format!("{ns}.{}", thm.name),
             None => thm.name.clone(),
@@ -1101,7 +1311,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
         let (mut solved, mut last_diag, unsolved_diags) =
             kernel_eval::verify_candidates_batched_with_heartbeats(
-                &src,
+                &eval_src,
                 thm,
                 &full_name,
                 &candidates,
@@ -1119,11 +1329,14 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 options.max_depth,
                 options.max_nodes,
                 |store, node, dedup| {
-                    let cur_src = node
-                        .tree
-                        .read_file(store, &node.target_file)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| src.clone());
+                    let cur_src = if node.depth == 0 {
+                        eval_src.clone()
+                    } else {
+                        node.tree
+                            .read_file(store, &node.target_file)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| eval_src.clone())
+                    };
                     let step_cands: Vec<Vec<String>> = if node.depth == 0 {
                         unsolved_diags.iter().take(2).map(|(s, _)| s.clone()).collect()
                     } else {
@@ -1272,7 +1485,13 @@ pub fn prove_lean_path_with_artifacts_and_options(
         eprintln!("{log_block}");
         stage_logs.push(log_block);
 
-        if let Some((new_src, script)) = solved {
+        if let Some((_eval_new_src, script)) = solved {
+            let body = script
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let new_src = replace_theorem_sorry(&src, &thm.name, &body);
             root_tree = root_tree.with_updates(&mut blob_store, &[(thm.file.clone(), new_src)]);
             proved += 1;
             proved_names.push(full_name.clone());
@@ -1302,6 +1521,95 @@ pub fn prove_lean_path_with_artifacts_and_options(
         failed_theorems,
         stage_logs,
     })
+}
+
+fn compose_live_eval_source(
+    root_tree: &vfs::TreeSnapshot,
+    store: &vfs::BlobStore,
+    target_file: &std::path::Path,
+    workspace_deps: &[std::path::PathBuf],
+    base_root: &std::path::Path,
+) -> String {
+    let target_src = root_tree
+        .read_file(store, target_file)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    if workspace_deps.is_empty() {
+        return target_src;
+    }
+
+    let dep_mods: std::collections::HashSet<String> = workspace_deps
+        .iter()
+        .map(|p| file_module_name(p, base_root))
+        .collect();
+    let target_mod = file_module_name(target_file, base_root);
+
+    let mut ext_imports: Vec<String> = Vec::new();
+    let mut body = String::new();
+
+    for dep in workspace_deps {
+        let Some(dep_src) = root_tree.read_file(store, dep) else {
+            continue;
+        };
+        let mut ns_stack: Vec<String> = Vec::new();
+        for line in dep_src.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("import ") {
+                for tok in rest.split_whitespace() {
+                    if !dep_mods.contains(tok) && tok != target_mod {
+                        let imp_line = format!("import {tok}");
+                        if !ext_imports.contains(&imp_line) {
+                            ext_imports.push(imp_line);
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(ns) = trimmed.strip_prefix("namespace ") {
+                ns_stack.push(ns.trim().to_string());
+            } else if let Some(end_ns) = trimmed.strip_prefix("end ") {
+                let end_name = end_ns.trim();
+                if ns_stack.last().is_some_and(|top| top == end_name) {
+                    ns_stack.pop();
+                }
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        while let Some(open_ns) = ns_stack.pop() {
+            body.push_str(&format!("end {open_ns}\n"));
+        }
+        body.push('\n');
+    }
+
+    for line in target_src.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            let mut kept_any = false;
+            for tok in rest.split_whitespace() {
+                if !dep_mods.contains(tok) && tok != target_mod {
+                    let imp_line = format!("import {tok}");
+                    if !ext_imports.contains(&imp_line) {
+                        ext_imports.push(imp_line);
+                    }
+                    kept_any = true;
+                }
+            }
+            if !kept_any {
+                continue;
+            }
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+
+    let mut out = ext_imports.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&body);
+    out
 }
 
 fn parse_unsolved_goal_from_diag(diag: &str) -> Option<(Vec<String>, String)> {
@@ -1472,6 +1780,9 @@ fn synthesize_from_model_and_vdb(
                 }
                 scripts.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
                 scripts.push(vec![format!(
+                    "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
+                )]);
+                scripts.push(vec![format!(
                     "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> try omega"
                 )]);
             } else {
@@ -1553,24 +1864,26 @@ pub(crate) fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body:
     src.replacen("  sorry", replacement_body, 1)
 }
 
-/// Dispatch CLI arguments for `lean-prover` (`prove`, `check`, `init`, `doctor`, `--help`, `--version`).
+fn cli_help_text() -> String {
+    concat!(
+        "sheaf ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\nUsage:\n",
+        "  sheaf prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
+        "                     [--max-depth <1..16>=4] [--max-nodes <1..1024>=64] [--max-workers <1..8>=2] [--max-heartbeats <N>=200000]\n",
+        "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
+        "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
+        "  sheaf doctor                   Verify Lean 4, Lake, and artifact readiness\n",
+        "  sheaf --version                Print version\n",
+    )
+    .to_string()
+}
+
+/// Dispatch CLI arguments for `sheaf` (`prove`, `check`, `init`, `doctor`, `--help`, `--version`).
 pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
     let sub = args.get(1).map(String::as_str).unwrap_or("--help");
     match sub {
-        "--help" | "-h" | "help" => Ok((
-            0,
-            concat!(
-                "sheaf ",
-                env!("CARGO_PKG_VERSION"),
-                "\n\nUsage:\n",
-                "  sheaf prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
-                "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
-                "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
-                "  sheaf doctor                   Verify Lean 4, Lake, and artifact readiness\n",
-                "  sheaf --version                Print version\n",
-            )
-            .to_string(),
-        )),
+        "--help" | "-h" | "help" => Ok((0, cli_help_text())),
         "--version" | "-V" => Ok((0, format!("sheaf {}", env!("CARGO_PKG_VERSION")))),
         "doctor" => {
             let lean_out = std::process::Command::new("lean").arg("--version").output();
@@ -1630,6 +1943,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
         "prove" => {
             let prove_args = match ProveArgs::try_from_args(args) {
                 Ok(a) => a,
+                Err(msg) if msg == "__HELP__" => return Ok((0, cli_help_text())),
                 Err(msg) => return Ok((2, msg)),
             };
             let target_path = std::path::Path::new(&prove_args.target);
@@ -2503,5 +2817,64 @@ mod tests {
             })
             .collect();
         assert!(leftover.is_empty(), "leftover worktree dirs: {leftover:?}");
+    }
+
+    #[test]
+    fn test_prove_help_and_unknown_flag_rejection() {
+        let (code, out) = run_cli_args(&["sheaf".into(), "prove".into(), "--help".into()]).unwrap();
+        assert_eq!(code, 0);
+        assert!(out.contains("--max-depth"));
+        assert!(out.contains("--max-heartbeats"));
+
+        let (bad_code, bad_out) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            ".".into(),
+            "--unknown-flag".into(),
+        ])
+        .unwrap();
+        assert_eq!(bad_code, 2);
+        assert!(bad_out.contains("unknown flag"));
+    }
+
+    #[test]
+    fn test_topo_sort_diamond_multifile_and_docstring_batch_isolation() {
+        let dir = std::env::temp_dir().join("sheaf_m13_diamond_topo");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ZTop")).unwrap();
+        std::fs::create_dir_all(dir.join("AMid")).unwrap();
+        std::fs::create_dir_all(dir.join("BMid")).unwrap();
+
+        // Alphabetically ZTop < AMid/BMid fails unless topological sort orders Base -> AMid/BMid -> ZTop
+        std::fs::write(
+            dir.join("Base.lean"),
+            "import Init\nnamespace Base\ninductive Expr where\n  | lit : Nat → Expr\n  | add : Expr → Expr → Expr\ndef evalOpt : Expr → Option Nat\n  | .lit n => some n\n  | .add a b =>\n    match evalOpt a, evalOpt b with\n    | some x, some y => some (x + y)\n    | _, _ => none\ndef evalTotal : Expr → Nat\n  | .lit n => n\n  | .add a b => evalTotal a + evalTotal b\nend Base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("AMid").join("Left.lean"),
+            "import Init\nimport Base\nopen Base\nnamespace AMid\n/-- Docstring before theorem -/\ntheorem evalOpt_eq (e : Expr) : evalOpt e = some (evalTotal e) := by\n  sorry\nend AMid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("BMid").join("Right.lean"),
+            "import Init\nimport Base\nopen Base\nnamespace BMid\n/-- Another docstring -/\ntheorem add_zero_expr (e : Expr) : evalTotal e + 0 = evalTotal e := by\n  sorry\nend BMid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ZTop").join("Join.lean"),
+            "import Init\nimport Base\nimport AMid.Left\nimport BMid.Right\nopen Base AMid BMid\nnamespace ZTop\n/-- Diamond join theorem -/\ntheorem join_eval (e : Expr) : evalOpt e = some (evalTotal e + 0) := by\n  sorry\nend ZTop\n",
+        )
+        .unwrap();
+
+        let discovered = discover_sorry_theorems(&dir).unwrap();
+        let names: Vec<&str> = discovered.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["evalOpt_eq", "add_zero_expr", "join_eval"]);
+
+        let summary = prove_lean_path(&dir, false).unwrap();
+        assert_eq!(summary.discovered, 3);
+        assert_eq!(summary.proved, 3, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
