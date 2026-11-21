@@ -72,6 +72,7 @@ fn build_lean4_benchmark_vdb() -> (StaticVdbIndex, VectorDatabase) {
             quantizer,
             metadata,
             codes,
+            neighbors: Vec::new(),
         },
         db,
     )

@@ -727,15 +727,49 @@ fn collect_lean_files(
     Ok(())
 }
 
+/// Configuration options for `lean-prover prove`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProveOptions {
+    pub write_in_place: bool,
+    pub gate_threshold: f32,
+    pub max_branches: usize,
+    pub premise_tau: f32,
+}
+
+impl Default for ProveOptions {
+    fn default() -> Self {
+        Self {
+            write_in_place: false,
+            gate_threshold: lean_sys1_ort::CONFIDENCE_GATE_THRESHOLD,
+            max_branches: 4,
+            premise_tau: 0.50,
+        }
+    }
+}
+
 /// Prove all discovered `sorry` theorems in `path` using the embedded `lean_sys1.onnx` and `mathlib_sq8.vdb`.
 pub fn prove_lean_path(
     path: &std::path::Path,
     write_in_place: bool,
 ) -> Result<WorkspaceProveSummary, ProverError> {
-    let emb = embedded_artifacts();
-    prove_lean_path_with_artifacts(
+    prove_lean_path_with_options(
         path,
-        write_in_place,
+        &ProveOptions {
+            write_in_place,
+            ..Default::default()
+        },
+    )
+}
+
+/// Prove all discovered `sorry` theorems in `path` with explicit `ProveOptions`.
+pub fn prove_lean_path_with_options(
+    path: &std::path::Path,
+    options: &ProveOptions,
+) -> Result<WorkspaceProveSummary, ProverError> {
+    let emb = embedded_artifacts();
+    prove_lean_path_with_artifacts_and_options(
+        path,
+        options,
         emb.lean_sys1_onnx,
         emb.tokenizer_json,
         emb.temperatures_json,
@@ -752,21 +786,34 @@ pub fn prove_lean_path_with_artifacts(
     temperatures_json: &str,
     vdb_bytes: &[u8],
 ) -> Result<WorkspaceProveSummary, ProverError> {
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    prove_lean_path_with_artifacts_and_options(
+        path,
+        &ProveOptions {
+            write_in_place,
+            ..Default::default()
+        },
+        onnx_bytes,
+        tokenizer_json,
+        temperatures_json,
+        vdb_bytes,
+    )
+}
+
+/// Prove all discovered `sorry` theorems with explicit artifacts and `ProveOptions`.
+pub fn prove_lean_path_with_artifacts_and_options(
+    path: &std::path::Path,
+    options: &ProveOptions,
+    onnx_bytes: &[u8],
+    tokenizer_json: &str,
+    temperatures_json: &str,
+    vdb_bytes: &[u8],
+) -> Result<WorkspaceProveSummary, ProverError> {
+    use std::time::Instant;
 
     let onnx_sess = lean_sys1_ort::LeanSys1OnnxSession::from_onnx_bytes(onnx_bytes)?;
     let temps: lean_sys1_ort::CalibrationTemperatures = serde_json::from_str(temperatures_json)
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Json(e)))?;
     let (vdb, _resolver) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(vdb_bytes)?;
-
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let orion_dir = std::env::temp_dir().join(format!(
-        "lean_prover_orion_{unique}_{:?}",
-        std::thread::current().id()
-    ));
-    let orion_db = vdb.build_orion_db(&orion_dir)?;
 
     let theorems = discover_sorry_theorems(path)?;
     let total = theorems.len();
@@ -812,106 +859,103 @@ pub fn prove_lean_path_with_artifacts(
             lean_sys1_ort::encode_canonical_text(tokenizer_json, &canonical, 512)?;
         let non_pad = attention_mask.iter().filter(|&&m| m == 1).count();
 
-        // Stage 3: Lean-Sys1 ONNX forward pass
+        // Stage 3: Lean-Sys1 ONNX forward pass with configurable confidence gate
         let (pred, _choice_logits, gate) =
-            onnx_sess.forward(&input_ids, &attention_mask, &temps)?;
+            onnx_sess.forward_with_gate(&input_ids, &attention_mask, &temps, options.gate_threshold)?;
 
-        // Stage 4: Orion VDB HNSW search + 4d PremiseFit + PDA mask
-        let vdb_hits =
-            vdb.search_hnsw_backend(&orion_db, &pred.state_emb, head_symbol.as_str(), 8)?;
-        let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
-        let cand_names: Vec<String> = vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
-        let scored = if cand_embs.is_empty() {
-            Vec::new()
+        // Stage 4: Gated direct-SQ8 VDB HNSW search + 4d PremiseFit
+        let (vdb_hits, top_lemmas) = if gate == lean_sys1_ort::GateDecision::FallbackToLeJepa {
+            let query_emb = onnx_sess.predict_lejepa_target(&pred.state_emb, pred.strategy);
+            let hits = vdb.search_sq8_hnsw(&query_emb, head_symbol.as_str(), 16)?;
+            let cand_embs: Vec<Vec<f32>> = hits.iter().map(|h| h.embedding.clone()).collect();
+            let cand_names: Vec<String> = hits.iter().map(|h| h.metadata.name.clone()).collect();
+            let scored = if cand_embs.is_empty() {
+                Vec::new()
+            } else {
+                lean_sys1_ort::score_premise_fit_batch(
+                    &pred.state_emb,
+                    &cand_embs,
+                    onnx_sess.premise_fit_weights(),
+                    temps.t_fit,
+                    options.premise_tau,
+                )?
+            };
+            let fallback = lean_sys1_ort::select_fallback_outcome(&scored, options.max_branches);
+            let top = match fallback {
+                lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
+                    .iter()
+                    .filter_map(|(i, _)| cand_names.get(*i).cloned())
+                    .collect(),
+                lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => Vec::new(),
+            };
+            (hits, top)
         } else {
-            lean_sys1_ort::score_premise_fit_batch(
-                &pred.state_emb,
-                &cand_embs,
-                onnx_sess.premise_fit_weights(),
-                temps.t_fit,
-                0.0,
-            )?
+            (Vec::new(), Vec::new())
         };
-        let fallback = lean_sys1_ort::select_fallback_outcome(&scored, 4);
-        let top_lemmas: Vec<String> = match &fallback {
-            lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
-                .iter()
-                .filter_map(|(i, _)| cand_names.get(*i).cloned())
-                .collect(),
-            lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => Vec::new(),
-        };
-        let pda_mask = build_pda_logit_mask(&cand_names, &hyp_strs, &top_lemmas, "");
-        let pda_allowed = pda_mask.iter().filter(|&&m| m == 0.0).count();
-        let _soft_tokens = project_soft_tokens(
-            &cand_embs.iter().take(2).cloned().collect::<Vec<_>>(),
-            2,
-            pred.state_emb.len(),
-        );
 
-        // Stage 5: Model-only VDB-driven tactic synthesis + Lean 4 Kernel verification
-        let candidates =
-            synthesize_from_model_and_vdb(thm, head_symbol.as_str(), &pred, &vdb_hits, &top_lemmas);
+        // Stage 5: Model-only VDB-driven tactic synthesis + Batched Lean 4 Kernel verification + Axiom Allowlist
+        let candidates = synthesize_from_model_and_vdb(
+            thm,
+            head_symbol.as_str(),
+            &pred,
+            &vdb_hits,
+            &top_lemmas,
+            options.max_branches,
+        );
         let lake_root = find_lake_workspace_root(&thm.file);
 
-        let mut solved: Option<(String, Vec<String>)> = None;
-        let mut last_diag = String::from("model produced no valid kernel-verified tactic");
+        let (mut solved, mut last_diag, unsolved_diags) =
+            verify_candidates_batched(&src, thm, &full_name, &candidates, lake_root.as_deref())?;
 
-        for script in candidates {
-            let body = script
-                .iter()
-                .map(|l| format!("  {l}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let candidate_src = replace_theorem_sorry(&src, &thm.name, &body);
-            let tmp_file = std::env::temp_dir().join(format!("lean_prove_{}.lean", thm.name));
-            let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
-            std::fs::write(&tmp_file, &audit)
-                .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-
-            let out = if let Some(ref root) = lake_root {
-                std::process::Command::new("lake")
-                    .args(["env", "lean", "--json"])
-                    .arg(&tmp_file)
-                    .current_dir(root)
-                    .output()
-            } else {
-                std::process::Command::new("lean")
-                    .arg("--json")
-                    .arg(&tmp_file)
-                    .output()
-            }
-            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-            let _ = std::fs::remove_file(&tmp_file);
-
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let mut has_error = false;
-            let mut uses_sorry_ax = false;
-            let mut first_error_msg: Option<String> = None;
-            for line in stdout.lines() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-                    let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                    if sev == "error" {
-                        has_error = true;
-                        if first_error_msg.is_none() && !data.is_empty() {
-                            first_error_msg = Some(data.to_string());
+        // Compositional 2-step subgoal recovery using EpisodicCache when unsolved goals remain
+        if solved.is_none() && !unsolved_diags.is_empty() {
+            let mut episodic_cache = lean_vdb::EpisodicCache::default();
+            let _ = episodic_cache.check_or_insert(&pred.state_emb);
+            let mut composed_candidates: Vec<Vec<String>> = Vec::new();
+            for (base_script, goal_diag) in unsolved_diags.into_iter().take(2) {
+                if let Some((sub_hyps, sub_target)) = parse_unsolved_goal_from_diag(&goal_diag) {
+                    let sub_collapsed = lean_canonicalizer::collapse_implicit_instances(&sub_target);
+                    let (sub_norm_h, sub_norm_t) =
+                        lean_canonicalizer::normalize_alpha_vars(&sub_hyps, &sub_collapsed);
+                    let sub_canonical = format!("{} ⊢ {}", sub_norm_h.join(", "), sub_norm_t);
+                    if let Ok((sub_ids, sub_mask)) =
+                        lean_sys1_ort::encode_canonical_text(tokenizer_json, &sub_canonical, 512)
+                        && let Ok((sub_pred, _, _)) = onnx_sess.forward_with_gate(
+                            &sub_ids,
+                            &sub_mask,
+                            &temps,
+                            options.gate_threshold,
+                        )
+                        && episodic_cache.check_or_insert(&sub_pred.state_emb)
+                            == lean_vdb::EpisodicHit::Novel
+                    {
+                        let sub_closer = match sub_pred.strategy {
+                            lean_sys1_ort::StrategyChoice::AtomicClose => "all_goals (first | rfl | simp | omega)",
+                            lean_sys1_ort::StrategyChoice::Rewrite => "all_goals (first | simp_all | omega)",
+                            _ => "all_goals (try simp_all; try omega)",
+                        };
+                        let mut step = base_script;
+                        if let Some(last) = step.last_mut() {
+                            *last = format!("{last}; {sub_closer}");
                         }
+                        composed_candidates.push(step);
                     }
-                    if data.contains("sorryAx") {
-                        uses_sorry_ax = true;
-                    }
-                } else if line.contains("sorryAx") {
-                    uses_sorry_ax = true;
                 }
             }
-
-            if out.status.success() && !has_error && !uses_sorry_ax {
-                solved = Some((candidate_src, script));
-                break;
+            if !composed_candidates.is_empty() {
+                let (comp_solved, comp_diag, _) = verify_candidates_batched(
+                    &src,
+                    thm,
+                    &full_name,
+                    &composed_candidates,
+                    lake_root.as_deref(),
+                )?;
+                if comp_solved.is_some() {
+                    solved = comp_solved;
+                } else {
+                    last_diag = comp_diag;
+                }
             }
-            last_diag = first_error_msg
-                .or_else(|| stdout.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
-                .unwrap_or_else(|| "kernel rejected".to_string());
         }
 
         let elapsed_ms = thm_start.elapsed().as_millis();
@@ -920,7 +964,7 @@ pub fn prove_lean_path_with_artifacts(
             None => format!("FAILED in {elapsed_ms}ms [{last_diag}]"),
         };
         let log_block = format!(
-            "[{}/{}] {full_name} ({}:{})\n  ├─ 1. Canonicalize : {canonical} [head_symbol={}]\n  ├─ 2. Tokenize     : {non_pad} tokens (pad_to=512)\n  ├─ 3. Lean-Sys1    : strategy={:?} conf={:.2} noul={:.2} difficulty={:?} gate={gate:?}\n  ├─ 4. Orion VDB    : {} hits -> top={top_lemmas:?} pda_allowed={pda_allowed}\n  └─ 5. Lean Kernel  : {kernel_line}",
+            "[{}/{}] {full_name} ({}:{})\n  ├─ 1. Canonicalize : {canonical} [head_symbol={}]\n  ├─ 2. Tokenize     : {non_pad} tokens (pad_to=512)\n  ├─ 3. Lean-Sys1    : strategy={:?} conf={:.2} noul={:.2} difficulty={:?} gate={gate:?}\n  ├─ 4. Orion VDB    : {} hits -> top={top_lemmas:?}\n  └─ 5. Lean Kernel  : {kernel_line}",
             idx + 1,
             total,
             thm.file.display(),
@@ -937,7 +981,7 @@ pub fn prove_lean_path_with_artifacts(
 
         if let Some((new_src, script)) = solved {
             file_buffers.insert(thm.file.clone(), new_src.clone());
-            if write_in_place {
+            if options.write_in_place {
                 std::fs::write(&thm.file, new_src)
                     .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
             }
@@ -950,7 +994,6 @@ pub fn prove_lean_path_with_artifacts(
         }
     }
 
-    let _ = std::fs::remove_dir_all(&orion_dir);
     Ok(WorkspaceProveSummary {
         discovered: total,
         proved,
@@ -962,12 +1005,239 @@ pub fn prove_lean_path_with_artifacts(
     })
 }
 
+fn run_lean_json(file: &std::path::Path, lake_root: Option<&std::path::Path>) -> Result<std::process::Output, ProverError> {
+    if let Some(root) = lake_root {
+        std::process::Command::new("lake")
+            .args(["env", "lean", "--json"])
+            .arg(file)
+            .current_dir(root)
+            .output()
+    } else {
+        std::process::Command::new("lean")
+            .arg("--json")
+            .arg(file)
+            .output()
+    }
+    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
+}
+
+fn audit_single_candidate(
+    src: &str,
+    thm_name: &str,
+    full_name: &str,
+    script: &[String],
+    lake_root: Option<&std::path::Path>,
+) -> Result<Result<String, String>, ProverError> {
+    let body = script
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let candidate_src = replace_theorem_sorry(src, thm_name, &body);
+    let tmp_file = std::env::temp_dir().join(format!("lean_prove_audit_{thm_name}.lean"));
+    let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
+    std::fs::write(&tmp_file, &audit)
+        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+    let out = run_lean_json(&tmp_file, lake_root)?;
+    let _ = std::fs::remove_file(&tmp_file);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut has_error = false;
+    let mut illegal_axiom: Option<String> = None;
+    let mut first_error_msg: Option<String> = None;
+
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
+            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            if sev == "error" {
+                has_error = true;
+                if first_error_msg.is_none() && !data.is_empty() {
+                    first_error_msg = Some(data.to_string());
+                }
+            }
+            if (data.contains("depends on axioms:") || data.contains("does not depend on any axioms"))
+                && let Err(e) = lean_repl::verify_allowed_axioms(data)
+            {
+                illegal_axiom = Some(e.to_string());
+            }
+        }
+    }
+
+    if out.status.success() && !has_error && illegal_axiom.is_none() {
+        Ok(Ok(candidate_src))
+    } else {
+        let diag = illegal_axiom
+            .or(first_error_msg)
+            .or_else(|| stdout.lines().find(|l| !l.trim().is_empty()).map(str::to_string))
+            .unwrap_or_else(|| "kernel rejected".to_string());
+        Ok(Err(diag))
+    }
+}
+
+type BatchedVerifyResult = (
+    Option<(String, Vec<String>)>,
+    String,
+    Vec<(Vec<String>, String)>,
+);
+
+fn verify_candidates_batched(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    full_name: &str,
+    candidates: &[Vec<String>],
+    lake_root: Option<&std::path::Path>,
+) -> Result<BatchedVerifyResult, ProverError> {
+    let mut last_diag = String::from("model produced no valid kernel-verified tactic");
+    let mut unsolved_diags: Vec<(Vec<String>, String)> = Vec::new();
+    if candidates.is_empty() {
+        return Ok((None, last_diag, unsolved_diags));
+    }
+
+    // Extract the theorem's declaration header up to `:= by` so we can clone it as `private theorem __probe_i`.
+    let needle = format!("theorem {}", thm.name);
+    let Some(thm_pos) = src.find(&needle) else {
+        for script in candidates {
+            match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
+                Ok(cand_src) => return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags)),
+                Err(d) => {
+                    if d.contains("unsolved goals") {
+                        unsolved_diags.push((script.clone(), d.clone()));
+                    }
+                    last_diag = d;
+                }
+            }
+        }
+        return Ok((None, last_diag, unsolved_diags));
+    };
+
+    let prefix = &src[..thm_pos];
+    let rest = &src[thm_pos..];
+    let Some(by_rel) = rest.find(":= by") else {
+        return Ok((None, last_diag, unsolved_diags));
+    };
+    let after_name = &rest[needle.len()..by_rel];
+
+    const BATCH_SIZE: usize = 8;
+    for chunk in candidates.chunks(BATCH_SIZE) {
+        let mut batch_src = String::from(prefix);
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
+        let mut cur_line = batch_src.lines().count() + if batch_src.ends_with('\n') || batch_src.is_empty() { 1 } else { 2 };
+        if !batch_src.ends_with('\n') && !batch_src.is_empty() {
+            batch_src.push('\n');
+        }
+
+        for (i, script) in chunk.iter().enumerate() {
+            let start_line = cur_line;
+            let body = script
+                .iter()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let decl = format!("private theorem __probe_{i}{after_name}:= by\n{body}\n");
+            cur_line += decl.lines().count();
+            ranges.push((start_line, cur_line.saturating_sub(1)));
+            batch_src.push_str(&decl);
+        }
+
+        let tmp_file = std::env::temp_dir().join(format!("lean_prove_batch_{}.lean", thm.name));
+        std::fs::write(&tmp_file, &batch_src)
+            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+        let out = run_lean_json(&tmp_file, lake_root)?;
+        let _ = std::fs::remove_file(&tmp_file);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut cand_errors: Vec<Option<String>> = vec![None; chunk.len()];
+        let mut has_unmapped_error = false;
+
+        for line in stdout.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
+                if sev != "error" {
+                    continue;
+                }
+                let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                let err_line = v
+                    .get("pos")
+                    .and_then(|p| p.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| l as usize);
+                if let Some(el) = err_line
+                    && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
+                {
+                    if cand_errors[idx].is_none() {
+                        cand_errors[idx] = Some(data);
+                    }
+                } else {
+                    has_unmapped_error = true;
+                    last_diag = data;
+                }
+            }
+        }
+
+        if !has_unmapped_error {
+            for (i, err) in cand_errors.iter().enumerate() {
+                if err.is_none() {
+                    let script = &chunk[i];
+                    match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
+                        Ok(cand_src) => {
+                            return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags));
+                        }
+                        Err(d) => {
+                            last_diag = d;
+                        }
+                    }
+                } else if let Some(d) = err {
+                    if d.contains("unsolved goals") {
+                        unsolved_diags.push((chunk[i].clone(), d.clone()));
+                    }
+                    last_diag = d.clone();
+                }
+            }
+        } else {
+            // Fallback to individual verification if a global parse/import error occurred
+            for script in chunk {
+                match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
+                    Ok(cand_src) => {
+                        return Ok((Some((cand_src, script.clone())), String::new(), unsolved_diags));
+                    }
+                    Err(d) => {
+                        if d.contains("unsolved goals") {
+                            unsolved_diags.push((script.clone(), d.clone()));
+                        }
+                        last_diag = d;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((None, last_diag, unsolved_diags))
+}
+
+fn parse_unsolved_goal_from_diag(diag: &str) -> Option<(Vec<String>, String)> {
+    let mut hyps = Vec::new();
+    let mut target: Option<String> = None;
+    for line in diag.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix('⊢') {
+            target = Some(rest.trim().to_string());
+            break;
+        }
+        if trimmed.contains(" : ") && !trimmed.starts_with("unsolved") && !trimmed.starts_with("case ") {
+            hyps.push(trimmed.to_string());
+        }
+    }
+    target.map(|t| (hyps, t))
+}
+
 fn synthesize_from_model_and_vdb(
     thm: &DiscoveredTheorem,
     head_symbol: &str,
     pred: &lean_sys1_ort::Sys1Prediction,
     vdb_hits: &[lean_vdb::VdbSearchHit],
     top_lemmas: &[String],
+    max_branches: usize,
 ) -> Vec<Vec<String>> {
     let mut scripts: Vec<Vec<String>> = Vec::new();
 
@@ -1139,7 +1409,7 @@ fn synthesize_from_model_and_vdb(
         .map(|(v, _)| v.as_str())
         .collect();
 
-    for lemma in vdb_lemma_names.iter().take(6) {
+    for lemma in vdb_lemma_names.iter().take(max_branches.clamp(1, 16)) {
         if !var_args.is_empty() {
             scripts.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
         }
@@ -1204,7 +1474,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 "lean-prover ",
                 env!("CARGO_PKG_VERSION"),
                 "\n\nUsage:\n",
-                "  lean-prover prove <PATH> [--write]   Discover sorry theorems, prove, and kernel-verify\n",
+                "  lean-prover prove <PATH> [--write] [--gate-threshold <VAL>] [--max-branches <N>]\n",
                 "  lean-prover check <PATH>             List remaining sorry theorems in a file or workspace\n",
                 "  lean-prover init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
                 "  lean-prover doctor                   Verify Lean 4, Lake, and artifact readiness\n",
@@ -1274,8 +1544,43 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             if !target_path.exists() {
                 return Ok((2, format!("error: path '{target}' does not exist")));
             }
-            let write_in_place = args.iter().any(|a| a == "--write");
-            let summary = prove_lean_path(target_path, write_in_place)?;
+            let mut options = ProveOptions::default();
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--write" => options.write_in_place = true,
+                    "--gate-threshold" => {
+                        let Some(raw) = args.get(i + 1) else {
+                            return Ok((2, "error: --gate-threshold requires a value".to_string()));
+                        };
+                        let Ok(val) = raw.parse::<f32>() else {
+                            return Ok((2, format!("error: invalid --gate-threshold '{raw}'")));
+                        };
+                        let normalized = if val > 1.0 { val / 100.0 } else { val };
+                        if !(0.0..=1.0).contains(&normalized) {
+                            return Ok((
+                                2,
+                                format!("error: --gate-threshold '{raw}' must be in 0..1 or 0..100"),
+                            ));
+                        }
+                        options.gate_threshold = normalized;
+                        i += 1;
+                    }
+                    "--max-branches" => {
+                        let Some(raw) = args.get(i + 1) else {
+                            return Ok((2, "error: --max-branches requires a value".to_string()));
+                        };
+                        let Ok(n) = raw.parse::<usize>() else {
+                            return Ok((2, format!("error: invalid --max-branches '{raw}'")));
+                        };
+                        options.max_branches = n.clamp(1, 16);
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let summary = prove_lean_path_with_options(target_path, &options)?;
             let code = if summary.failed == 0 { 0 } else { 1 };
             let failed_names: Vec<&str> = summary
                 .failed_theorems
@@ -1286,7 +1591,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 "discovered={} proved={} failed={} theorems={:?} failed_theorems={:?}",
                 summary.discovered, summary.proved, summary.failed, summary.proved_names, failed_names
             )];
-            if !write_in_place {
+            if !options.write_in_place {
                 for (name, script) in &summary.proved_scripts {
                     lines.push(format!("[PROVED] {name} := by\n  {}", script.join("\n  ")));
                 }
@@ -1294,7 +1599,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             for (name, diag) in &summary.failed_theorems {
                 lines.push(format!("[FAILED] {name}: {diag}"));
             }
-            if !write_in_place && summary.proved > 0 {
+            if !options.write_in_place && summary.proved > 0 {
                 lines.push("Dry run complete. Re-run with --write to update files.".to_string());
             }
             Ok((code, lines.join("\n")))
@@ -1714,5 +2019,80 @@ mod tests {
             .unwrap();
         assert_eq!(len_script, "simp");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_gate_branch_flags_and_strict_axiom_allowlist() {
+        let dir = std::env::temp_dir().join("lean_prover_m11_flags_axioms");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("FlagsAxioms.lean");
+        std::fs::write(
+            &f,
+            "import Init\ntheorem simple_id (n : Nat) : n + 0 = n := by\n  sorry\n",
+        )
+        .unwrap();
+
+        let args = vec![
+            "lean-prover".to_string(),
+            "prove".to_string(),
+            f.to_string_lossy().to_string(),
+            "--gate-threshold".to_string(),
+            "75".to_string(),
+            "--max-branches".to_string(),
+            "2".to_string(),
+        ];
+        let (code, out) = run_cli_args(&args).unwrap();
+        assert_eq!(code, 0, "unexpected failure: {out}");
+        assert!(out.contains("proved=1"));
+
+        let bad_args = vec![
+            "lean-prover".to_string(),
+            "prove".to_string(),
+            f.to_string_lossy().to_string(),
+            "--gate-threshold".to_string(),
+            "150".to_string(),
+        ];
+        let (bad_code, _) = run_cli_args(&bad_args).unwrap();
+        assert_eq!(bad_code, 2);
+
+        // Strict 3-axiom allowlist rejects custom/unsafe axioms even without sorryAx
+        assert!(lean_repl::verify_allowed_axioms("'t' depends on axioms: [propext, Classical.choice]").is_ok());
+        assert!(lean_repl::verify_allowed_axioms("'t' depends on axioms: [Lean.ofReduceBool]").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batched_candidate_probing_reduces_kernel_invocations() {
+        let dir = std::env::temp_dir().join("lean_prover_m11_batched");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Batched.lean");
+        let src = "import Init\ntheorem add_comm_batched (a b : Nat) : a + b = b + a := by\n  sorry\n";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![
+            vec!["rfl".to_string()],
+            vec!["intro h".to_string()],
+            vec!["omega".to_string()],
+        ];
+        let (solved, _diag, _unsolved) =
+            verify_candidates_batched(src, &thms[0], "add_comm_batched", &cands, None).unwrap();
+        assert!(solved.is_some());
+        assert_eq!(solved.unwrap().1, vec!["omega".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_compositional_subgoal_recovery_with_episodic_cache() {
+        let diag = "unsolved goals\ncase h\na b : Nat\n⊢ a + b = b + a";
+        let parsed = parse_unsolved_goal_from_diag(diag).unwrap();
+        assert_eq!(parsed.0, vec!["a b : Nat".to_string()]);
+        assert_eq!(parsed.1, "a + b = b + a");
+
+        let mut cache = lean_vdb::EpisodicCache::default();
+        let emb = vec![1.0_f32, 0.0, 0.0];
+        assert_eq!(cache.check_or_insert(&emb), lean_vdb::EpisodicHit::Novel);
+        assert_eq!(cache.check_or_insert(&emb), lean_vdb::EpisodicHit::PruneLoop);
     }
 }
