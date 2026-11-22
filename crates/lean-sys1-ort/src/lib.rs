@@ -64,7 +64,97 @@ pub enum Sys1Error {
     InvalidDimensions,
 }
 
-/// Encode canonical text with `tokenizer.json` matching Python IDs identically.
+/// Pre-tokenize canonical Lean 4 text by splitting delimiters and dot projections while preserving
+/// pinned multi-character tokens (`[_]`, `::`, `++`, `->`, `=>`, `<=`, `>=`, `!=`, `:=`).
+#[must_use]
+pub fn pre_tokenize_lean_canonical(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for word in text.split_whitespace() {
+        let chars: Vec<char> = word.chars().collect();
+        let mut i = 0usize;
+        let mut cur = String::new();
+        while i < chars.len() {
+            if i + 2 < chars.len() && chars[i] == '[' && chars[i + 1] == '_' && chars[i + 2] == ']' {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+                tokens.push("[_]".to_string());
+                i += 3;
+                continue;
+            }
+            if i + 1 < chars.len() {
+                let pair: String = [chars[i], chars[i + 1]].iter().collect();
+                if matches!(
+                    pair.as_str(),
+                    "::" | "++" | "->" | "=>" | "<=" | ">=" | "!=" | ":="
+                ) {
+                    if !cur.is_empty() {
+                        tokens.push(std::mem::take(&mut cur));
+                    }
+                    tokens.push(pair);
+                    i += 2;
+                    continue;
+                }
+            }
+            let ch = chars[i];
+            if matches!(
+                ch,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | ':'
+            ) {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+                tokens.push(ch.to_string());
+                i += 1;
+                continue;
+            }
+            cur.push(ch);
+            i += 1;
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+    }
+    tokens
+}
+
+fn encode_token_with_subword_fallback(
+    vocab: Option<&serde_json::Map<String, serde_json::Value>>,
+    tok: &str,
+    unk_id: i64,
+    out: &mut Vec<i64>,
+) {
+    let Some(v) = vocab else {
+        out.push(unk_id);
+        return;
+    };
+    if let Some(id) = v.get(tok).and_then(|x| x.as_i64()) {
+        out.push(id);
+        return;
+    }
+    let chars: Vec<char> = tok.chars().collect();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let mut matched: Option<(usize, i64)> = None;
+        for end in (start + 1..=chars.len()).rev() {
+            let sub: String = chars[start..end].iter().collect();
+            if let Some(id) = v.get(&sub).and_then(|x| x.as_i64()) {
+                matched = Some((end, id));
+                break;
+            }
+        }
+        if let Some((end, id)) = matched {
+            out.push(id);
+            start = end;
+        } else {
+            out.push(unk_id);
+            start += 1;
+        }
+    }
+}
+
+/// Encode canonical text with `tokenizer.json` using delimiter pre-splitting, `<s>`/`</s>` framing,
+/// and greedy longest-prefix subword fallback.
 pub fn encode_canonical_text(
     tokenizer_json: &str,
     text: &str,
@@ -85,17 +175,34 @@ pub fn encode_canonical_text(
         .and_then(|v| v.get("<pad>"))
         .and_then(|id| id.as_i64())
         .unwrap_or(0);
+    let bos_id = vocab
+        .and_then(|v| v.get("<s>"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(2);
+    let eos_id = vocab
+        .and_then(|v| v.get("</s>"))
+        .and_then(|id| id.as_i64())
+        .unwrap_or(3);
+
+    let mut content_ids = Vec::new();
+    for tok in pre_tokenize_lean_canonical(text) {
+        encode_token_with_subword_fallback(vocab, &tok, unk_id, &mut content_ids);
+    }
 
     let mut ids = Vec::with_capacity(max_len);
     let mut mask = Vec::with_capacity(max_len);
-
-    for tok in text.split_whitespace().take(max_len) {
-        let id = vocab
-            .and_then(|v| v.get(tok))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(unk_id);
-        ids.push(id);
+    if max_len > 0 {
+        ids.push(bos_id);
         mask.push(1);
+        let body_cap = max_len.saturating_sub(2);
+        for id in content_ids.into_iter().take(body_cap) {
+            ids.push(id);
+            mask.push(1);
+        }
+        if ids.len() < max_len {
+            ids.push(eos_id);
+            mask.push(1);
+        }
     }
 
     while ids.len() < max_len {
@@ -270,6 +377,7 @@ pub struct LeanSys1OnnxSession {
     pub fit_w1: Vec<f32>,
     pub fit_b1: Vec<f32>,
     pub fit_w2: Vec<f32>,
+    pub fit_b2: f32,
 }
 
 impl LeanSys1OnnxSession {
@@ -399,10 +507,31 @@ impl LeanSys1OnnxSession {
         let mut score_bias = [0.0_f32; 3];
         score_bias.copy_from_slice(score_bias_vec);
 
-        // Derive PremiseFit 4d MLP weights from norm_weight & tok_emb statistics
-        let fit_w1 = vec![0.02_f32; d_model * 4 * d_model];
-        let fit_b1 = vec![0.0_f32; d_model];
-        let fit_w2 = vec![0.05_f32; d_model];
+        let fit_w1 = get_tensor_with_aliases(
+            &tensors,
+            &["heads.premise_fit.0.weight", "premise_fit.w1"],
+            "fit_w1",
+        )
+        .unwrap_or_else(|_| vec![0.02_f32; d_model * 4 * d_model]);
+        let fit_b1 = get_tensor_with_aliases(
+            &tensors,
+            &["heads.premise_fit.0.bias", "premise_fit.b1"],
+            "fit_b1",
+        )
+        .unwrap_or_else(|_| vec![0.0_f32; d_model]);
+        let fit_w2 = get_tensor_with_aliases(
+            &tensors,
+            &["heads.premise_fit.2.weight", "premise_fit.w2"],
+            "fit_w2",
+        )
+        .unwrap_or_else(|_| vec![0.05_f32; d_model]);
+        let fit_b2 = get_tensor_with_aliases(
+            &tensors,
+            &["heads.premise_fit.2.bias", "premise_fit.b2"],
+            "fit_b2",
+        )
+        .map(|v| v.first().copied().unwrap_or(0.0))
+        .unwrap_or(0.0);
 
         Ok(Self {
             d_model,
@@ -432,6 +561,7 @@ impl LeanSys1OnnxSession {
             fit_w1,
             fit_b1,
             fit_w2,
+            fit_b2,
         })
     }
 
@@ -442,7 +572,7 @@ impl LeanSys1OnnxSession {
             w1: &self.fit_w1,
             b1: &self.fit_b1,
             w2: &self.fit_w2,
-            b2: 0.0,
+            b2: self.fit_b2,
         }
     }
 
@@ -1084,5 +1214,23 @@ mod tests {
             vec![3.0, 4.0]
         );
         assert!(get_tensor_with_aliases(&map, &["missing.a", "missing.b"], "missing").is_err());
+    }
+
+    #[test]
+    fn test_canonical_pre_splitting_bos_eos_and_low_unk_rate() {
+        let tok_json = include_str!("../../lean-prover/assets/tokenizer.json");
+        let goal = "_v0 : List Nat, _v1 : List Nat ⊢ (_v0 ++ _v1).length = _v0.length + _v1.length";
+        let (ids, mask) = encode_canonical_text(tok_json, goal, 512).unwrap();
+        let non_pad = mask.iter().filter(|&&m| m == 1).count();
+        assert_eq!(ids[0], 2);
+        assert_eq!(ids[non_pad - 1], 3);
+        // _v0 (11) and _v1 (12) must not collapse to <unk> even when attached to '(' or '.'
+        assert!(ids[..non_pad].contains(&11));
+        assert!(ids[..non_pad].contains(&12));
+        let unk_count = ids[..non_pad].iter().filter(|&&id| id == 1).count();
+        assert!(
+            (unk_count as f32) / (non_pad as f32) < 0.10,
+            "unk rate too high: {unk_count}/{non_pad}"
+        );
     }
 }

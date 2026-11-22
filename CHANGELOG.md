@@ -2,6 +2,14 @@
 
 All notable changes to `sheaf` (formerly `lean-prover`) are documented in this file.
 
+## `[1.4.0]` - 2026-11-22 (tag `v1.4.0`)
+
+### Added
+- Delimiter pre-splitting (`pre_tokenize_lean_canonical`), `<s>`/`</s>` framing, greedy subword fallback, and expanded 277-token `tokenizer.json` achieving `< 10%` `<unk>` rate (`crates/lean-sys1-ort`).
+- Real `PremiseFit` 4d MLP weight loading (`heads.premise_fit.*`, `fit_b2`) in `LeanSys1OnnxSession::from_onnx_bytes`.
+- `pred.strategy`-ordered tactic synthesis buckets and incremental `repeat (first | rfl | omega | (split <;> try dsimp only))` pruning for 2/3-record nested `if-then-else` (`crates/lean-prover`).
+- Hardened Colab L4 scripts (`scripts/colab_stage1_train.py`, `scripts/colab_stage3_4_tune_and_promote.py`) with exact Python tokenizer parity, full `LeanSys1OnnxModule`, class-balanced CE, `lambda_sigreg <= 0.05`, and L-BFGS calibration clamped to `[0.5, 2.5]`.
+
 ## `[1.3.0]` - 2026-11-22 (tag `v1.3.0`)
 
 ### Added
