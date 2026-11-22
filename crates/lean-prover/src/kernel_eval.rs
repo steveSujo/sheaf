@@ -101,6 +101,33 @@ pub fn audit_single_candidate(
     }
 }
 
+fn strip_trailing_docstrings_and_attrs(prefix: &str) -> &str {
+    let mut s = prefix.trim_end();
+    loop {
+        if s.ends_with("-/")
+            && let Some(start) = s.rfind("/--")
+        {
+            s = s[..start].trim_end();
+            continue;
+        }
+        if let Some(last_nl) = s.rfind('\n') {
+            let last_line = s[last_nl + 1..].trim();
+            if last_line.starts_with("@[") && last_line.ends_with(']') {
+                s = s[..last_nl].trim_end();
+                continue;
+            }
+        } else {
+            let trimmed = s.trim();
+            if trimmed.starts_with("@[") && trimmed.ends_with(']') {
+                s = "";
+                continue;
+            }
+        }
+        break;
+    }
+    s
+}
+
 /// Evaluate candidate scripts in batches of 8 with per-probe `set_option maxHeartbeats <N> in` isolation.
 pub fn verify_candidates_batched_with_heartbeats(
     src: &str,
@@ -138,7 +165,7 @@ pub fn verify_candidates_batched_with_heartbeats(
         return Ok((None, last_diag, unsolved_diags));
     };
 
-    let prefix = &src[..thm_pos];
+    let prefix = strip_trailing_docstrings_and_attrs(&src[..thm_pos]);
     let rest = &src[thm_pos..];
     let Some(by_rel) = rest.find(":= by") else {
         return Ok((None, last_diag, unsolved_diags));
@@ -245,11 +272,8 @@ pub fn verify_candidates_batched_with_heartbeats(
                 }
             }
         } else {
-            // Parse-error fallback: re-run non-failing candidates individually
-            for (i, script) in chunk.iter().enumerate() {
-                if cand_errors[i].is_some() {
-                    continue;
-                }
+            // Parse-error fallback: re-run candidates individually and collect unsolved goals
+            for script in chunk {
                 match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
                     Ok(cand_src) => {
                         return Ok((
