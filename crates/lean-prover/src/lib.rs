@@ -1918,7 +1918,7 @@ fn synthesize_from_model_and_vdb(
         if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∃')) {
             bucket_have.push(vec![
                 format!("rcases {hyp_name} with ⟨k, hk⟩"),
-                format!("exact ⟨2 * k * k, by simp [hk, Nat.mul_assoc{simp_extra}]⟩"),
+                format!("exact ⟨2 * k * k, by simp [hk, Nat.mul_assoc, Nat.mul_left_comm{simp_extra}]⟩"),
             ]);
         }
     }
@@ -2016,12 +2016,17 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 _ => "lean: NOT FOUND".to_string(),
             };
             let emb = embedded_artifacts();
-            let artifacts_ok = std::path::Path::new("artifacts/tokenizer.json").exists()
-                && std::path::Path::new("artifacts/lean_sys1.onnx").exists();
+            let override_status = if std::path::Path::new("artifacts/tokenizer.json").exists()
+                && std::path::Path::new("artifacts/lean_sys1.onnx").exists()
+            {
+                "artifacts/ (disk override)"
+            } else {
+                "none (using embedded assets)"
+            };
             Ok((
                 0,
                 format!(
-                    "lean: {lean_ver}\nembedded_model: true (lean_sys1.onnx={} bytes)\nartifacts_bootstrapped: {artifacts_ok}",
+                    "lean: {lean_ver}\nembedded_model: true (lean_sys1.onnx={} bytes)\nartifacts_override: {override_status}",
                     emb.lean_sys1_onnx.len()
                 ),
             ))
