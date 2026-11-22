@@ -354,7 +354,7 @@ impl StaticVdbIndex {
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let dim = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        if version != 1 || dim == 0 {
+        if (version != 1 && version != 2) || dim == 0 {
             return Err(VdbError::InvalidHeader);
         }
         let mut pos = 16usize;
@@ -388,6 +388,7 @@ impl StaticVdbIndex {
 
         let mut metadata = Vec::new();
         let mut resolver = ImportResolver::default();
+        let mut persisted_neighbors: Option<Vec<Vec<u32>>> = None;
         if pos + 4 <= bytes.len() {
             let meta_len =
                 u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
@@ -408,10 +409,17 @@ impl StaticVdbIndex {
                     resolver.import_dag = serde_json::from_value(dag.clone())
                         .map_err(|_| VdbError::InvalidHeader)?;
                 }
+                if let Some(nb) = meta_val.get("neighbors") {
+                    persisted_neighbors = serde_json::from_value(nb.clone())
+                        .map_err(|_| VdbError::InvalidHeader)?;
+                }
             }
         }
 
-        let neighbors = build_sq8_neighbors(&codes, 8);
+        let neighbors = match persisted_neighbors {
+            Some(nb) if nb.len() == codes.len() => nb,
+            _ => build_sq8_neighbors(&codes, 8),
+        };
         Ok((
             Self {
                 dim,
@@ -422,6 +430,40 @@ impl StaticVdbIndex {
             },
             resolver,
         ))
+    }
+
+    /// Serialize this `StaticVdbIndex` as `LVDB` `version = 2` with pre-built HNSW `neighbors`
+    /// so startup loads the adjacency graph with zero construction compute.
+    #[must_use]
+    pub fn to_lvdb_bytes(&self, resolver: &ImportResolver) -> Vec<u8> {
+        let count = self.codes.len() as u32;
+        let dim = self.dim as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"LVDB");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&dim.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        if count > 0 {
+            for &m in &self.quantizer.mins {
+                out.extend_from_slice(&m.to_le_bytes());
+            }
+            for &m in &self.quantizer.maxs {
+                out.extend_from_slice(&m.to_le_bytes());
+            }
+            for code in &self.codes {
+                out.extend_from_slice(code);
+            }
+        }
+        let meta_json = serde_json::json!({
+            "entries": self.metadata,
+            "symbol_to_module": resolver.symbol_to_module,
+            "import_dag": resolver.import_dag,
+            "neighbors": self.neighbors,
+        });
+        let meta_bytes = serde_json::to_vec(&meta_json).unwrap_or_default();
+        out.extend_from_slice(&(meta_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&meta_bytes);
+        out
     }
 
     /// Build an `orion::database::VectorDatabase` populated with all dequantized vectors in this index.
@@ -661,5 +703,39 @@ mod tests {
         assert_eq!(cache.check_or_insert(&s1), EpisodicHit::Novel);
         assert_eq!(cache.check_or_insert(&s2), EpisodicHit::PruneLoop);
         assert_eq!(cache.check_or_insert(&s3), EpisodicHit::Novel);
+    }
+
+    #[test]
+    fn test_lvdb_v2_persisted_neighbors_zero_compute_load() {
+        let idx = StaticVdbIndex {
+            dim: 4,
+            quantizer: Sq8Quantizer {
+                mins: vec![-1.0; 4],
+                maxs: vec![1.0; 4],
+            },
+            metadata: vec![
+                LemmaMetadata {
+                    name: "Nat.add_comm".into(),
+                    head_symbol: "Eq".into(),
+                    module: "Init".into(),
+                    arity: 2,
+                    signature: "a + b = b + a".into(),
+                },
+                LemmaMetadata {
+                    name: "Poly.refl".into(),
+                    head_symbol: "POLYMORPHIC".into(),
+                    module: "Init".into(),
+                    arity: 1,
+                    signature: "x = x".into(),
+                },
+            ],
+            codes: vec![vec![180, 180, 180, 180], vec![10, 10, 10, 10]],
+            neighbors: vec![vec![1], vec![0]],
+        };
+        let bytes = idx.to_lvdb_bytes(&ImportResolver::default());
+        let (loaded, _) = StaticVdbIndex::from_lvdb_bytes(&bytes).unwrap();
+        assert_eq!(loaded.neighbors, vec![vec![1], vec![0]]);
+        let hits = loaded.search_sq8_hnsw(&[0.45, 0.45, 0.45, 0.45], "Eq", 2).unwrap();
+        assert_eq!(hits[0].metadata.name, "Nat.add_comm");
     }
 }

@@ -2,6 +2,14 @@
 
 All notable changes to `sheaf` (formerly `lean-prover`) are documented in this file.
 
+## `[1.3.0]` - 2026-11-22 (tag `v1.3.0`)
+
+### Added
+- Semantic PyTorch/ONNX initializer name resolution (`get_tensor_with_aliases`) with legacy `onnx::MatMul_*` / `onnx::Slice_*` fallback in `crates/lean-sys1-ort/src/lib.rs`.
+- `LVDB` `version = 2` support and `StaticVdbIndex::to_lvdb_bytes` in `crates/lean-vdb/src/lib.rs` to persist pre-built HNSW `neighbors` for zero-compute startup.
+- `KernelBackend` trait and `BatchLeanCliBackend` in `crates/lean-prover/src/kernel_eval.rs`.
+- Upstream `section __sheaf_dep_<i>` isolation and `private` declaration mangling in `compose_live_eval_source` (`crates/lean-prover/src/lib.rs`), plus `private` filtering in `ModuleExports`.
+
 ## `[1.2.1]` - 2026-11-22 (`66b2487`, tag `v1.2.1`)
 
 ### Changed

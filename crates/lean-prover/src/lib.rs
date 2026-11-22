@@ -726,13 +726,15 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
         let mut idx = 0usize;
         while idx < lines.len() {
             let trimmed = lines[idx].trim();
-            if let Some(ns) = trimmed.strip_prefix("namespace ") {
+            let is_private = trimmed.starts_with("private ");
+            let decl_trimmed = trimmed.strip_prefix("private ").map(str::trim).unwrap_or(trimmed);
+            if let Some(ns) = decl_trimmed.strip_prefix("namespace ") {
                 current_ns = Some(ns.trim().to_string());
-            } else if trimmed.starts_with("end ") {
+            } else if decl_trimmed.starts_with("end ") {
                 current_ns = None;
-            } else if let Some(after_def) = trimmed
+            } else if let Some(after_def) = decl_trimmed
                 .strip_prefix("def ")
-                .or_else(|| trimmed.strip_prefix("abbrev "))
+                .or_else(|| decl_trimmed.strip_prefix("abbrev "))
             {
                 if let Some(dname) = after_def
                     .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
@@ -740,33 +742,39 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     .filter(|s| !s.is_empty())
                 {
                     local_defs.push(dname.to_string());
-                    file_exports.defs.push((current_ns.clone(), dname.to_string()));
+                    if !is_private {
+                        file_exports.defs.push((current_ns.clone(), dname.to_string()));
+                    }
                 }
-            } else if let Some(after_struct) = trimmed.strip_prefix("structure ") {
+            } else if let Some(after_struct) = decl_trimmed.strip_prefix("structure ") {
                 if let Some(sname) = after_struct
                     .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
                     .next()
                     .filter(|s| !s.is_empty())
                 {
                     local_structures.push(sname.to_string());
-                    file_exports
-                        .structures
-                        .push((current_ns.clone(), sname.to_string()));
+                    if !is_private {
+                        file_exports
+                            .structures
+                            .push((current_ns.clone(), sname.to_string()));
+                    }
                 }
-            } else if let Some(after_ind) = trimmed.strip_prefix("inductive ") {
+            } else if let Some(after_ind) = decl_trimmed.strip_prefix("inductive ") {
                 if let Some(iname) = after_ind
                     .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
                     .next()
                     .filter(|s| !s.is_empty())
                 {
                     local_inductives.push(iname.to_string());
-                    file_exports
-                        .inductives
-                        .push((current_ns.clone(), iname.to_string()));
+                    if !is_private {
+                        file_exports
+                            .inductives
+                            .push((current_ns.clone(), iname.to_string()));
+                    }
                 }
-            } else if let Some(after_thm) = trimmed
+            } else if let Some(after_thm) = decl_trimmed
                 .strip_prefix("theorem ")
-                .or_else(|| trimmed.strip_prefix("lemma "))
+                .or_else(|| decl_trimmed.strip_prefix("lemma "))
             {
                 let start_line = idx + 1;
                 let name = after_thm
@@ -819,7 +827,9 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                 }
                 if !name.is_empty() {
                     local_theorems.push(name.clone());
-                    file_exports.theorems.push((current_ns.clone(), name));
+                    if !is_private {
+                        file_exports.theorems.push((current_ns.clone(), name));
+                    }
                 }
             }
             idx += 1;
@@ -1565,11 +1575,13 @@ fn compose_live_eval_source(
     let mut ext_imports: Vec<String> = Vec::new();
     let mut body = String::new();
 
-    for dep in workspace_deps {
+    for (dep_idx, dep) in workspace_deps.iter().enumerate() {
         let Some(dep_src) = root_tree.read_file(store, dep) else {
             continue;
         };
         let mut ns_stack: Vec<String> = Vec::new();
+        let mut dep_body = String::new();
+        let mut priv_names: Vec<String> = Vec::new();
         for line in dep_src.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("import ") {
@@ -1583,6 +1595,21 @@ fn compose_live_eval_source(
                 }
                 continue;
             }
+            if let Some(after_priv) = trimmed.strip_prefix("private ") {
+                let rest = after_priv.trim();
+                for kw in ["def ", "abbrev ", "theorem ", "lemma ", "structure ", "inductive "] {
+                    if let Some(after_kw) = rest.strip_prefix(kw) {
+                        if let Some(pname) = after_kw
+                            .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                        {
+                            priv_names.push(pname.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
             if let Some(ns) = trimmed.strip_prefix("namespace ") {
                 ns_stack.push(ns.trim().to_string());
             } else if let Some(end_ns) = trimmed.strip_prefix("end ") {
@@ -1591,13 +1618,22 @@ fn compose_live_eval_source(
                     ns_stack.pop();
                 }
             }
-            body.push_str(line);
-            body.push('\n');
+            dep_body.push_str(line);
+            dep_body.push('\n');
         }
+        // Scope-isolate each upstream module inside `section __sheaf_dep_<i>` and mangle upstream `private` names
+        for pname in priv_names {
+            let scoped = format!("__priv_dep_{dep_idx}_{pname}");
+            dep_body = dep_body.replace(&format!("private def {pname}"), &format!("private def {scoped}"));
+            dep_body = dep_body.replace(&format!("private theorem {pname}"), &format!("private theorem {scoped}"));
+            dep_body = dep_body.replace(&format!("private lemma {pname}"), &format!("private lemma {scoped}"));
+        }
+        body.push_str(&format!("section __sheaf_dep_{dep_idx}\n"));
+        body.push_str(&dep_body);
         while let Some(open_ns) = ns_stack.pop() {
             body.push_str(&format!("end {open_ns}\n"));
         }
-        body.push('\n');
+        body.push_str(&format!("end __sheaf_dep_{dep_idx}\n\n"));
     }
 
     for line in target_src.lines() {
@@ -2942,6 +2978,34 @@ mod tests {
         assert_eq!(summary.discovered, 2);
         assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
         assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_upstream_private_and_section_scope_isolation() {
+        let dir = std::env::temp_dir().join("sheaf_m15_scope_iso");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("Up.lean"),
+            "import Init\nnamespace Up\nprivate def secretHelper (n : Nat) : Nat := n + 1\ndef pubHelper (n : Nat) : Nat := n + 1\nend Up\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Down.lean"),
+            "import Init\nimport Up\nopen Up\ntheorem down_pub (n : Nat) : pubHelper n = n + 1 := by\n  sorry\n",
+        )
+        .unwrap();
+
+        let thms = discover_sorry_theorems(&dir).unwrap();
+        assert_eq!(thms.len(), 1);
+        assert!(!thms[0].local_defs.contains(&"secretHelper".to_string()));
+        assert!(!thms[0].local_defs.contains(&"Up.secretHelper".to_string()));
+        assert!(thms[0].local_defs.contains(&"pubHelper".to_string()));
+
+        let summary = prove_lean_path(&dir, false).unwrap();
+        assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
