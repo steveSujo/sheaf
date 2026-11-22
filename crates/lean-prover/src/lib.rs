@@ -1358,28 +1358,46 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         if !dedup.record_sys1_and_check_tier2(&sub_pred.state_emb) {
                             return Ok(search::StepOutcome::Pruned("semantic loop pruned".into()));
                         }
-                        let sub_closers = match sub_pred.strategy {
-                            lean_sys1_ort::StrategyChoice::AtomicClose => vec![
-                                "all_goals (first | rfl | simp | omega)",
-                                "all_goals (try simp_all; try omega)",
-                            ],
-                            lean_sys1_ort::StrategyChoice::Rewrite => vec![
-                                "all_goals (first | simp_all | omega)",
-                                "all_goals (try simp; try omega)",
-                            ],
-                            _ => vec![
-                                "all_goals (try simp_all; try omega)",
-                                "all_goals omega",
-                            ],
-                        };
+                        let mut search_ctx: Vec<String> = thm.local_defs.clone();
+                        for lt in &thm.local_theorems {
+                            if !search_ctx.contains(lt) {
+                                search_ctx.push(lt.clone());
+                            }
+                        }
+                        let search_ctx_list = search_ctx.join(", ");
+                        let search_thms_list = thm.local_theorems.join(", ");
+                        let mut sub_closers: Vec<String> = Vec::new();
+                        if !search_thms_list.is_empty() {
+                            sub_closers.push(format!("all_goals (first | rfl | simp [{search_thms_list}] | omega)"));
+                        }
+                        if !search_ctx_list.is_empty() {
+                            sub_closers.push(format!(
+                                "all_goals (repeat (first | rfl | simp_all [{search_ctx_list}] | (split <;> try simp_all [{search_ctx_list}]) | omega))"
+                            ));
+                        }
+                        match sub_pred.strategy {
+                            lean_sys1_ort::StrategyChoice::AtomicClose => {
+                                sub_closers.push("all_goals (first | rfl | simp | omega)".to_string());
+                                sub_closers.push("all_goals (try simp_all; try omega)".to_string());
+                            }
+                            lean_sys1_ort::StrategyChoice::Rewrite => {
+                                sub_closers.push("all_goals (first | simp_all | omega)".to_string());
+                                sub_closers.push("all_goals (try simp; try omega)".to_string());
+                            }
+                            _ => {
+                                sub_closers.push("all_goals (try simp_all; try omega)".to_string());
+                                sub_closers.push("all_goals omega".to_string());
+                            }
+                        }
                         sub_closers
                             .into_iter()
+                            .take(4)
                             .map(|c| {
                                 let mut s = node.partial_script.clone();
                                 if let Some(last) = s.last_mut() {
                                     *last = format!("{last}; {c}");
                                 } else {
-                                    s.push(c.to_string());
+                                    s.push(c);
                                 }
                                 s
                             })
@@ -1687,14 +1705,27 @@ fn synthesize_from_model_and_vdb(
                 .collect::<Vec<_>>()
                 .join("; ");
             scripts.push(vec![format!(
+                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))"
+            )]);
+            scripts.push(vec![format!(
                 "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))))"
             )]);
         } else {
             // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
             scripts.push(vec![format!("dsimp [{defs_list}] at *; omega")]);
             scripts.push(vec![format!("unfold {defs_list} at *; omega")]);
+            if !thm.local_theorems.is_empty() {
+                let thms_list = thm.local_theorems.join(", ");
+                scripts.push(vec![format!("simp [{thms_list}]")]);
+                if !context_list.is_empty() {
+                    scripts.push(vec![format!("simp [{thms_list}]; simp [{context_list}]")]);
+                }
+            }
             if !context_list.is_empty() {
                 scripts.push(vec![format!("simp [{context_list}]")]);
+                scripts.push(vec![format!(
+                    "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
+                )]);
             }
         }
     } else {
@@ -1702,8 +1733,15 @@ fn synthesize_from_model_and_vdb(
         // unrelated preceding local theorems do not trigger unused simp argument warnings.
         scripts.push(vec!["simp".to_string()]);
         scripts.push(vec!["omega".to_string()]);
+        if !thm.local_theorems.is_empty() {
+            let thms_list = thm.local_theorems.join(", ");
+            scripts.push(vec![format!("simp [{thms_list}]")]);
+        }
         if !context_list.is_empty() {
             scripts.push(vec![format!("simp [{context_list}]")]);
+            scripts.push(vec![format!(
+                "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
+            )]);
         }
     }
 
@@ -2874,6 +2912,35 @@ mod tests {
         let summary = prove_lean_path(&dir, false).unwrap();
         assert_eq!(summary.discovered, 3);
         assert_eq!(summary.proved, 3, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_diamond_compound_term_theorem_first_rewrite_and_split() {
+        let dir = std::env::temp_dir().join("sheaf_m14_compound_diamond");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Join")).unwrap();
+
+        std::fs::write(
+            dir.join("Base.lean"),
+            "import Init\nnamespace Base\ninductive Op where\n  | lit : Nat → Op\n  | add : Op → Op → Op\ndef evalOpt : Op → Option Nat\n  | .lit n => some n\n  | .add a b =>\n    match evalOpt a, evalOpt b with\n    | some x, some y => some (x + y)\n    | _, _ => none\ndef evalVal : Op → Nat\n  | .lit n => n\n  | .add a b => evalVal a + evalVal b\nend Base\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Mid.lean"),
+            "import Init\nimport Base\nopen Base\nnamespace Mid\ntheorem evalOpt_sound (e : Op) : evalOpt e = some (evalVal e) := by\n  sorry\nend Mid\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Join").join("Top.lean"),
+            "import Init\nimport Base\nimport Mid\nopen Base Mid\nnamespace Join\n/-- Compound specialized expression over imported match-based evaluator -/\ntheorem compound_spec (x : Nat) (e : Op) : evalOpt (.add (.lit x) e) = some (x + evalVal e) := by\n  sorry\nend Join\n",
+        )
+        .unwrap();
+
+        let summary = prove_lean_path(&dir, false).unwrap();
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
         assert_eq!(summary.failed, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
