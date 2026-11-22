@@ -2472,18 +2472,117 @@ fn synthesize_existential_candidates(thm: &DiscoveredTheorem) -> Vec<Vec<String>
 }
 
 pub(crate) fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> String {
-    let needle = format!("theorem {thm_name}");
-    if let Some(pos) = src.find(&needle) {
-        if let Some(sorry_rel) = src[pos..].find("  sorry") {
-            let start = pos + sorry_rel;
-            return format!("{}{replacement_body}{}", &src[..start], &src[start + 7..]);
+    let mut byte_offset = 0usize;
+    let mut in_target_decl = false;
+    let mut seen_assign = false;
+    let mut block_depth = 0usize;
+
+    for raw_line in src.split_inclusive('\n') {
+        let line_len = raw_line.len();
+        let line_no_nl = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line_no_nl.trim();
+        let decl_trimmed = trimmed
+            .strip_prefix("private ")
+            .or_else(|| trimmed.strip_prefix("protected "))
+            .unwrap_or(trimmed);
+
+        if !in_target_decl {
+            if let Some(after_kw) = decl_trimmed
+                .strip_prefix("theorem ")
+                .or_else(|| decl_trimmed.strip_prefix("lemma "))
+                && let Some(rest_after_name) = after_kw.strip_prefix(thm_name)
+                && rest_after_name
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_lean_ident_char(c))
+            {
+                in_target_decl = true;
+                block_depth = 0;
+                if let Some(assign_rel) = raw_line.find(":=") {
+                    seen_assign = true;
+                    let after_assign_offset = assign_rel + 2;
+                    let code_after =
+                        strip_lean_comments_line(&raw_line[after_assign_offset..], &mut block_depth);
+                    if let Some(sorry_rel) = find_standalone_sorry_pos(&code_after) {
+                        let abs_start = byte_offset + after_assign_offset + sorry_rel;
+                        let abs_end = abs_start + "sorry".len();
+                        return format!(
+                            "{}\n{replacement_body}{}",
+                            &src[..abs_start],
+                            &src[abs_end..]
+                        );
+                    }
+                }
+            }
+            byte_offset += line_len;
+            continue;
         }
-        if let Some(sorry_rel) = src[pos..].find("sorry") {
-            let start = pos + sorry_rel;
-            return format!("{}\n{replacement_body}{}", &src[..start], &src[start + 5..]);
+
+        if is_top_level_decl_boundary(trimmed) {
+            break;
+        }
+
+        let scan_start = if !seen_assign {
+            if let Some(assign_rel) = raw_line.find(":=") {
+                seen_assign = true;
+                assign_rel + 2
+            } else {
+                let _ = strip_lean_comments_line(raw_line, &mut block_depth);
+                byte_offset += line_len;
+                continue;
+            }
+        } else {
+            0
+        };
+
+        let code_slice = strip_lean_comments_line(&raw_line[scan_start..], &mut block_depth);
+        if let Some(sorry_rel) = find_standalone_sorry_pos(&code_slice) {
+            let abs_sorry = byte_offset + scan_start + sorry_rel;
+            let abs_end = abs_sorry + "sorry".len();
+            let line_prefix = &raw_line[..scan_start + sorry_rel];
+            if line_prefix.chars().all(|c| c == ' ' || c == '\t') {
+                return format!(
+                    "{}{replacement_body}{}",
+                    &src[..byte_offset],
+                    &src[abs_end..]
+                );
+            }
+            return format!(
+                "{}\n{replacement_body}{}",
+                &src[..abs_sorry],
+                &src[abs_end..]
+            );
+        }
+
+        byte_offset += line_len;
+    }
+
+    src.replacen("  sorry", replacement_body, 1)
+}
+
+fn find_standalone_sorry_pos(code: &str) -> Option<usize> {
+    let needle = "sorry";
+    let mut start = 0usize;
+    while let Some(pos) = code[start..].find(needle) {
+        let abs = start + pos;
+        let left_ok = code[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_lean_ident_char(c));
+        let right_idx = abs + needle.len();
+        let right_ok = code[right_idx..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_lean_ident_char(c));
+        if left_ok && right_ok {
+            return Some(abs);
+        }
+        start = right_idx;
+        if start >= code.len() {
+            break;
         }
     }
-    src.replacen("  sorry", replacement_body, 1)
+    None
 }
 
 fn cli_help_text() -> String {
@@ -3762,5 +3861,25 @@ theorem still_open (a b : Nat) : a + b = b + a := by
                 .any(|v| v.get("event").and_then(|e| e.as_str()) == Some("workspace_finished"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_replace_theorem_sorry_ignores_name_and_comments() {
+        let src = "\
+/-- Docstring mentioning sorry -/
+theorem verify_rejects_sorry (x : Nat) : x = x := by
+  -- sorry inside comment
+  sorry
+";
+        let updated = replace_theorem_sorry(src, "verify_rejects_sorry", "  rfl");
+        assert!(updated.contains("theorem verify_rejects_sorry"));
+        assert!(updated.contains("-- sorry inside comment"));
+        assert!(updated.contains(":= by\n  -- sorry inside comment\n  rfl\n"));
+        assert!(!updated.ends_with("sorry\n"));
+
+        let inline = "theorem inline_sorry (x : Nat) : x = x := by sorry\n";
+        let updated_inline = replace_theorem_sorry(inline, "inline_sorry", "  rfl");
+        assert!(updated_inline.contains(":= by \n  rfl\n"));
+        assert!(!updated_inline.contains("sorry\n"));
     }
 }

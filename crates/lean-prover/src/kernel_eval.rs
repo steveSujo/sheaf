@@ -125,6 +125,17 @@ pub fn audit_single_candidate(
     script: &[String],
     lake_root: Option<&Path>,
 ) -> Result<Result<String, String>, ProverError> {
+    let (res, _, _) = audit_single_candidate_raw(src, thm_name, full_name, script, lake_root)?;
+    Ok(res)
+}
+
+fn audit_single_candidate_raw(
+    src: &str,
+    thm_name: &str,
+    full_name: &str,
+    script: &[String],
+    lake_root: Option<&Path>,
+) -> Result<(Result<String, String>, String, String), ProverError> {
     let body = script
         .iter()
         .map(|l| format!("  {l}"))
@@ -144,7 +155,7 @@ pub fn audit_single_candidate(
     let out = run_lean_json(&tmp_file, lake_root)?;
     let _ = std::fs::remove_file(&tmp_file);
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut has_error = false;
     let mut illegal_axiom: Option<String> = None;
     let mut first_error_msg: Option<String> = None;
@@ -169,7 +180,7 @@ pub fn audit_single_candidate(
     }
 
     if out.status.success() && !has_error && illegal_axiom.is_none() {
-        Ok(Ok(candidate_src))
+        Ok((Ok(candidate_src), audit, stdout))
     } else {
         let diag = illegal_axiom
             .or(first_error_msg)
@@ -180,8 +191,134 @@ pub fn audit_single_candidate(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "kernel rejected".to_string());
-        Ok(Err(diag))
+        Ok((Err(diag), audit, stdout))
     }
+}
+
+fn extract_span_text(src: &str, pos_line: usize, pos_col: usize, end_line: usize, end_col: usize) -> Option<String> {
+    if pos_line == 0 || end_line < pos_line {
+        return None;
+    }
+    let lines: Vec<&str> = src.lines().collect();
+    if pos_line == end_line {
+        let line = lines.get(pos_line - 1)?;
+        let start = pos_col.min(line.len());
+        let end = end_col.min(line.len());
+        if start < end {
+            return Some(line[start..end].trim().to_string());
+        }
+    }
+    None
+}
+
+fn collect_unused_simp_args(audit_src: &str, stdout: &str) -> Vec<String> {
+    let mut unused = Vec::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("severity").and_then(|s| s.as_str()) != Some("warning") {
+            continue;
+        }
+        let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+        if !data.contains("This simp argument is unused") && !data.contains("unusedSimpArgs") {
+            continue;
+        }
+        let span_ident = v.get("pos").and_then(|p| {
+            let pl = p.get("line")?.as_u64()? as usize;
+            let pc = p.get("column")?.as_u64()? as usize;
+            let ep = v.get("endPos")?;
+            let el = ep.get("line")?.as_u64()? as usize;
+            let ec = ep.get("column")?.as_u64()? as usize;
+            extract_span_text(audit_src, pl, pc, el, ec)
+        });
+        let arg = span_ident.or_else(|| {
+            let start = data.find('`')? + 1;
+            let end = data[start..].find('`')?;
+            Some(data[start..start + end].trim().to_string())
+        });
+        if let Some(a) = arg
+            && !a.is_empty()
+            && !unused.contains(&a)
+        {
+            unused.push(a);
+        }
+    }
+    unused
+}
+
+fn strip_unused_args_from_simp_line(line: &str, unused: &[String]) -> String {
+    let mut out = line.to_string();
+    for kw in ["simp_all [", "simp ["] {
+        let mut search_from = 0usize;
+        while let Some(rel) = out[search_from..].find(kw) {
+            let kw_start = search_from + rel;
+            let bracket_open = kw_start + kw.len() - 1;
+            let Some(close_rel) = out[bracket_open + 1..].find(']') else {
+                break;
+            };
+            let bracket_close = bracket_open + 1 + close_rel;
+            let inner = &out[bracket_open + 1..bracket_close];
+            let kept: Vec<&str> = inner
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty() && !unused.iter().any(|u| u == item))
+                .collect();
+            let kw_name = kw.trim_end_matches(" [");
+            let replacement = if kept.is_empty() {
+                kw_name.to_string()
+            } else {
+                format!("{kw_name} [{}]", kept.join(", "))
+            };
+            out.replace_range(kw_start..=bracket_close, &replacement);
+            search_from = kw_start + replacement.len();
+        }
+    }
+    out
+}
+
+fn audit_and_prune_unused_simp_args(
+    src: &str,
+    thm_name: &str,
+    full_name: &str,
+    script: &[String],
+    lake_root: Option<&Path>,
+) -> Result<Result<(String, Vec<String>), String>, ProverError> {
+    let (res, audit_src, stdout) =
+        audit_single_candidate_raw(src, thm_name, full_name, script, lake_root)?;
+    let Ok(cand_src) = res else {
+        return Ok(Err(res.unwrap_err()));
+    };
+
+    let has_simp_list = script
+        .iter()
+        .any(|l| l.contains("simp [") || l.contains("simp_all ["));
+    if !has_simp_list {
+        return Ok(Ok((cand_src, script.to_vec())));
+    }
+
+    let unused = collect_unused_simp_args(&audit_src, &stdout);
+    if unused.is_empty() {
+        return Ok(Ok((cand_src, script.to_vec())));
+    }
+
+    let pruned_script: Vec<String> = script
+        .iter()
+        .map(|l| strip_unused_args_from_simp_line(l, &unused))
+        .collect();
+    if pruned_script == script {
+        return Ok(Ok((cand_src, script.to_vec())));
+    }
+
+    let (re_res, re_audit, re_stdout) =
+        audit_single_candidate_raw(src, thm_name, full_name, &pruned_script, lake_root)?;
+    if let Ok(pruned_src) = re_res
+        && collect_unused_simp_args(&re_audit, &re_stdout).is_empty()
+    {
+        return Ok(Ok((pruned_src, pruned_script)));
+    }
+
+    Ok(Ok((cand_src, script.to_vec())))
 }
 
 fn strip_trailing_docstrings_and_attrs(prefix: &str) -> &str {
@@ -266,15 +403,17 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
                 elapsed_ms: 0,
             });
             let t0 = Instant::now();
-            match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                Ok(cand_src) => {
+            match audit_and_prune_unused_simp_args(src, &thm.name, full_name, script, lake_root)? {
+                Ok((cand_src, final_script)) => {
                     ui.send(UiEvent::BranchUpdated {
                         id: branch_id,
-                        status: BranchStatus::Verified { tactic: preview },
+                        status: BranchStatus::Verified {
+                            tactic: final_script.join("; "),
+                        },
                         elapsed_ms: t0.elapsed().as_millis() as u64,
                     });
                     return Ok((
-                        Some((cand_src, script.clone())),
+                        Some((cand_src, final_script)),
                         String::new(),
                         unsolved_diags,
                     ));
@@ -412,13 +551,19 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
             for (i, err) in cand_errors.iter().enumerate() {
                 if err.is_none() {
                     let script = &chunk[i];
-                    match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                        Ok(cand_src) => {
+                    match audit_and_prune_unused_simp_args(
+                        src,
+                        &thm.name,
+                        full_name,
+                        script,
+                        lake_root,
+                    )? {
+                        Ok((cand_src, final_script)) => {
                             let elapsed_ms = batch_start.elapsed().as_millis() as u64;
                             ui.send(UiEvent::BranchUpdated {
                                 id: chunk_base_id + i + 1,
                                 status: BranchStatus::Verified {
-                                    tactic: script.join("; "),
+                                    tactic: final_script.join("; "),
                                 },
                                 elapsed_ms,
                             });
@@ -432,7 +577,7 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
                                 }
                             }
                             return Ok((
-                                Some((cand_src, script.clone())),
+                                Some((cand_src, final_script)),
                                 String::new(),
                                 unsolved_diags,
                             ));
@@ -459,18 +604,24 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
             // Parse-error fallback: re-run candidates individually and collect unsolved goals
             for (i, script) in chunk.iter().enumerate() {
                 let branch_id = chunk_base_id + i + 1;
-                match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
-                    Ok(cand_src) => {
+                match audit_and_prune_unused_simp_args(
+                    src,
+                    &thm.name,
+                    full_name,
+                    script,
+                    lake_root,
+                )? {
+                    Ok((cand_src, final_script)) => {
                         let elapsed_ms = batch_start.elapsed().as_millis() as u64;
                         ui.send(UiEvent::BranchUpdated {
                             id: branch_id,
                             status: BranchStatus::Verified {
-                                tactic: script.join("; "),
+                                tactic: final_script.join("; "),
                             },
                             elapsed_ms,
                         });
                         return Ok((
-                            Some((cand_src, script.clone())),
+                            Some((cand_src, final_script)),
                             String::new(),
                             unsolved_diags,
                         ));
@@ -766,6 +917,33 @@ mod tests {
             )),
             "expected Verified event for branch #3: {events:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unused_simp_args_pruned_post_verification() {
+        let dir = std::env::temp_dir().join("lean_prover_v171_prune_unused_simp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("UnusedSimp.lean");
+        let src = "import Init\ntheorem zero_id_prune (n : Nat) : n + 0 = n := by\n  sorry\n";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![vec!["simp [Nat.add_comm, Nat.mul_comm]".to_string()]];
+        let (solved, diag, _) = verify_candidates_batched_with_heartbeats_and_ui(
+            src,
+            &thms[0],
+            "zero_id_prune",
+            &cands,
+            None,
+            200_000,
+            &UiHandle::noop(),
+            0,
+        )
+        .unwrap();
+        let (_, script) =
+            solved.unwrap_or_else(|| panic!("expected verified proof, got diag: {diag}"));
+        assert_eq!(script, vec!["simp".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
