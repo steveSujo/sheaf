@@ -1,12 +1,14 @@
 //! Hybrid Kernel Evaluator: Single-file batched probes with `maxHeartbeats` isolation
 //! and Multi-file ephemeral dirty-worktree evaluation with early cancellation.
 
+use crate::ui::{BranchStatus, UiEvent, UiHandle};
 use crate::vfs::{BlobStore, TreeSnapshot};
 use crate::{DiscoveredTheorem, ProverError, replace_theorem_sorry};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Result of batched candidate evaluation: `(solved_src_and_script, last_diag, unsolved_goal_diags)`.
 pub type BatchedVerifyResult = (
@@ -88,6 +90,29 @@ pub(crate) fn run_lean_json(
             .arg("--json")
             .arg(file)
             .output()
+    }
+    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
+}
+
+pub(crate) fn spawn_lean_json_piped(
+    file: &Path,
+    lake_root: Option<&Path>,
+) -> Result<std::process::Child, ProverError> {
+    if let Some(root) = lake_root {
+        std::process::Command::new("lake")
+            .args(["env", "lean", "--json"])
+            .arg(file)
+            .current_dir(root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    } else {
+        std::process::Command::new("lean")
+            .arg("--json")
+            .arg(file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
     }
     .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
 }
@@ -195,6 +220,30 @@ pub fn verify_candidates_batched_with_heartbeats(
     lake_root: Option<&Path>,
     max_heartbeats: usize,
 ) -> Result<BatchedVerifyResult, ProverError> {
+    verify_candidates_batched_with_heartbeats_and_ui(
+        src,
+        thm,
+        full_name,
+        candidates,
+        lake_root,
+        max_heartbeats,
+        &UiHandle::noop(),
+        0,
+    )
+}
+
+/// Evaluate candidate scripts in batches of 8, streaming `lake env lean --json` diagnostics live to `ui`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_candidates_batched_with_heartbeats_and_ui(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    full_name: &str,
+    candidates: &[Vec<String>],
+    lake_root: Option<&Path>,
+    max_heartbeats: usize,
+    ui: &UiHandle,
+    branch_offset: usize,
+) -> Result<BatchedVerifyResult, ProverError> {
     let mut last_diag = String::from("model produced no valid kernel-verified tactic");
     let mut unsolved_diags: Vec<(Vec<String>, String)> = Vec::new();
     if candidates.is_empty() {
@@ -203,16 +252,41 @@ pub fn verify_candidates_batched_with_heartbeats(
 
     let needle = format!("theorem {}", thm.name);
     let Some(thm_pos) = src.find(&needle) else {
-        for script in candidates {
+        for (idx, script) in candidates.iter().enumerate() {
+            let branch_id = branch_offset + idx + 1;
+            let preview = script.join("; ");
+            ui.send(UiEvent::BranchSpawned {
+                id: branch_id,
+                tag: "Probe".to_string(),
+                preview: preview.clone(),
+            });
+            ui.send(UiEvent::BranchUpdated {
+                id: branch_id,
+                status: BranchStatus::Running,
+                elapsed_ms: 0,
+            });
+            let t0 = Instant::now();
             match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
                 Ok(cand_src) => {
+                    ui.send(UiEvent::BranchUpdated {
+                        id: branch_id,
+                        status: BranchStatus::Verified { tactic: preview },
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                    });
                     return Ok((
                         Some((cand_src, script.clone())),
                         String::new(),
                         unsolved_diags,
-                    ))
+                    ));
                 }
                 Err(d) => {
+                    ui.send(UiEvent::BranchUpdated {
+                        id: branch_id,
+                        status: BranchStatus::Failed {
+                            reason: d.lines().next().unwrap_or("failed").to_string(),
+                        },
+                        elapsed_ms: t0.elapsed().as_millis() as u64,
+                    });
                     if d.contains("unsolved goals") {
                         unsolved_diags.push((script.clone(), d.clone()));
                     }
@@ -232,7 +306,9 @@ pub fn verify_candidates_batched_with_heartbeats(
     let hb = max_heartbeats.max(10_000);
 
     const BATCH_SIZE: usize = 8;
-    for chunk in candidates.chunks(BATCH_SIZE) {
+    for (chunk_idx, chunk) in candidates.chunks(BATCH_SIZE).enumerate() {
+        let chunk_base_id = branch_offset + chunk_idx * BATCH_SIZE;
+        let batch_start = Instant::now();
         let mut batch_src = String::from(prefix);
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
         let mut cur_line = batch_src.lines().count()
@@ -258,6 +334,19 @@ pub fn verify_candidates_batched_with_heartbeats(
             cur_line += decl.lines().count();
             ranges.push((start_line, cur_line.saturating_sub(1)));
             batch_src.push_str(&decl);
+
+            let branch_id = chunk_base_id + i + 1;
+            let preview = script.join("; ");
+            ui.send(UiEvent::BranchSpawned {
+                id: branch_id,
+                tag: "Batch".to_string(),
+                preview,
+            });
+            ui.send(UiEvent::BranchUpdated {
+                id: branch_id,
+                status: BranchStatus::Running,
+                elapsed_ms: 0,
+            });
         }
 
         let unique = SystemTime::now()
@@ -270,41 +359,54 @@ pub fn verify_candidates_batched_with_heartbeats(
         ));
         std::fs::write(&tmp_file, &batch_src)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-        let out = run_lean_json(&tmp_file, lake_root)?;
-        let _ = std::fs::remove_file(&tmp_file);
 
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut child = spawn_lean_json_piped(&tmp_file, lake_root)?;
         let mut cand_errors: Vec<Option<String>> = vec![None; chunk.len()];
         let mut has_unmapped_error = false;
 
-        for line in stdout.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-                if sev != "error" {
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line_res in reader.lines() {
+                let Ok(line) = line_res else {
                     continue;
-                }
-                let data = v
-                    .get("data")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let err_line = v
-                    .get("pos")
-                    .and_then(|p| p.get("line"))
-                    .and_then(|l| l.as_u64())
-                    .map(|l| l as usize);
-                if let Some(el) = err_line
-                    && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
-                {
-                    if cand_errors[idx].is_none() {
-                        cand_errors[idx] = Some(data);
+                };
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
+                    if sev != "error" {
+                        continue;
                     }
-                } else {
-                    has_unmapped_error = true;
-                    last_diag = data;
+                    let data = v
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let err_line = v
+                        .get("pos")
+                        .and_then(|p| p.get("line"))
+                        .and_then(|l| l.as_u64())
+                        .map(|l| l as usize);
+                    if let Some(el) = err_line
+                        && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
+                    {
+                        if cand_errors[idx].is_none() {
+                            ui.send(UiEvent::BranchUpdated {
+                                id: chunk_base_id + idx + 1,
+                                status: BranchStatus::Failed {
+                                    reason: data.lines().next().unwrap_or("error").to_string(),
+                                },
+                                elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                            });
+                            cand_errors[idx] = Some(data);
+                        }
+                    } else {
+                        has_unmapped_error = true;
+                        last_diag = data;
+                    }
                 }
             }
         }
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&tmp_file);
 
         if !has_unmapped_error {
             for (i, err) in cand_errors.iter().enumerate() {
@@ -312,6 +414,23 @@ pub fn verify_candidates_batched_with_heartbeats(
                     let script = &chunk[i];
                     match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
                         Ok(cand_src) => {
+                            let elapsed_ms = batch_start.elapsed().as_millis() as u64;
+                            ui.send(UiEvent::BranchUpdated {
+                                id: chunk_base_id + i + 1,
+                                status: BranchStatus::Verified {
+                                    tactic: script.join("; "),
+                                },
+                                elapsed_ms,
+                            });
+                            for (j, other_err) in cand_errors.iter().enumerate() {
+                                if j != i && other_err.is_none() {
+                                    ui.send(UiEvent::BranchUpdated {
+                                        id: chunk_base_id + j + 1,
+                                        status: BranchStatus::Canceled,
+                                        elapsed_ms,
+                                    });
+                                }
+                            }
                             return Ok((
                                 Some((cand_src, script.clone())),
                                 String::new(),
@@ -319,6 +438,13 @@ pub fn verify_candidates_batched_with_heartbeats(
                             ));
                         }
                         Err(d) => {
+                            ui.send(UiEvent::BranchUpdated {
+                                id: chunk_base_id + i + 1,
+                                status: BranchStatus::Failed {
+                                    reason: d.lines().next().unwrap_or("audit failed").to_string(),
+                                },
+                                elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                            });
                             last_diag = d;
                         }
                     }
@@ -331,9 +457,18 @@ pub fn verify_candidates_batched_with_heartbeats(
             }
         } else {
             // Parse-error fallback: re-run candidates individually and collect unsolved goals
-            for script in chunk {
+            for (i, script) in chunk.iter().enumerate() {
+                let branch_id = chunk_base_id + i + 1;
                 match audit_single_candidate(src, &thm.name, full_name, script, lake_root)? {
                     Ok(cand_src) => {
+                        let elapsed_ms = batch_start.elapsed().as_millis() as u64;
+                        ui.send(UiEvent::BranchUpdated {
+                            id: branch_id,
+                            status: BranchStatus::Verified {
+                                tactic: script.join("; "),
+                            },
+                            elapsed_ms,
+                        });
                         return Ok((
                             Some((cand_src, script.clone())),
                             String::new(),
@@ -341,6 +476,13 @@ pub fn verify_candidates_batched_with_heartbeats(
                         ));
                     }
                     Err(d) => {
+                        ui.send(UiEvent::BranchUpdated {
+                            id: branch_id,
+                            status: BranchStatus::Failed {
+                                reason: d.lines().next().unwrap_or("failed").to_string(),
+                            },
+                            elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                        });
                         if d.contains("unsolved goals") {
                             unsolved_diags.push((script.clone(), d.clone()));
                         }
@@ -565,5 +707,65 @@ fn eval_single_multifile_worktree(
         Ok(Some((cand.tree.clone(), cand.script_label.clone())))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover_sorry_theorems;
+
+    #[test]
+    fn test_streaming_batch_probe_emits_live_branch_updates() {
+        let dir = std::env::temp_dir().join("lean_prover_v17_streaming_probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("StreamProbe.lean");
+        let src = "import Init\ntheorem add_comm_stream (a b : Nat) : a + b = b + a := by\n  sorry\n";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![
+            vec!["rfl".to_string()],
+            vec!["intro h".to_string()],
+            vec!["omega".to_string()],
+        ];
+        let (ui, rx) = UiHandle::test_channel();
+        let (solved, _diag, _unsolved) = verify_candidates_batched_with_heartbeats_and_ui(
+            src,
+            &thms[0],
+            "add_comm_stream",
+            &cands,
+            None,
+            200_000,
+            &ui,
+            0,
+        )
+        .unwrap();
+        drop(ui);
+        assert!(solved.is_some());
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UiEvent::BranchUpdated {
+                    id: 1,
+                    status: BranchStatus::Failed { .. },
+                    ..
+                }
+            )),
+            "expected live Failed event for branch #1: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UiEvent::BranchUpdated {
+                    id: 3,
+                    status: BranchStatus::Verified { .. },
+                    ..
+                }
+            )),
+            "expected Verified event for branch #3: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

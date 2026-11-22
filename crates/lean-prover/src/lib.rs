@@ -2,6 +2,7 @@
 
 pub mod kernel_eval;
 pub mod search;
+pub mod ui;
 pub mod vfs;
 
 use std::collections::HashSet;
@@ -496,6 +497,7 @@ pub struct WorkspaceProveSummary {
     pub proved_scripts: Vec<(String, Vec<String>)>,
     pub failed_theorems: Vec<(String, String)>,
     pub stage_logs: Vec<String>,
+    pub json_events: Vec<String>,
 }
 
 /// Bootstrap baseline `lean_sys1.onnx`, `tokenizer.json`, `temperatures.json`, and `mathlib_sq8.vdb` into `artifact_dir`.
@@ -1016,6 +1018,9 @@ pub struct ProveArgs {
     pub max_nodes: usize,
     pub max_workers: usize,
     pub max_heartbeats: usize,
+    pub verbose: bool,
+    pub plain: bool,
+    pub json: bool,
 }
 
 impl Default for ProveArgs {
@@ -1030,6 +1035,9 @@ impl Default for ProveArgs {
             max_nodes: 64,
             max_workers: 2,
             max_heartbeats: 200_000,
+            verbose: false,
+            plain: false,
+            json: false,
         }
     }
 }
@@ -1161,6 +1169,9 @@ impl ProveArgs {
                     parsed.max_heartbeats = hb;
                     i += 1;
                 }
+                "-v" | "--verbose" => parsed.verbose = true,
+                "--plain" => parsed.plain = true,
+                "--json" => parsed.json = true,
                 "--help" | "-h" => return Err("__HELP__".to_string()),
                 unknown if unknown.starts_with("--") => {
                     return Err(format!(
@@ -1186,6 +1197,9 @@ pub struct ProverConfig {
     pub max_nodes: usize,
     pub max_workers: usize,
     pub max_heartbeats: usize,
+    pub verbose: bool,
+    pub plain: bool,
+    pub json: bool,
 }
 
 pub type ProveOptions = ProverConfig;
@@ -1207,6 +1221,9 @@ impl From<&ProveArgs> for ProverConfig {
             max_nodes: args.max_nodes,
             max_workers: args.max_workers,
             max_heartbeats: args.max_heartbeats,
+            verbose: args.verbose,
+            plain: args.plain,
+            json: args.json,
         }
     }
 }
@@ -1281,8 +1298,24 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
     let theorems = discover_sorry_theorems(path)?;
     let total = theorems.len();
+    let ui_mode = if options.json {
+        ui::UiMode::Json
+    } else if options.verbose {
+        ui::UiMode::Verbose
+    } else if options.plain {
+        ui::UiMode::Plain
+    } else {
+        ui::UiMode::Auto
+    };
+    let ui_session = ui::UiSession::start(ui_mode);
+    let ui = ui_session.handle();
+    let ws_start = Instant::now();
+    ui.send(ui::UiEvent::WorkspaceStarted { total });
+
     let mut proved = 0usize;
     let mut failed = 0usize;
+    let mut direct_count = 0usize;
+    let mut escalated_count = 0usize;
     let mut proved_names = Vec::new();
     let mut proved_scripts = Vec::new();
     let mut failed_theorems = Vec::new();
@@ -1332,6 +1365,11 @@ pub fn prove_lean_path_with_artifacts_and_options(
             Some(ns) => format!("{ns}.{}", thm.name),
             None => thm.name.clone(),
         };
+        ui.send(ui::UiEvent::TheoremStarted {
+            index: idx + 1,
+            total,
+            name: full_name.clone(),
+        });
 
         // Stage 1: Canonicalize
         let target_str = extract_theorem_target(&thm.signature);
@@ -1354,11 +1392,21 @@ pub fn prove_lean_path_with_artifacts_and_options(
         // Stage 3: Lean-Sys1 ONNX forward pass with configurable confidence gate
         let (pred, _choice_logits, gate) =
             onnx_sess.forward_with_gate(&input_ids, &attention_mask, &temps, options.gate_threshold)?;
+        let gate_label = match &gate {
+            lean_sys1_ort::GateDecision::DirectExecute(_) => "DirectExecute",
+            lean_sys1_ort::GateDecision::FallbackToLeJepa => "FallbackToLeJepa",
+        };
+        ui.send(ui::UiEvent::ModelRouted {
+            strategy: format!("{:?}", pred.strategy),
+            conf: pred.answer_confidence,
+            gate: gate_label.to_string(),
+        });
 
         let lake_root = find_lake_workspace_root(&thm.file);
         let mut vdb_hits: Vec<lean_vdb::VdbSearchHit> = Vec::new();
         let mut top_lemmas: Vec<String> = Vec::new();
         let mut tried_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut did_escalate = false;
 
         // Stage 4/5 fast-path: DirectExecute runs only the top-ranked strategy bucket first
         let (mut solved, mut last_diag, mut unsolved_diags) = if matches!(
@@ -1380,13 +1428,15 @@ pub fn prove_lean_path_with_artifacts_and_options(
             if fast_candidates.is_empty() {
                 (None, String::new(), Vec::new())
             } else {
-                kernel_eval::verify_candidates_batched_with_heartbeats(
+                kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
                     &eval_src,
                     thm,
                     &full_name,
                     &fast_candidates,
                     lake_root.as_deref(),
                     options.max_heartbeats,
+                    &ui,
+                    0,
                 )?
             }
         } else {
@@ -1395,12 +1445,17 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
         // Escalate to FallbackToLeJepa when gated or when DirectExecute fast-path fails
         if solved.is_none() {
+            did_escalate = true;
             let query_emb = onnx_sess.predict_lejepa_target(&pred.state_emb, pred.strategy);
             vdb_hits = vdb.search_sq8_hnsw(
                 &query_emb,
                 head_symbol.as_str(),
                 options.max_branches.max(16),
             )?;
+            ui.send(ui::UiEvent::Escalated {
+                vdb_hits: vdb_hits.len(),
+                tau: options.premise_tau,
+            });
             let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
             let cand_names: Vec<String> =
                 vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
@@ -1439,13 +1494,15 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
             if !fallback_candidates.is_empty() {
                 let (fb_solved, fb_diag, fb_unsolved) =
-                    kernel_eval::verify_candidates_batched_with_heartbeats(
+                    kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
                         &eval_src,
                         thm,
                         &full_name,
                         &fallback_candidates,
                         lake_root.as_deref(),
                         options.max_heartbeats,
+                        &ui,
+                        tried_scripts.len(),
                     )?;
                 solved = fb_solved;
                 if !fb_diag.is_empty() {
@@ -1544,14 +1601,22 @@ pub fn prove_lean_path_with_artifacts_and_options(
                             .collect()
                     };
 
+                    ui.send(ui::UiEvent::SearchTick {
+                        depth: node.depth,
+                        max_depth: options.max_depth,
+                        nodes: node.id + 1,
+                        max_nodes: options.max_nodes,
+                    });
                     let (step_solved, step_diag, step_unsolved) =
-                        kernel_eval::verify_candidates_batched_with_heartbeats(
+                        kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
                             &cur_src,
                             thm,
                             &full_name,
                             &step_cands,
                             lake_root.as_deref(),
                             options.max_heartbeats,
+                            &ui,
+                            tried_scripts.len() + node.id * 4,
                         )
                         .map_err(|e| e.to_string())?;
 
@@ -1640,8 +1705,30 @@ pub fn prove_lean_path_with_artifacts_and_options(
             pred.difficulty,
             vdb_hits.len(),
         );
-        eprintln!("{log_block}");
+        ui.send(ui::UiEvent::StageLogReady {
+            log_block: log_block.clone(),
+        });
         stage_logs.push(log_block);
+
+        let route_label = if did_escalate {
+            escalated_count += 1;
+            format!("Escalated -> VDB ({} hits)", vdb_hits.len())
+        } else {
+            direct_count += 1;
+            format!("DirectExecute({:?})", pred.strategy)
+        };
+        ui.send(ui::UiEvent::TheoremFinished {
+            name: full_name.clone(),
+            proved: solved.is_some(),
+            route_label,
+            tactic: solved.as_ref().map(|(_, s)| s.join("; ")),
+            diag: if solved.is_none() {
+                Some(last_diag.clone())
+            } else {
+                None
+            },
+            elapsed_ms: elapsed_ms as u64,
+        });
 
         if let Some((_eval_new_src, script)) = solved {
             let body = script
@@ -1670,6 +1757,16 @@ pub fn prove_lean_path_with_artifacts_and_options(
         }
     }
 
+    ui.send(ui::UiEvent::WorkspaceFinished {
+        proved,
+        total,
+        direct_count,
+        escalated_count,
+        elapsed_ms: ws_start.elapsed().as_millis() as u64,
+    });
+    drop(ui);
+    let json_events = ui_session.finish();
+
     Ok(WorkspaceProveSummary {
         discovered: total,
         proved,
@@ -1678,6 +1775,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
         proved_scripts,
         failed_theorems,
         stage_logs,
+        json_events,
     })
 }
 
@@ -2393,8 +2491,8 @@ fn cli_help_text() -> String {
         "sheaf ",
         env!("CARGO_PKG_VERSION"),
         "\n\nUsage:\n",
-        "  sheaf prove <PATH> [--write] [--gate-pct <0..100>] [--max-branches <N>=4] [--premise-tau <0..1>]\n",
-        "                     [--max-depth <1..16>=4] [--max-nodes <1..1024>=64] [--max-workers <1..8>=2] [--max-heartbeats <N>=200000]\n",
+        "  sheaf prove <PATH> [--write] [-v|--verbose] [--plain] [--json] [--gate-pct <0..100>] [--max-branches <N>=4]\n",
+        "                     [--premise-tau <0..1>] [--max-depth <1..16>=4] [--max-nodes <1..1024>=64] [--max-workers <1..8>=2] [--max-heartbeats <N>=200000]\n",
         "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
         "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
         "  sheaf doctor                   Verify Lean 4, Lake, and artifact readiness\n",
@@ -2482,6 +2580,9 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             let options = ProverConfig::from(&prove_args);
             let summary = prove_lean_path_with_options(target_path, &options)?;
             let code = if summary.failed == 0 { 0 } else { 1 };
+            if options.json {
+                return Ok((code, summary.json_events.join("\n")));
+            }
             let failed_names: Vec<&str> = summary
                 .failed_theorems
                 .iter()
@@ -3611,5 +3712,55 @@ theorem still_open (a b : Nat) : a + b = b + a := by
             flat.iter().any(|s| s.contains("exists (a - amt), ((a + b) - ((a - amt)))")),
             "expected clean 2-pass witness extraction after stripping := by sorry: {flat:?}"
         );
+    }
+
+    #[test]
+    fn test_cli_prove_plain_verbose_and_json_flags() {
+        let dir = std::env::temp_dir().join("lean_prover_v17_ui_flags");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("UiFlags.lean");
+        std::fs::write(&f, "import Init\ntheorem id_add (n : Nat) : n + 0 = n := by\n  sorry\n")
+            .unwrap();
+
+        let parsed = ProveArgs::try_from_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f.to_string_lossy().into(),
+            "-v".into(),
+            "--plain".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert!(parsed.verbose && parsed.plain && parsed.json);
+
+        let (code, stdout) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f.to_string_lossy().into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert_eq!(code, 0, "json mode failed: {stdout}");
+        let json_lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid NDJSON line"))
+            .collect();
+        assert!(
+            json_lines
+                .iter()
+                .any(|v| v.get("event").and_then(|e| e.as_str()) == Some("workspace_started"))
+        );
+        assert!(
+            json_lines
+                .iter()
+                .any(|v| v.get("event").and_then(|e| e.as_str()) == Some("theorem_finished"))
+        );
+        assert!(
+            json_lines
+                .iter()
+                .any(|v| v.get("event").and_then(|e| e.as_str()) == Some("workspace_finished"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
