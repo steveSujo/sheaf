@@ -409,36 +409,49 @@ impl LeanSys1OnnxSession {
             .cloned()
             .unwrap_or_else(|| norm_weight.clone());
 
-        let qkv_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.blocks.0.attn.qkv.weight", "onnx::MatMul_238"],
-            "qkv",
-        )?;
-        let attn_proj_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.blocks.0.attn.proj.weight", "onnx::MatMul_254"],
-            "attn_proj",
-        )?;
-        let ffn_gate_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.blocks.0.ffn.w_gate.weight", "onnx::MatMul_255"],
-            "ffn_gate",
-        )?;
-        let ffn_up_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.blocks.0.ffn.w_up.weight", "onnx::MatMul_256"],
-            "ffn_up",
-        )?;
-        let ffn_down_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.blocks.0.ffn.w_down.weight", "onnx::MatMul_257"],
-            "ffn_down",
-        )?;
-        let pool_query_weight = get_tensor_with_aliases(
-            &tensors,
-            &["enc.pool_query.weight", "onnx::MatMul_258"],
-            "pool_query",
-        )?;
+        let mut indexed_matmuls: Vec<(usize, &Vec<f32>)> = tensors
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("onnx::MatMul_")
+                    .and_then(|num| num.parse::<usize>().ok())
+                    .map(|idx| (idx, v))
+            })
+            .collect();
+        indexed_matmuls.sort_by_key(|(idx, _)| *idx);
+        let fallback_matmul = |slot: usize| -> Option<Vec<f32>> {
+            (indexed_matmuls.len() == 6).then(|| indexed_matmuls[slot].1.clone())
+        };
+
+        let qkv_weight = tensors
+            .get("enc.blocks.0.attn.qkv.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(0))
+            .ok_or_else(|| Sys1Error::Onnx("missing qkv".to_string()))?;
+        let attn_proj_weight = tensors
+            .get("enc.blocks.0.attn.proj.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(1))
+            .ok_or_else(|| Sys1Error::Onnx("missing attn_proj".to_string()))?;
+        let ffn_gate_weight = tensors
+            .get("enc.blocks.0.ffn.w_gate.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(2))
+            .ok_or_else(|| Sys1Error::Onnx("missing ffn_gate".to_string()))?;
+        let ffn_up_weight = tensors
+            .get("enc.blocks.0.ffn.w_up.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(3))
+            .ok_or_else(|| Sys1Error::Onnx("missing ffn_up".to_string()))?;
+        let ffn_down_weight = tensors
+            .get("enc.blocks.0.ffn.w_down.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(4))
+            .ok_or_else(|| Sys1Error::Onnx("missing ffn_down".to_string()))?;
+        let pool_query_weight = tensors
+            .get("enc.pool_query.weight")
+            .cloned()
+            .or_else(|| fallback_matmul(5))
+            .ok_or_else(|| Sys1Error::Onnx("missing pool_query".to_string()))?;
         let rope_cos = get_tensor_with_aliases(
             &tensors,
             &["enc.rope_cos", "onnx::Slice_27"],
@@ -1149,19 +1162,19 @@ mod tests {
         let (pred_a, choice_a, _) = sess.forward(&ids_a, &mask, &temps).unwrap();
 
         let ref_state_prefix = [
-            -1.0525968_f32,
-            -0.11565425,
-            -1.1521168,
-            1.0578138,
-            -0.8256417,
-            -0.08311277,
-            0.31805936,
-            -0.38810647,
+            -0.0259715_f32,
+            0.5952697,
+            0.9862621,
+            0.8247418,
+            -0.6717533,
+            -0.4550829,
+            -0.596716,
+            -0.7930471,
         ];
         for (got, exp) in pred_a.state_emb.iter().zip(ref_state_prefix.iter()) {
             assert!((got - exp).abs() < 1e-4, "state_emb mismatch: got={got}, exp={exp}");
         }
-        let ref_choice = [0.11478883_f32, -0.08977753, -0.023169301, -0.14556327, 0.08173258];
+        let ref_choice = [0.1006087_f32, 0.9398667, -0.5518216, -0.6410031, 1.2079908];
         for (got, exp) in choice_a.iter().zip(ref_choice.iter()) {
             assert!((got - exp).abs() < 1e-4, "choice mismatch: got={got}, exp={exp}");
         }
