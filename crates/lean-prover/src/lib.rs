@@ -1716,19 +1716,25 @@ fn synthesize_from_model_and_vdb(
     }
     let context_list = context_lemmas.join(", ");
 
-    // 1. Local def + structure binders with leaf-only omega
+    let mut bucket_atomic: Vec<Vec<String>> = Vec::new();
+    let mut bucket_rewrite: Vec<Vec<String>> = Vec::new();
+    let mut bucket_apply: Vec<Vec<String>> = Vec::new();
+    let mut bucket_have: Vec<Vec<String>> = Vec::new();
+    let mut bucket_induction: Vec<Vec<String>> = Vec::new();
+
+    // 1. Local def + structure binders with incremental split-and-prune omega
     if !used_defs.is_empty() {
         let defs_list = used_defs.join(", ");
         if struct_vars.len() == 1 {
-            scripts.push(vec![format!("simp [{defs_list}]")]);
+            bucket_atomic.push(vec![format!("simp [{defs_list}]")]);
         } else if struct_vars.len() == 2 {
             let cases_prefix: String = struct_vars
                 .iter()
                 .map(|v| format!("cases {v}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            scripts.push(vec![format!(
-                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))"
+            bucket_atomic.push(vec![format!(
+                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))"
             )]);
         } else if struct_vars.len() >= 3 {
             let v0 = struct_vars[0];
@@ -1740,26 +1746,29 @@ fn synthesize_from_model_and_vdb(
                 .map(|v| format!("cases {v}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            scripts.push(vec![format!(
-                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))"
+            bucket_atomic.push(vec![format!(
+                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | omega | (split <;> try dsimp only))"
             )]);
-            scripts.push(vec![format!(
-                "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | (split <;> try dsimp only at *) | (exfalso; omega) | (congr 1; all_goals omega))))"
+            bucket_atomic.push(vec![format!(
+                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))"
+            )]);
+            bucket_atomic.push(vec![format!(
+                "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))))"
             )]);
         } else {
             // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
-            scripts.push(vec![format!("dsimp [{defs_list}] at *; omega")]);
-            scripts.push(vec![format!("unfold {defs_list} at *; omega")]);
+            bucket_atomic.push(vec![format!("dsimp [{defs_list}] at *; omega")]);
+            bucket_atomic.push(vec![format!("unfold {defs_list} at *; omega")]);
             if !thm.local_theorems.is_empty() {
                 let thms_list = thm.local_theorems.join(", ");
-                scripts.push(vec![format!("simp [{thms_list}]")]);
+                bucket_rewrite.push(vec![format!("simp [{thms_list}]")]);
                 if !context_list.is_empty() {
-                    scripts.push(vec![format!("simp [{thms_list}]; simp [{context_list}]")]);
+                    bucket_rewrite.push(vec![format!("simp [{thms_list}]; simp [{context_list}]")]);
                 }
             }
             if !context_list.is_empty() {
-                scripts.push(vec![format!("simp [{context_list}]")]);
-                scripts.push(vec![format!(
+                bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
+                bucket_rewrite.push(vec![format!(
                     "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
                 )]);
             }
@@ -1767,15 +1776,15 @@ fn synthesize_from_model_and_vdb(
     } else {
         // When no local definition appears in the signature, try bare closers first so
         // unrelated preceding local theorems do not trigger unused simp argument warnings.
-        scripts.push(vec!["simp".to_string()]);
-        scripts.push(vec!["omega".to_string()]);
+        bucket_atomic.push(vec!["simp".to_string()]);
+        bucket_atomic.push(vec!["omega".to_string()]);
         if !thm.local_theorems.is_empty() {
             let thms_list = thm.local_theorems.join(", ");
-            scripts.push(vec![format!("simp [{thms_list}]")]);
+            bucket_rewrite.push(vec![format!("simp [{thms_list}]")]);
         }
         if !context_list.is_empty() {
-            scripts.push(vec![format!("simp [{context_list}]")]);
-            scripts.push(vec![format!(
+            bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
+            bucket_rewrite.push(vec![format!(
                 "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
             )]);
         }
@@ -1833,41 +1842,41 @@ fn synthesize_from_model_and_vdb(
             if !ind_ctx_list.is_empty() {
                 if !other_vars.is_empty() {
                     let gen_all = other_vars.join(" ");
-                    scripts.push(vec![format!(
+                    bucket_induction.push(vec![format!(
                         "induction {v_ind} generalizing {gen_all} <;> simp_all [{ind_ctx_list}]"
                     )]);
                     if let Some(&last_var) = other_vars.last() {
                         if other_vars.len() > 1 {
-                            scripts.push(vec![format!(
+                            bucket_induction.push(vec![format!(
                                 "induction {v_ind} generalizing {last_var} <;> simp_all [{ind_ctx_list}]"
                             )]);
                         }
                         if is_list {
-                            scripts.push(vec![format!(
+                            bucket_induction.push(vec![format!(
                                 "induction {v_ind} generalizing {last_var} with | nil => simp_all [{ind_ctx_list}] | cons hd tl ih => cases hd <;> simp_all [{ind_ctx_list}] <;> cases {last_var} with | nil => simp_all [{ind_ctx_list}] | cons _ tl2 => cases tl2 <;> simp_all [{ind_ctx_list}]"
                             )]);
                         }
                     }
-                    scripts.push(vec![format!(
+                    bucket_induction.push(vec![format!(
                         "induction {v_ind} generalizing {gen_all} <;> all_goals (repeat (first | rfl | simp_all [{ind_ctx_list}] | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
                     )]);
                 }
-                scripts.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
-                scripts.push(vec![format!(
+                bucket_induction.push(vec![format!("induction {v_ind} <;> simp_all [{ind_ctx_list}]")]);
+                bucket_induction.push(vec![format!(
                     "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{ind_ctx_list}]) | omega))"
                 )]);
-                scripts.push(vec![format!(
+                bucket_induction.push(vec![format!(
                     "induction {v_ind} <;> simp_all [{ind_ctx_list}] <;> try omega"
                 )]);
             } else {
-                scripts.push(vec![format!("induction {v_ind} <;> simp_all <;> try omega")]);
+                bucket_induction.push(vec![format!("induction {v_ind} <;> simp_all <;> try omega")]);
             }
         }
     }
 
     // 3. Bare general closers before external VDB lemmas
-    scripts.push(vec!["simp".to_string()]);
-    scripts.push(vec!["omega".to_string()]);
+    bucket_atomic.push(vec!["simp".to_string()]);
+    bucket_atomic.push(vec!["omega".to_string()]);
 
     // 4. Model + VDB retrieved lemma candidates (zero hardcoded theorem-string checks)
     let mut vdb_lemma_names: Vec<String> = top_lemmas.to_vec();
@@ -1885,15 +1894,15 @@ fn synthesize_from_model_and_vdb(
 
     for lemma in vdb_lemma_names.iter().take(max_branches.clamp(1, 16)) {
         if !var_args.is_empty() {
-            scripts.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
+            bucket_apply.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
         }
-        scripts.push(vec![format!("simp [{lemma}]")]);
+        bucket_apply.push(vec![format!("simp [{lemma}]")]);
     }
 
     // 5. Structural head-symbol introduction from canonicalizer + model gate
     if head_symbol == "And" || thm.signature.contains('∧') {
         if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∧')) {
-            scripts.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
+            bucket_have.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
         }
     } else if head_symbol == "Exists" || thm.signature.contains('∃') {
         let mul_lemmas: Vec<&str> = vdb_lemma_names
@@ -1907,10 +1916,49 @@ fn synthesize_from_model_and_vdb(
             format!(", {}", mul_lemmas.join(", "))
         };
         if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∃')) {
-            scripts.push(vec![
+            bucket_have.push(vec![
                 format!("rcases {hyp_name} with ⟨k, hk⟩"),
                 format!("exact ⟨2 * k * k, by simp [hk, Nat.mul_assoc{simp_extra}]⟩"),
             ]);
+        }
+    }
+
+    // Order buckets dynamically based on `pred.strategy` while preserving full fallback coverage
+    match pred.strategy {
+        lean_sys1_ort::StrategyChoice::AtomicClose => {
+            scripts.extend(bucket_atomic);
+            scripts.extend(bucket_rewrite);
+            scripts.extend(bucket_induction);
+            scripts.extend(bucket_apply);
+            scripts.extend(bucket_have);
+        }
+        lean_sys1_ort::StrategyChoice::Rewrite => {
+            scripts.extend(bucket_rewrite);
+            scripts.extend(bucket_atomic);
+            scripts.extend(bucket_induction);
+            scripts.extend(bucket_apply);
+            scripts.extend(bucket_have);
+        }
+        lean_sys1_ort::StrategyChoice::ApplyLemma => {
+            scripts.extend(bucket_apply);
+            scripts.extend(bucket_atomic);
+            scripts.extend(bucket_rewrite);
+            scripts.extend(bucket_induction);
+            scripts.extend(bucket_have);
+        }
+        lean_sys1_ort::StrategyChoice::IntroduceHave => {
+            scripts.extend(bucket_have);
+            scripts.extend(bucket_atomic);
+            scripts.extend(bucket_rewrite);
+            scripts.extend(bucket_induction);
+            scripts.extend(bucket_apply);
+        }
+        lean_sys1_ort::StrategyChoice::Induction => {
+            scripts.extend(bucket_induction);
+            scripts.extend(bucket_atomic);
+            scripts.extend(bucket_rewrite);
+            scripts.extend(bucket_apply);
+            scripts.extend(bucket_have);
         }
     }
 
@@ -2462,7 +2510,10 @@ mod tests {
             .find(|(name, _)| name == "clean_list_len")
             .map(|(_, s)| s.join("; "))
             .unwrap();
-        assert_eq!(len_script, "simp");
+        assert!(
+            len_script == "simp" || len_script.starts_with("induction "),
+            "unexpected clean_list_len script: {len_script}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
