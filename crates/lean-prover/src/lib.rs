@@ -785,24 +785,27 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
 
                 let mut decl_parts = vec![trimmed.to_string()];
                 let mut scan = idx;
-                while !decl_parts.last().is_some_and(|l| l.contains(":= by")) && scan + 1 < lines.len() {
+                while !decl_parts.last().is_some_and(|l| l.contains(":=")) && scan + 1 < lines.len() {
                     scan += 1;
                     let nt = lines[scan].trim();
-                    if nt.starts_with("theorem ") || nt.starts_with("lemma ") || nt.starts_with("end ") {
+                    if is_top_level_decl_boundary(nt) {
                         break;
                     }
                     decl_parts.push(nt.to_string());
                 }
                 let full_decl = decl_parts.join(" ");
 
-                let mut has_sorry = full_decl.contains("sorry");
+                let mut block_depth = 0usize;
+                let mut has_sorry = full_decl
+                    .split_once(":=")
+                    .is_some_and(|(_, body)| contains_standalone_sorry(body, &mut block_depth));
                 if !has_sorry {
-                    for next_line in lines.iter().skip(scan + 1).take(6) {
+                    for next_line in lines.iter().skip(scan + 1) {
                         let nt = next_line.trim();
-                        if nt.starts_with("theorem ") || nt.starts_with("lemma ") || nt.starts_with("end ") {
+                        if is_top_level_decl_boundary(nt) {
                             break;
                         }
-                        if nt.contains("sorry") {
+                        if contains_standalone_sorry(nt, &mut block_depth) {
                             has_sorry = true;
                             break;
                         }
@@ -837,6 +840,84 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
         exports_by_file.insert(file.clone(), file_exports);
     }
     Ok(found)
+}
+
+fn is_top_level_decl_boundary(trimmed: &str) -> bool {
+    let decl = trimmed
+        .strip_prefix("private ")
+        .or_else(|| trimmed.strip_prefix("protected "))
+        .unwrap_or(trimmed);
+    decl.starts_with("theorem ")
+        || decl.starts_with("lemma ")
+        || decl.starts_with("def ")
+        || decl.starts_with("inductive ")
+        || decl.starts_with("structure ")
+        || decl.starts_with("namespace ")
+        || decl.starts_with("section ")
+        || decl.starts_with("end ")
+        || decl.starts_with("axiom ")
+        || decl.starts_with("example ")
+        || decl.starts_with("instance ")
+        || decl.starts_with("class ")
+        || trimmed.starts_with("/--")
+}
+
+fn is_lean_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '\''
+}
+
+fn strip_lean_comments_line(line: &str, block_depth: &mut usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '-' {
+            *block_depth += 1;
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if *block_depth > 0 && i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '/' {
+            *block_depth -= 1;
+            out.push(' ');
+            i += 2;
+            continue;
+        }
+        if *block_depth == 0 && i + 1 < chars.len() && chars[i] == '-' && chars[i + 1] == '-' {
+            break;
+        }
+        if *block_depth == 0 {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn contains_standalone_sorry(line: &str, block_depth: &mut usize) -> bool {
+    let code = strip_lean_comments_line(line, block_depth);
+    let needle = "sorry";
+    let mut start = 0;
+    while let Some(pos) = code[start..].find(needle) {
+        let abs = start + pos;
+        let left_ok = code[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_lean_ident_char(c));
+        let right_idx = abs + needle.len();
+        let right_ok = code[right_idx..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_lean_ident_char(c));
+        if left_ok && right_ok {
+            return true;
+        }
+        start = right_idx;
+        if start >= code.len() {
+            break;
+        }
+    }
+    false
 }
 
 fn extract_theorem_target(signature: &str) -> &str {
@@ -1812,13 +1893,13 @@ fn synthesize_from_model_and_vdb(
                 .collect::<Vec<_>>()
                 .join("; ");
             bucket_atomic.push(vec![format!(
+                "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))))"
+            )]);
+            bucket_atomic.push(vec![format!(
                 "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | omega | (split <;> try dsimp only))"
             )]);
             bucket_atomic.push(vec![format!(
                 "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))"
-            )]);
-            bucket_atomic.push(vec![format!(
-                "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))))"
             )]);
         } else {
             // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
@@ -2120,22 +2201,8 @@ fn split_top_level_plus(expr: &str) -> Option<(&str, &str)> {
 }
 
 fn extract_existential_target(signature: &str) -> Option<(Vec<String>, String)> {
-    let mut depth = 0usize;
-    let mut colon_idx = None;
-    for (idx, ch) in signature.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => {
-                colon_idx = Some(idx);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let mut s = colon_idx
-        .map(|i| signature[i + 1..].trim())
-        .unwrap_or_else(|| signature.trim());
+    let target = extract_theorem_target(signature);
+    let mut s = target.split(":=").next().unwrap_or(target).trim();
     while s.starts_with('(') && s.ends_with(')') {
         s = s[1..s.len() - 1].trim();
     }
@@ -3481,6 +3548,68 @@ mod tests {
             flat.iter()
                 .any(|s| s.contains("refine ⟨?_, ?_, ?_, ?_⟩ <;> try rfl")),
             "expected k+c metavariable refine with try rfl per conjunct: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_sorry_theorems_ignores_identifier_substrings_and_boundaries() {
+        let temp_dir = std::env::temp_dir().join("sheaf_test_sorry_scanner");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let lean_file = temp_dir.join("AxiomGateTest.lean");
+        std::fs::write(
+            &lean_file,
+            "\
+def sorryAx := 0
+
+theorem verify_rejects_sorry (x : Nat) : x = x := by
+  simp
+-- sorry in a comment should be ignored
+def next_sorryAx_helper : Nat := sorryAx
+
+theorem still_open (a b : Nat) : a + b = b + a := by
+  sorry
+",
+        )
+        .expect("write lean test file");
+
+        let found = discover_sorry_theorems(&temp_dir).expect("discover sorry theorems");
+        let names: Vec<&str> = found.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["still_open"], "unexpected discovered theorems: {names:?}");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extract_existential_target_strips_trailing_by_sorry() {
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("LedgerTest.lean"),
+            line: 1,
+            namespace: None,
+            name: "transfer_exists_with_sorry".to_string(),
+            signature:
+                "theorem transfer_exists_with_sorry (a b amt : Nat) (h : amt ≤ a) : ∃ a' b' : Nat, a' + b' = a + b ∧ a' = a - amt := by sorry"
+                    .to_string(),
+            binders: vec![
+                ("a".to_string(), "Nat".to_string()),
+                ("b".to_string(), "Nat".to_string()),
+                ("amt".to_string(), "Nat".to_string()),
+                ("h".to_string(), "amt ≤ a".to_string()),
+            ],
+            local_defs: vec![],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            workspace_deps: vec![],
+        };
+        let cands = synthesize_existential_candidates(&thm);
+        let flat: Vec<String> = cands.iter().map(|s| s.join(" ; ")).collect();
+        assert!(
+            flat.iter().all(|s| !s.contains(":= by") && !s.contains("sorry")),
+            "trailing := by sorry must be stripped before witness extraction: {flat:?}"
+        );
+        assert!(
+            flat.iter().any(|s| s.contains("exists (a - amt), ((a + b) - ((a - amt)))")),
+            "expected clean 2-pass witness extraction after stripping := by sorry: {flat:?}"
         );
     }
 }
