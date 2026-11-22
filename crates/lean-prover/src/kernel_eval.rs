@@ -15,6 +15,64 @@ pub type BatchedVerifyResult = (
     Vec<(Vec<String>, String)>,
 );
 
+/// Abstraction over Lean 4 kernel verification backends (`BatchLeanCliBackend` or future persistent `PantographSession`).
+pub trait KernelBackend {
+    fn eval_batch(
+        &self,
+        src: &str,
+        thm: &DiscoveredTheorem,
+        full_name: &str,
+        candidates: &[Vec<String>],
+        lake_root: Option<&Path>,
+        max_heartbeats: usize,
+    ) -> Result<BatchedVerifyResult, ProverError>;
+
+    fn audit_winner(
+        &self,
+        src: &str,
+        thm_name: &str,
+        full_name: &str,
+        script: &[String],
+        lake_root: Option<&Path>,
+    ) -> Result<Result<String, String>, ProverError>;
+}
+
+/// Default `KernelBackend` using batched `lake env lean --json` probes with per-probe `maxHeartbeats`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BatchLeanCliBackend;
+
+impl KernelBackend for BatchLeanCliBackend {
+    fn eval_batch(
+        &self,
+        src: &str,
+        thm: &DiscoveredTheorem,
+        full_name: &str,
+        candidates: &[Vec<String>],
+        lake_root: Option<&Path>,
+        max_heartbeats: usize,
+    ) -> Result<BatchedVerifyResult, ProverError> {
+        verify_candidates_batched_with_heartbeats(
+            src,
+            thm,
+            full_name,
+            candidates,
+            lake_root,
+            max_heartbeats,
+        )
+    }
+
+    fn audit_winner(
+        &self,
+        src: &str,
+        thm_name: &str,
+        full_name: &str,
+        script: &[String],
+        lake_root: Option<&Path>,
+    ) -> Result<Result<String, String>, ProverError> {
+        audit_single_candidate(src, thm_name, full_name, script, lake_root)
+    }
+}
+
 pub(crate) fn run_lean_json(
     file: &Path,
     lake_root: Option<&Path>,

@@ -301,38 +301,46 @@ impl LeanSys1OnnxSession {
             .cloned()
             .unwrap_or_else(|| norm_weight.clone());
 
-        let qkv_weight = tensors
-            .get("onnx::MatMul_238")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_238 (qkv)".to_string()))?
-            .clone();
-        let attn_proj_weight = tensors
-            .get("onnx::MatMul_254")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_254 (attn_proj)".to_string()))?
-            .clone();
-        let ffn_gate_weight = tensors
-            .get("onnx::MatMul_255")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_255 (ffn_gate)".to_string()))?
-            .clone();
-        let ffn_up_weight = tensors
-            .get("onnx::MatMul_256")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_256 (ffn_up)".to_string()))?
-            .clone();
-        let ffn_down_weight = tensors
-            .get("onnx::MatMul_257")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_257 (ffn_down)".to_string()))?
-            .clone();
-        let pool_query_weight = tensors
-            .get("onnx::MatMul_258")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::MatMul_258 (pool_query)".to_string()))?
-            .clone();
-        let rope_cos = tensors
-            .get("onnx::Slice_27")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::Slice_27 (rope_cos)".to_string()))?
-            .clone();
-        let rope_sin = tensors
-            .get("onnx::Slice_41")
-            .ok_or_else(|| Sys1Error::Onnx("missing onnx::Slice_41 (rope_sin)".to_string()))?
-            .clone();
+        let qkv_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.blocks.0.attn.qkv.weight", "onnx::MatMul_238"],
+            "qkv",
+        )?;
+        let attn_proj_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.blocks.0.attn.proj.weight", "onnx::MatMul_254"],
+            "attn_proj",
+        )?;
+        let ffn_gate_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.blocks.0.ffn.w_gate.weight", "onnx::MatMul_255"],
+            "ffn_gate",
+        )?;
+        let ffn_up_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.blocks.0.ffn.w_up.weight", "onnx::MatMul_256"],
+            "ffn_up",
+        )?;
+        let ffn_down_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.blocks.0.ffn.w_down.weight", "onnx::MatMul_257"],
+            "ffn_down",
+        )?;
+        let pool_query_weight = get_tensor_with_aliases(
+            &tensors,
+            &["enc.pool_query.weight", "onnx::MatMul_258"],
+            "pool_query",
+        )?;
+        let rope_cos = get_tensor_with_aliases(
+            &tensors,
+            &["enc.rope_cos", "onnx::Slice_27"],
+            "rope_cos",
+        )?;
+        let rope_sin = get_tensor_with_aliases(
+            &tensors,
+            &["enc.rope_sin", "onnx::Slice_41"],
+            "rope_sin",
+        )?;
 
         let head_dim = 64usize;
         if !d_model.is_multiple_of(head_dim) || !rope_cos.len().is_multiple_of(head_dim) {
@@ -680,6 +688,23 @@ impl LeanSys1OnnxSession {
     ) -> Result<(Sys1Prediction, [f32; 5], GateDecision), Sys1Error> {
         self.forward_with_gate(input_ids, attention_mask, temps, CONFIDENCE_GATE_THRESHOLD)
     }
+}
+
+/// Resolve a tensor by semantic PyTorch/ONNX name first, falling back to legacy auto-generated ONNX IDs.
+pub fn get_tensor_with_aliases(
+    tensors: &std::collections::HashMap<String, Vec<f32>>,
+    aliases: &[&str],
+    label: &str,
+) -> Result<Vec<f32>, Sys1Error> {
+    for alias in aliases {
+        if let Some(v) = tensors.get(*alias) {
+            return Ok(v.clone());
+        }
+    }
+    Err(Sys1Error::Onnx(format!(
+        "missing {label} (tried {:?})",
+        aliases
+    )))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -1040,5 +1065,24 @@ mod tests {
             select_fallback_outcome(&hits, 4),
             FallbackOutcome::BranchOnLemmas(hits)
         );
+    }
+
+    #[test]
+    fn test_semantic_onnx_initializer_names_and_legacy_fallback() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("enc.blocks.0.attn.qkv.weight".to_string(), vec![1.0, 2.0]);
+        map.insert("onnx::MatMul_254".to_string(), vec![3.0, 4.0]);
+
+        assert_eq!(
+            get_tensor_with_aliases(&map, &["enc.blocks.0.attn.qkv.weight", "onnx::MatMul_238"], "qkv")
+                .unwrap(),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(
+            get_tensor_with_aliases(&map, &["enc.blocks.0.attn.proj.weight", "onnx::MatMul_254"], "proj")
+                .unwrap(),
+            vec![3.0, 4.0]
+        );
+        assert!(get_tensor_with_aliases(&map, &["missing.a", "missing.b"], "missing").is_err());
     }
 }
