@@ -10,6 +10,37 @@ The compiled `sheaf` binary carries its own embedded `lean_sys1.onnx`, `tokenize
 - **Deep Best-First Search & Two-Tier Dedup:** Expands subgoals up to `--max-depth` (`4`) and `--max-nodes` (`64`), short-circuiting exact `(tree_hash, canon_subgoal)` duplicates before `Lean-Sys1` and semantic loops (`cos > 0.98`) in `EpisodicCache` after `Lean-Sys1`.
 - **Hybrid Kernel Verifier & Strict Axiom Gate:** Batches single-file probes with per-probe `set_option maxHeartbeats` isolation, evaluates multi-file branches in ephemeral `sheaf_wt_*` worktrees with early cancellation (`--max-workers`), and accepts proofs only under `propext`, `Classical.choice`, and `Quot.sound`.
 
+## Quick Self-Verification Demo (`examples/sheaf_self_verify`)
+
+The repository ships a standalone `import Init` specification workspace at `examples/sheaf_self_verify/` modeling `AxiomGate`, `GateSpec`, and `VfsSpec` invariants with `8` open `sorry` theorems:
+
+```powershell
+# 1. List the 8 open specification invariants (exits 1)
+./target/release/sheaf check examples/sheaf_self_verify
+
+# 2. Prove all 8 invariants cleanly against Lean 4 (exits 0)
+./target/release/sheaf prove examples/sheaf_self_verify
+
+# 3. Optional strict-lint in-place write mode (enforces -DwarningAsError=true)
+./target/release/sheaf prove examples/sheaf_self_verify --write --strict-lint
+```
+
+## Operational Output Modes
+
+- **Interactive TTY (default):** Renders a 12 Hz `indicatif` live branch viewport on `stderr` and collapses each verified theorem into a single permanent scrollback line.
+- **Plain / CI (`--plain` or non-TTY `stderr`):** Disables spinners and ANSI escapes automatically so CI logs stay clean.
+- **Verbose (`-v` / `--verbose`):** Prints the full 5-stage telemetry tree (`Canonicalize`, `Tokenize`, `Lean-Sys1`, `Orion VDB`, `Lean Kernel`) per theorem.
+- **Machine JSON (`--json`):** Silences `stderr` and emits newline-delimited JSON (`NDJSON`) events to `stdout` for editor integrations and benchmark scripts.
+
+## Empirical Benchmark Summary (`v1.8.0`)
+
+| Suite | Scope | Proved | Notes |
+| :--- | :--- | :---: | :--- |
+| Single-module (`Test A1..A5`, `Test B1..B10`) | Arithmetic, `List`, `BinTree`, 3-record associativity | `15 / 15` | Zero `sorryAx` |
+| 4-folder diamond (`Test C1..C5`) | Cross-module `import` composition | `5 / 5` | Per-occurrence `unusedSimpArgs` pruning on `--write` |
+| 4-folder state-machine (`Test D1..D6`) | `structure` + `List` replay + dependent `∃` | `6 / 6` | Dynamic `DirectExecute` to `FallbackToLeJepa` escalation |
+| Self-verification (`examples/sheaf_self_verify`) | `AxiomGate`, `GateSpec`, `VfsSpec` | `8 / 8` | Standalone `import Init` spec |
+
 ## Prerequisites
 
 - **Lean 4.36.0** (`lean` and `lake` on `PATH` via `elan`)

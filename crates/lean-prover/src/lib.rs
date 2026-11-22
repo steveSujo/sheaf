@@ -1021,6 +1021,7 @@ pub struct ProveArgs {
     pub verbose: bool,
     pub plain: bool,
     pub json: bool,
+    pub strict_lint: bool,
 }
 
 impl Default for ProveArgs {
@@ -1038,6 +1039,7 @@ impl Default for ProveArgs {
             verbose: false,
             plain: false,
             json: false,
+            strict_lint: false,
         }
     }
 }
@@ -1172,6 +1174,7 @@ impl ProveArgs {
                 "-v" | "--verbose" => parsed.verbose = true,
                 "--plain" => parsed.plain = true,
                 "--json" => parsed.json = true,
+                "--strict-lint" => parsed.strict_lint = true,
                 "--help" | "-h" => return Err("__HELP__".to_string()),
                 unknown if unknown.starts_with("--") => {
                     return Err(format!(
@@ -1200,6 +1203,7 @@ pub struct ProverConfig {
     pub verbose: bool,
     pub plain: bool,
     pub json: bool,
+    pub strict_lint: bool,
 }
 
 pub type ProveOptions = ProverConfig;
@@ -1224,6 +1228,7 @@ impl From<&ProveArgs> for ProverConfig {
             verbose: args.verbose,
             plain: args.plain,
             json: args.json,
+            strict_lint: args.strict_lint,
         }
     }
 }
@@ -1428,7 +1433,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
             if fast_candidates.is_empty() {
                 (None, String::new(), Vec::new())
             } else {
-                kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
+                kernel_eval::verify_candidates_batched_with_options_and_ui(
                     &eval_src,
                     thm,
                     &full_name,
@@ -1437,6 +1442,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     options.max_heartbeats,
                     &ui,
                     0,
+                    options.write_in_place,
+                    options.strict_lint && options.write_in_place,
                 )?
             }
         } else {
@@ -1494,7 +1501,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
             if !fallback_candidates.is_empty() {
                 let (fb_solved, fb_diag, fb_unsolved) =
-                    kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
+                    kernel_eval::verify_candidates_batched_with_options_and_ui(
                         &eval_src,
                         thm,
                         &full_name,
@@ -1503,6 +1510,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         options.max_heartbeats,
                         &ui,
                         tried_scripts.len(),
+                        options.write_in_place,
+                        options.strict_lint && options.write_in_place,
                     )?;
                 solved = fb_solved;
                 if !fb_diag.is_empty() {
@@ -1608,7 +1617,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         max_nodes: options.max_nodes,
                     });
                     let (step_solved, step_diag, step_unsolved) =
-                        kernel_eval::verify_candidates_batched_with_heartbeats_and_ui(
+                        kernel_eval::verify_candidates_batched_with_options_and_ui(
                             &cur_src,
                             thm,
                             &full_name,
@@ -1617,6 +1626,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
                             options.max_heartbeats,
                             &ui,
                             tried_scripts.len() + node.id * 4,
+                            options.write_in_place,
+                            options.strict_lint && options.write_in_place,
                         )
                         .map_err(|e| e.to_string())?;
 
@@ -1993,11 +2004,8 @@ fn synthesize_from_model_and_vdb(
             bucket_atomic.push(vec![format!(
                 "fun_cases {primary_def} {v0} {v1} <;> fun_cases {primary_def} {v1} {v2} <;> simp_all [{defs_list}] <;> all_goals (try ({cases_prefix}; dsimp only at *; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))))"
             )]);
-            bucket_atomic.push(vec![format!(
-                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | omega | (split <;> try dsimp only))"
-            )]);
-            bucket_atomic.push(vec![format!(
-                "{cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | intro _ | omega | (split <;> try dsimp only) | (congr 1; all_goals omega))"
+            bucket_have.push(vec![format!(
+                "set_option maxHeartbeats 50000 in ({cases_prefix}; unfold {defs_list}; dsimp only; repeat (first | rfl | omega | (split <;> try dsimp only)))"
             )]);
         } else {
             // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
@@ -2590,7 +2598,7 @@ fn cli_help_text() -> String {
         "sheaf ",
         env!("CARGO_PKG_VERSION"),
         "\n\nUsage:\n",
-        "  sheaf prove <PATH> [--write] [-v|--verbose] [--plain] [--json] [--gate-pct <0..100>] [--max-branches <N>=4]\n",
+        "  sheaf prove <PATH> [--write] [--strict-lint] [-v|--verbose] [--plain] [--json] [--gate-pct <0..100>] [--max-branches <N>=4]\n",
         "                     [--premise-tau <0..1>] [--max-depth <1..16>=4] [--max-nodes <1..1024>=64] [--max-workers <1..8>=2] [--max-heartbeats <N>=200000]\n",
         "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
         "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
@@ -3881,5 +3889,30 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
         let updated_inline = replace_theorem_sorry(inline, "inline_sorry", "  rfl");
         assert!(updated_inline.contains(":= by \n  rfl\n"));
         assert!(!updated_inline.contains("sorry\n"));
+    }
+
+    #[test]
+    fn test_strict_lint_flag_parsing() {
+        let parsed = ProveArgs::try_from_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            ".".into(),
+            "--write".into(),
+            "--strict-lint".into(),
+        ])
+        .unwrap();
+        assert!(parsed.write && parsed.strict_lint);
+    }
+
+    #[test]
+    fn test_examples_sheaf_self_verify_discovers_and_proves() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let example_dir = manifest_dir.join("../../examples/sheaf_self_verify");
+        let found = discover_sorry_theorems(&example_dir).expect("discover self_verify");
+        assert_eq!(found.len(), 8, "expected 8 open invariants in examples/sheaf_self_verify");
+        let summary = prove_lean_path(&example_dir, false).expect("prove self_verify");
+        assert_eq!(summary.discovered, 8);
+        assert_eq!(summary.proved, 8, "failed: {:?}", summary.failed_theorems);
+        assert_eq!(summary.failed, 0);
     }
 }
