@@ -78,7 +78,7 @@ impl KernelBackend for BatchLeanCliBackend {
 pub(crate) fn run_lean_json_with_strict(
     file: &Path,
     lake_root: Option<&Path>,
-    strict_lint: bool,
+    _strict_lint: bool,
 ) -> Result<std::process::Output, ProverError> {
     let mut cmd = if let Some(root) = lake_root {
         let mut c = std::process::Command::new("lake");
@@ -90,13 +90,10 @@ pub(crate) fn run_lean_json_with_strict(
         c.arg("--json");
         c
     };
-    if strict_lint {
-        cmd.args([
-            "-DwarningAsError=true",
-            "-Dlinter.unusedVariables=true",
-            "-Dlinter.unusedSimpArgs=true",
-        ]);
-    }
+    cmd.args([
+        "-Dlinter.unusedVariables=true",
+        "-Dlinter.unusedSimpArgs=true",
+    ]);
     cmd.arg(file)
         .output()
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
@@ -138,6 +135,66 @@ pub fn audit_single_candidate(
     Ok(res)
 }
 
+fn is_decl_boundary_line(trimmed: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "theorem ",
+        "lemma ",
+        "private theorem ",
+        "private lemma ",
+        "protected theorem ",
+        "protected lemma ",
+        "def ",
+        "private def ",
+        "inductive ",
+        "structure ",
+        "class ",
+        "instance ",
+        "namespace ",
+        "section ",
+        "end ",
+        "/--",
+        "#print axioms ",
+    ];
+    PREFIXES.iter().any(|p| trimmed.starts_with(p))
+}
+
+fn target_theorem_line_span(audit_src: &str, thm_name: &str) -> (usize, usize) {
+    let lines: Vec<&str> = audit_src.lines().collect();
+    let mut start_line: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        for kw in ["theorem ", "lemma "] {
+            if let Some(pos) = trimmed.find(kw) {
+                let after_kw = trimmed[pos + kw.len()..].trim_start();
+                if let Some(rest) = after_kw.strip_prefix(thm_name) {
+                    let boundary_ok = rest.is_empty()
+                        || rest.starts_with(|c: char| {
+                            c.is_whitespace() || matches!(c, ':' | '(' | '{' | '[')
+                        });
+                    if boundary_ok {
+                        start_line = Some(idx + 1);
+                        break;
+                    }
+                }
+            }
+        }
+        if start_line.is_some() {
+            break;
+        }
+    }
+    let Some(start) = start_line else {
+        return (1, lines.len().max(1));
+    };
+    let mut end = lines.len();
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        if is_decl_boundary_line(line.trim_start()) {
+            end = idx;
+            break;
+        }
+    }
+    (start, end.max(start))
+}
+
 fn audit_single_candidate_raw(
     src: &str,
     thm_name: &str,
@@ -165,6 +222,7 @@ fn audit_single_candidate_raw(
     let out = run_lean_json_with_strict(&tmp_file, lake_root, strict_lint)?;
     let _ = std::fs::remove_file(&tmp_file);
 
+    let (thm_start_line, thm_end_line) = target_theorem_line_span(&audit, thm_name);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut has_error = false;
     let mut illegal_axiom: Option<String> = None;
@@ -178,6 +236,20 @@ fn audit_single_candidate_raw(
                 has_error = true;
                 if first_error_msg.is_none() && !data.is_empty() {
                     first_error_msg = Some(data.to_string());
+                }
+            } else if strict_lint && sev == "warning" {
+                let line_num = v
+                    .get("pos")
+                    .and_then(|p| p.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| l as usize);
+                let in_target_span =
+                    line_num.is_some_and(|l| (thm_start_line..=thm_end_line).contains(&l));
+                if in_target_span && !data.is_empty() {
+                    has_error = true;
+                    if first_error_msg.is_none() {
+                        first_error_msg = Some(format!("strict-lint warning in {thm_name}: {data}"));
+                    }
                 }
             }
             if (data.contains("depends on axioms:")
@@ -1145,6 +1217,43 @@ theorem strict_reject (unused_n : Nat) : 0 = 0 := by
             solved.is_none(),
             "strict_lint must reject unprunable unusedVariables warning, got: {solved:?} ({diag})"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_strict_lint_ignores_sorry_warnings_in_other_theorems() {
+        let dir = std::env::temp_dir().join("lean_prover_strict_lint_multitheorem_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("MultiTheorem.lean");
+        let src = "\
+import Init
+theorem thm_one (n : Nat) : n + 0 = n := by
+  sorry
+
+theorem thm_two (m : Nat) : m = m := by
+  sorry
+";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![vec!["simp [Nat.add_zero, Nat.mul_comm]".to_string()]];
+        let (solved, diag, _) = verify_candidates_batched_with_options_and_ui(
+            src,
+            &thms[0],
+            "thm_one",
+            &cands,
+            None,
+            200_000,
+            &UiHandle::noop(),
+            0,
+            true,
+            true,
+        )
+        .unwrap();
+        let (_, script) = solved.unwrap_or_else(|| {
+            panic!("strict_lint must ignore sorry warnings in thm_two, got diag: {diag}")
+        });
+        assert_eq!(script, vec!["simp [Nat.add_zero]".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
