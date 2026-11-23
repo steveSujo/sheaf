@@ -2661,10 +2661,20 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             } else {
                 "none (using embedded assets)"
             };
+            let banner_raw = concat!(
+                "..######::'##::::'##:'########::::'###::::'########:\n",
+                "'##... ##: ##:::: ##: ##.....::::'## ##::: ##.....::\n",
+                " ##:::..:: ##:::: ##: ##::::::::'##:. ##:: ##:::::::\n",
+                ". ######:: #########: ######:::'##:::. ##: ######:::\n",
+                ":..... ##: ##.... ##: ##...:::: #########: ##...::::\n",
+                "'##::: ##: ##:::: ##: ##::::::: ##.... ##: ##:::::::\n",
+                ". ######:: ##:::: ##: ########: ##:::: ##: ##:::::::\n",
+                ":......:::..:::::..::........::..:::::..::..::::::::\n"
+            );
             Ok((
                 0,
                 format!(
-                    "lean: {lean_ver}\nembedded_model: true (lean_sys1.onnx={} bytes)\nartifacts_override: {override_status}",
+                    "{banner_raw}\nlean: {lean_ver}\nembedded_model: true (lean_sys1.onnx={} bytes)\nartifacts_override: {override_status}",
                     emb.lean_sys1_onnx.len()
                 ),
             ))

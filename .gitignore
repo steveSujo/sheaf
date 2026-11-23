@@ -1,16 +1,6 @@
-# Rough works
-.agents/
-tasks/
-LEAN4_COMPOSER_SPEC.md
-M2_COLAB_TRAINING_SPEC.md
-AGENTS.md
-ROADMAP.md
-CORE_ARCHITECTURE.md
-
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Python / uv / Training
 .venv/
