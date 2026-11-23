@@ -75,23 +75,31 @@ impl KernelBackend for BatchLeanCliBackend {
     }
 }
 
-pub(crate) fn run_lean_json(
+pub(crate) fn run_lean_json_with_strict(
     file: &Path,
     lake_root: Option<&Path>,
+    strict_lint: bool,
 ) -> Result<std::process::Output, ProverError> {
-    if let Some(root) = lake_root {
-        std::process::Command::new("lake")
-            .args(["env", "lean", "--json"])
-            .arg(file)
-            .current_dir(root)
-            .output()
+    let mut cmd = if let Some(root) = lake_root {
+        let mut c = std::process::Command::new("lake");
+        c.args(["env", "lean", "--json"]);
+        c.current_dir(root);
+        c
     } else {
-        std::process::Command::new("lean")
-            .arg("--json")
-            .arg(file)
-            .output()
+        let mut c = std::process::Command::new("lean");
+        c.arg("--json");
+        c
+    };
+    if strict_lint {
+        cmd.args([
+            "-DwarningAsError=true",
+            "-Dlinter.unusedVariables=true",
+            "-Dlinter.unusedSimpArgs=true",
+        ]);
     }
-    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
+    cmd.arg(file)
+        .output()
+        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
 }
 
 pub(crate) fn spawn_lean_json_piped(
@@ -125,7 +133,8 @@ pub fn audit_single_candidate(
     script: &[String],
     lake_root: Option<&Path>,
 ) -> Result<Result<String, String>, ProverError> {
-    let (res, _, _) = audit_single_candidate_raw(src, thm_name, full_name, script, lake_root)?;
+    let (res, _, _, _) =
+        audit_single_candidate_raw(src, thm_name, full_name, script, lake_root, false)?;
     Ok(res)
 }
 
@@ -135,7 +144,8 @@ fn audit_single_candidate_raw(
     full_name: &str,
     script: &[String],
     lake_root: Option<&Path>,
-) -> Result<(Result<String, String>, String, String), ProverError> {
+    strict_lint: bool,
+) -> Result<(Result<String, String>, String, String, String), ProverError> {
     let body = script
         .iter()
         .map(|l| format!("  {l}"))
@@ -152,7 +162,7 @@ fn audit_single_candidate_raw(
     let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
     std::fs::write(&tmp_file, &audit)
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-    let out = run_lean_json(&tmp_file, lake_root)?;
+    let out = run_lean_json_with_strict(&tmp_file, lake_root, strict_lint)?;
     let _ = std::fs::remove_file(&tmp_file);
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -180,7 +190,7 @@ fn audit_single_candidate_raw(
     }
 
     if out.status.success() && !has_error && illegal_axiom.is_none() {
-        Ok((Ok(candidate_src), audit, stdout))
+        Ok((Ok(candidate_src), body, audit, stdout))
     } else {
         let diag = illegal_axiom
             .or(first_error_msg)
@@ -191,28 +201,37 @@ fn audit_single_candidate_raw(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "kernel rejected".to_string());
-        Ok((Err(diag), audit, stdout))
+        Ok((Err(diag), body, audit, stdout))
     }
 }
 
-fn extract_span_text(src: &str, pos_line: usize, pos_col: usize, end_line: usize, end_col: usize) -> Option<String> {
-    if pos_line == 0 || end_line < pos_line {
+fn char_col_to_byte(line: &str, col: usize) -> usize {
+    line.chars().take(col).map(char::len_utf8).sum()
+}
+
+fn line_col_to_byte_offset(src: &str, line_1based: usize, col_0based: usize) -> Option<usize> {
+    if line_1based == 0 {
         return None;
     }
-    let lines: Vec<&str> = src.lines().collect();
-    if pos_line == end_line {
-        let line = lines.get(pos_line - 1)?;
-        let start = pos_col.min(line.len());
-        let end = end_col.min(line.len());
-        if start < end {
-            return Some(line[start..end].trim().to_string());
+    let mut offset = 0usize;
+    for (idx, raw_line) in src.split_inclusive('\n').enumerate() {
+        if idx + 1 == line_1based {
+            let line_no_nl = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            return Some(offset + char_col_to_byte(line_no_nl, col_0based));
         }
+        offset += raw_line.len();
     }
     None
 }
 
-fn collect_unused_simp_args(audit_src: &str, stdout: &str) -> Vec<String> {
-    let mut unused = Vec::new();
+#[derive(Debug, Clone)]
+struct UnusedSimpOccurrence {
+    abs_start: Option<usize>,
+    ident: String,
+}
+
+fn collect_unused_simp_occurrences(audit_src: &str, stdout: &str) -> Vec<UnusedSimpOccurrence> {
+    let mut out = Vec::new();
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -224,56 +243,99 @@ fn collect_unused_simp_args(audit_src: &str, stdout: &str) -> Vec<String> {
         if !data.contains("This simp argument is unused") && !data.contains("unusedSimpArgs") {
             continue;
         }
-        let span_ident = v.get("pos").and_then(|p| {
+        let span_info = v.get("pos").and_then(|p| {
             let pl = p.get("line")?.as_u64()? as usize;
             let pc = p.get("column")?.as_u64()? as usize;
             let ep = v.get("endPos")?;
             let el = ep.get("line")?.as_u64()? as usize;
             let ec = ep.get("column")?.as_u64()? as usize;
-            extract_span_text(audit_src, pl, pc, el, ec)
+            let abs_start = line_col_to_byte_offset(audit_src, pl, pc)?;
+            let abs_end = line_col_to_byte_offset(audit_src, el, ec)?;
+            if abs_start < abs_end && abs_end <= audit_src.len() {
+                Some((abs_start, audit_src[abs_start..abs_end].trim().to_string()))
+            } else {
+                None
+            }
         });
-        let arg = span_ident.or_else(|| {
-            let start = data.find('`')? + 1;
-            let end = data[start..].find('`')?;
-            Some(data[start..start + end].trim().to_string())
-        });
-        if let Some(a) = arg
-            && !a.is_empty()
-            && !unused.contains(&a)
-        {
-            unused.push(a);
-        }
+        let (abs_start, ident) = match span_info {
+            Some((s, id)) if !id.is_empty() => (Some(s), id),
+            _ => {
+                let fallback = data.find('`').and_then(|s| {
+                    let rest = &data[s + 1..];
+                    let e = rest.find('`')?;
+                    Some(rest[..e].trim().to_string())
+                });
+                match fallback {
+                    Some(id) if !id.is_empty() => (None, id),
+                    _ => continue,
+                }
+            }
+        };
+        out.push(UnusedSimpOccurrence { abs_start, ident });
     }
-    unused
+    out
 }
 
-fn strip_unused_args_from_simp_line(line: &str, unused: &[String]) -> String {
-    let mut out = line.to_string();
+fn prune_unused_simp_args_by_span(
+    body: &str,
+    audit_src: &str,
+    occurrences: &[UnusedSimpOccurrence],
+) -> String {
+    let body_offset = audit_src.find(body);
+    let mut out = body.to_string();
+
+    // Collect all `simp [` and `simp_all [` bracket ranges in `body` from back to front so
+    // replacing a range never shifts earlier offsets.
+    let mut brackets: Vec<(usize, usize, &'static str)> = Vec::new();
     for kw in ["simp_all [", "simp ["] {
         let mut search_from = 0usize;
-        while let Some(rel) = out[search_from..].find(kw) {
+        while let Some(rel) = body[search_from..].find(kw) {
             let kw_start = search_from + rel;
-            let bracket_open = kw_start + kw.len() - 1;
-            let Some(close_rel) = out[bracket_open + 1..].find(']') else {
-                break;
-            };
-            let bracket_close = bracket_open + 1 + close_rel;
-            let inner = &out[bracket_open + 1..bracket_close];
-            let kept: Vec<&str> = inner
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty() && !unused.iter().any(|u| u == item))
-                .collect();
-            let kw_name = kw.trim_end_matches(" [");
-            let replacement = if kept.is_empty() {
-                kw_name.to_string()
+            let open_idx = kw_start + kw.len() - 1;
+            if let Some(close_rel) = body[open_idx + 1..].find(']') {
+                let close_idx = open_idx + 1 + close_rel;
+                brackets.push((kw_start, close_idx, kw));
+                search_from = close_idx + 1;
             } else {
-                format!("{kw_name} [{}]", kept.join(", "))
-            };
-            out.replace_range(kw_start..=bracket_close, &replacement);
-            search_from = kw_start + replacement.len();
+                break;
+            }
         }
     }
+    brackets.sort_by_key(|b| std::cmp::Reverse(b.0));
+
+    for (kw_start, close_idx, kw) in brackets {
+        let open_idx = kw_start + kw.len() - 1;
+        let mut local_unused: Vec<&str> = Vec::new();
+        for occ in occurrences {
+            let matches_here = match (occ.abs_start, body_offset) {
+                (Some(abs), Some(base)) if abs >= base => {
+                    let rel = abs - base;
+                    rel > open_idx && rel < close_idx
+                }
+                _ => true,
+            };
+            if matches_here && !local_unused.contains(&occ.ident.as_str()) {
+                local_unused.push(occ.ident.as_str());
+            }
+        }
+        if local_unused.is_empty() {
+            continue;
+        }
+        let inner = &out[open_idx + 1..close_idx];
+        let kept: Vec<&str> = inner
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty() && !local_unused.contains(item))
+            .collect();
+        let kw_name = kw.trim_end_matches(" [");
+        let replacement = if kept.is_empty() {
+            kw_name.to_string()
+        } else {
+            format!("{kw_name} [{}]", kept.join(", "))
+        };
+        out.replace_range(kw_start..=close_idx, &replacement);
+    }
+
     out
 }
 
@@ -283,9 +345,11 @@ fn audit_and_prune_unused_simp_args(
     full_name: &str,
     script: &[String],
     lake_root: Option<&Path>,
+    prune_unused_simp: bool,
+    strict_lint: bool,
 ) -> Result<Result<(String, Vec<String>), String>, ProverError> {
-    let (res, audit_src, stdout) =
-        audit_single_candidate_raw(src, thm_name, full_name, script, lake_root)?;
+    let (res, body, audit_src, stdout) =
+        audit_single_candidate_raw(src, thm_name, full_name, script, lake_root, false)?;
     let Ok(cand_src) = res else {
         return Ok(Err(res.unwrap_err()));
     };
@@ -293,29 +357,50 @@ fn audit_and_prune_unused_simp_args(
     let has_simp_list = script
         .iter()
         .any(|l| l.contains("simp [") || l.contains("simp_all ["));
-    if !has_simp_list {
+    if !prune_unused_simp || !has_simp_list {
+        if strict_lint {
+            let (strict_res, _, _, _) = audit_single_candidate_raw(
+                src, thm_name, full_name, script, lake_root, true,
+            )?;
+            return Ok(strict_res.map(|s| (s, script.to_vec())));
+        }
         return Ok(Ok((cand_src, script.to_vec())));
     }
 
-    let unused = collect_unused_simp_args(&audit_src, &stdout);
-    if unused.is_empty() {
+    let occurrences = collect_unused_simp_occurrences(&audit_src, &stdout);
+    if occurrences.is_empty() {
+        if strict_lint {
+            let (strict_res, _, _, _) = audit_single_candidate_raw(
+                src, thm_name, full_name, script, lake_root, true,
+            )?;
+            return Ok(strict_res.map(|s| (s, script.to_vec())));
+        }
         return Ok(Ok((cand_src, script.to_vec())));
     }
 
-    let pruned_script: Vec<String> = script
-        .iter()
-        .map(|l| strip_unused_args_from_simp_line(l, &unused))
+    let pruned_body = prune_unused_simp_args_by_span(&body, &audit_src, &occurrences);
+    let pruned_script: Vec<String> = pruned_body
+        .lines()
+        .map(|l| l.strip_prefix("  ").unwrap_or(l).to_string())
         .collect();
+
     if pruned_script == script {
         return Ok(Ok((cand_src, script.to_vec())));
     }
 
-    let (re_res, re_audit, re_stdout) =
-        audit_single_candidate_raw(src, thm_name, full_name, &pruned_script, lake_root)?;
-    if let Ok(pruned_src) = re_res
-        && collect_unused_simp_args(&re_audit, &re_stdout).is_empty()
-    {
-        return Ok(Ok((pruned_src, pruned_script)));
+    let (re_res, _, re_audit, re_stdout) = audit_single_candidate_raw(
+        src,
+        thm_name,
+        full_name,
+        &pruned_script,
+        lake_root,
+        strict_lint,
+    )?;
+    if let Ok(pruned_src) = re_res {
+        let remaining = collect_unused_simp_occurrences(&re_audit, &re_stdout);
+        if remaining.len() < occurrences.len() {
+            return Ok(Ok((pruned_src, pruned_script)));
+        }
     }
 
     Ok(Ok((cand_src, script.to_vec())))
@@ -381,6 +466,34 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
     ui: &UiHandle,
     branch_offset: usize,
 ) -> Result<BatchedVerifyResult, ProverError> {
+    verify_candidates_batched_with_options_and_ui(
+        src,
+        thm,
+        full_name,
+        candidates,
+        lake_root,
+        max_heartbeats,
+        ui,
+        branch_offset,
+        false,
+        false,
+    )
+}
+
+/// Evaluate candidate scripts in batches of 8 with optional `--write`-gated `unusedSimpArgs` pruning and `--strict-lint`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_candidates_batched_with_options_and_ui(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    full_name: &str,
+    candidates: &[Vec<String>],
+    lake_root: Option<&Path>,
+    max_heartbeats: usize,
+    ui: &UiHandle,
+    branch_offset: usize,
+    prune_unused_simp: bool,
+    strict_lint: bool,
+) -> Result<BatchedVerifyResult, ProverError> {
     let mut last_diag = String::from("model produced no valid kernel-verified tactic");
     let mut unsolved_diags: Vec<(Vec<String>, String)> = Vec::new();
     if candidates.is_empty() {
@@ -403,7 +516,15 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
                 elapsed_ms: 0,
             });
             let t0 = Instant::now();
-            match audit_and_prune_unused_simp_args(src, &thm.name, full_name, script, lake_root)? {
+            match audit_and_prune_unused_simp_args(
+                src,
+                &thm.name,
+                full_name,
+                script,
+                lake_root,
+                prune_unused_simp,
+                strict_lint,
+            )? {
                 Ok((cand_src, final_script)) => {
                     ui.send(UiEvent::BranchUpdated {
                         id: branch_id,
@@ -557,6 +678,8 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
                         full_name,
                         script,
                         lake_root,
+                        prune_unused_simp,
+                        strict_lint,
                     )? {
                         Ok((cand_src, final_script)) => {
                             let elapsed_ms = batch_start.elapsed().as_millis() as u64;
@@ -610,6 +733,8 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
                     full_name,
                     script,
                     lake_root,
+                    prune_unused_simp,
+                    strict_lint,
                 )? {
                     Ok((cand_src, final_script)) => {
                         let elapsed_ms = batch_start.elapsed().as_millis() as u64;
@@ -930,7 +1055,7 @@ mod tests {
         std::fs::write(&f, src).unwrap();
         let thms = discover_sorry_theorems(&f).unwrap();
         let cands = vec![vec!["simp [Nat.add_comm, Nat.mul_comm]".to_string()]];
-        let (solved, diag, _) = verify_candidates_batched_with_heartbeats_and_ui(
+        let (solved, diag, _) = verify_candidates_batched_with_options_and_ui(
             src,
             &thms[0],
             "zero_id_prune",
@@ -939,11 +1064,52 @@ mod tests {
             200_000,
             &UiHandle::noop(),
             0,
+            true,
+            true,
         )
         .unwrap();
         let (_, script) =
             solved.unwrap_or_else(|| panic!("expected verified proof, got diag: {diag}"));
         assert_eq!(script, vec!["simp".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_per_occurrence_unused_simp_args_in_multi_branch_tactic() {
+        let dir = std::env::temp_dir().join("lean_prover_v180_per_occ_prune");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("MultiBranchPrune.lean");
+        let src = "\
+import Init
+theorem branch_simp_prune (n : Nat) (h : n = 0) : n + 0 = 0 ∧ 0 + n = 0 := by
+  sorry
+";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        // First branch does not need Nat.mul_comm; second branch does not need Nat.mul_assoc
+        let cands = vec![vec![
+            "constructor; simp [h, Nat.mul_comm]; simp [h, Nat.mul_assoc]".to_string(),
+        ]];
+        let (solved, diag, _) = verify_candidates_batched_with_options_and_ui(
+            src,
+            &thms[0],
+            "branch_simp_prune",
+            &cands,
+            None,
+            200_000,
+            &UiHandle::noop(),
+            0,
+            true,
+            true,
+        )
+        .unwrap();
+        let (_, script) =
+            solved.unwrap_or_else(|| panic!("expected strict-lint clean proof, got diag: {diag}"));
+        assert!(
+            !script[0].contains("Nat.mul_comm") && !script[0].contains("Nat.mul_assoc"),
+            "expected unused simp args stripped per occurrence: {script:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
