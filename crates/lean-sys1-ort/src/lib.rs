@@ -1162,22 +1162,30 @@ mod tests {
         let (pred_a, choice_a, _) = sess.forward(&ids_a, &mask, &temps).unwrap();
 
         let ref_state_prefix = [
-            -0.0259715_f32,
-            0.5952697,
-            0.9862621,
-            0.8247418,
-            -0.6717533,
-            -0.4550829,
-            -0.596716,
-            -0.7930471,
+            -0.3763532_f32,
+            0.375561,
+            0.2974406,
+            0.4290989,
+            -0.4134203,
+            -0.0010092,
+            2.1205354,
+            -0.308362,
         ];
         for (got, exp) in pred_a.state_emb.iter().zip(ref_state_prefix.iter()) {
             assert!((got - exp).abs() < 1e-4, "state_emb mismatch: got={got}, exp={exp}");
         }
-        let ref_choice = [0.1006087_f32, 0.9398667, -0.5518216, -0.6410031, 1.2079908];
+        let ref_choice = [0.9732162_f32, -0.4440311, -1.0631375, 0.2587234, 0.126083];
         for (got, exp) in choice_a.iter().zip(ref_choice.iter()) {
             assert!((got - exp).abs() < 1e-4, "choice mismatch: got={got}, exp={exp}");
         }
+        let fit_w1_mean = sess.fit_w1.iter().sum::<f32>() / (sess.fit_w1.len() as f32);
+        let fit_w1_var = sess
+            .fit_w1
+            .iter()
+            .map(|&w| (w - fit_w1_mean) * (w - fit_w1_mean))
+            .sum::<f32>()
+            / (sess.fit_w1.len() as f32);
+        assert!(fit_w1_var > 1e-6, "expected trained heads.premise_fit.0.weight, got fallback var={fit_w1_var}");
 
         let mut ids_b = vec![0_i64; 512];
         for (i, &tok) in [2_i64, 15, 10, 3].iter().enumerate() {
