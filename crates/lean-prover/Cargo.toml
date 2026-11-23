@@ -9,6 +9,8 @@ name = "sheaf"
 path = "src/main.rs"
 
 [dependencies]
+console = "0.16.6"
+indicatif = "0.18.6"
 lean-canonicalizer = { path = "../lean-canonicalizer" }
 lean-repl = { path = "../lean-repl" }
 lean-sys1-ort = { path = "../lean-sys1-ort" }

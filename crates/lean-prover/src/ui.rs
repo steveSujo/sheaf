@@ -1,17 +1,17 @@
-//! Event-driven `uv`-style terminal UI for `sheaf`: two-zone `stderr` viewport,
-//! 12.5 FPS (`80 ms`) renderer thread, automatic non-TTY degradation, and `--json` NDJSON mode.
+//! Event-driven `uv`-style terminal UI for `sheaf` backed by `indicatif` + `console`:
+//! two-zone `stderr` viewport, 12 Hz `MultiProgress`, automatic non-TTY degradation, and `--json` NDJSON mode.
 
-use std::io::{IsTerminal, Write};
+use console::{Term, style, truncate_str};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const MAX_VIEWPORT_WIDTH: usize = 78;
 const MAX_BRANCH_ROWS: usize = 6;
 const TICK_MS: u64 = 80;
+const FALLBACK_COLS: usize = 80;
 
 /// Terminal rendering mode selected via CLI flags or `stderr` TTY detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,12 +25,12 @@ pub enum UiMode {
 }
 
 impl UiMode {
-    /// Resolve `Auto` via `std::io::stderr().is_terminal()`.
+    /// Resolve `Auto` via `console::Term::stderr().is_term()`.
     #[must_use]
     pub fn resolve(self) -> Self {
         match self {
             Self::Auto => {
-                if std::io::stderr().is_terminal() {
+                if Term::stderr().is_term() {
                     Self::TtyLive
                 } else {
                     Self::Plain
@@ -158,8 +158,6 @@ struct RendererState {
     nodes: usize,
     max_nodes: usize,
     branches: Vec<BranchRow>,
-    tick: usize,
-    drawn_lines: usize,
 }
 
 impl RendererState {
@@ -193,7 +191,8 @@ impl RendererState {
                 self.route_summary = format!("Sys1: {strategy} ({conf:.2}) -> {gate}");
             }
             UiEvent::Escalated { vdb_hits, tau } => {
-                self.escalated_summary = Some(format!("Escalated: VDB ({vdb_hits} hits, tau={tau:.2})"));
+                self.escalated_summary =
+                    Some(format!("Escalated: VDB ({vdb_hits} hits, tau={tau:.2})"));
             }
             UiEvent::SearchTick {
                 depth,
@@ -238,14 +237,10 @@ impl RendererState {
         }
     }
 
-    fn render_ephemeral_lines(&self) -> Vec<String> {
-        if self.active_name.is_empty() {
-            return Vec::new();
-        }
+    fn format_header_line(&self, max_cols: usize) -> String {
         let elapsed_s = self
             .active_started
             .map_or(0.0, |t| t.elapsed().as_secs_f64());
-        let mut lines = Vec::new();
         let header = if self.max_depth > 0 || self.max_nodes > 0 {
             format!(
                 "  Proving [{}/{}] {} (depth {}/{} · nodes {}/{} · {:.1}s)",
@@ -264,67 +259,85 @@ impl RendererState {
                 self.active_index, self.total_theorems, self.active_name, elapsed_s
             )
         };
-        lines.push(clamp_line(&header, MAX_VIEWPORT_WIDTH));
+        clamp_line(&header, max_cols)
+    }
 
-        if !self.route_summary.is_empty() {
-            let route_line = match &self.escalated_summary {
-                Some(esc) => format!("  ├─ {}  |  {}", self.route_summary, esc),
-                None => format!("  ├─ {}", self.route_summary),
-            };
-            lines.push(clamp_line(&route_line, MAX_VIEWPORT_WIDTH));
+    fn format_route_line(&self, max_cols: usize) -> Option<String> {
+        if self.route_summary.is_empty() {
+            return None;
         }
+        let route_line = match &self.escalated_summary {
+            Some(esc) => format!("  ├─ {}  |  {}", self.route_summary, esc),
+            None => format!("  ├─ {}", self.route_summary),
+        };
+        Some(clamp_line(&route_line, max_cols))
+    }
 
+    #[cfg(test)]
+    fn render_ephemeral_lines(&self, max_cols: usize) -> Vec<String> {
+        if self.active_name.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = vec![self.format_header_line(max_cols)];
+        if let Some(route) = self.format_route_line(max_cols) {
+            lines.push(route);
+        }
         let total_branches = self.branches.len();
         let show_cap = if total_branches > MAX_BRANCH_ROWS {
             MAX_BRANCH_ROWS - 1
         } else {
             total_branches
         };
-        let spin = SPINNER_FRAMES[self.tick % SPINNER_FRAMES.len()];
-
         for (i, row) in self.branches.iter().take(show_cap).enumerate() {
             let is_last = total_branches <= MAX_BRANCH_ROWS && i + 1 == show_cap;
-            let tree_ch = if is_last { "└─" } else { "├─" };
-            let (glyph, detail) = match &row.status {
-                BranchStatus::Queued => ('·', row.preview.clone()),
-                BranchStatus::Running => (spin, row.preview.clone()),
-                BranchStatus::Verified { tactic } => ('✓', tactic.clone()),
-                BranchStatus::Failed { reason } => ('✗', format!("{} ({reason})", row.preview)),
-                BranchStatus::Canceled => ('⊘', format!("{} (canceled)", row.preview)),
-            };
-            let sec = (row.elapsed_ms as f64) / 1000.0;
-            let raw = format!(
-                "  {tree_ch} {glyph} branch #{} [{}] {detail}  {sec:.1}s",
-                row.id, row.tag
-            );
-            lines.push(clamp_line(&raw, MAX_VIEWPORT_WIDTH));
+            lines.push(format_branch_line(row, is_last, max_cols));
         }
         if total_branches > MAX_BRANCH_ROWS {
             let rem = total_branches - show_cap;
-            lines.push(clamp_line(
-                &format!("  └─ … +{rem} more branches"),
-                MAX_VIEWPORT_WIDTH,
-            ));
+            lines.push(clamp_line(&format!("  └─ … +{rem} queued"), max_cols));
         }
-
         lines
     }
 }
 
-/// Clamp a line to at most `max_chars` characters so terminal wrapping cannot corrupt cursor-up math.
+fn term_width_cap() -> usize {
+    let cols = Term::stderr().size().1 as usize;
+    if cols == 0 {
+        FALLBACK_COLS.saturating_sub(2)
+    } else {
+        cols.saturating_sub(2).max(20)
+    }
+}
+
+/// Clamp a line to at most `max_chars` characters using `console::truncate_str` so wrapped lines never break `MultiProgress`.
 #[must_use]
 pub fn clamp_line(s: &str, max_chars: usize) -> String {
     let single_line = s.replace(['\r', '\n'], " ");
-    let count = single_line.chars().count();
-    if count <= max_chars {
-        single_line
-    } else if max_chars <= 1 {
-        "…".to_string()
+    truncate_str(&single_line, max_chars.max(1), "…").into_owned()
+}
+
+fn format_branch_line(row: &BranchRow, is_last: bool, max_cols: usize) -> String {
+    let tree_ch = if is_last { "└─" } else { "├─" };
+    let sec = (row.elapsed_ms as f64) / 1000.0;
+    let (glyph, detail) = match &row.status {
+        BranchStatus::Queued => ("·", row.preview.clone()),
+        BranchStatus::Running => ("", row.preview.clone()),
+        BranchStatus::Verified { tactic } => ("✓", tactic.clone()),
+        BranchStatus::Failed { reason } => ("✗", format!("{} ({reason})", row.preview)),
+        BranchStatus::Canceled => ("⊘", format!("{} (canceled)", row.preview)),
+    };
+    let raw = if glyph.is_empty() {
+        format!(
+            "  {tree_ch} branch #{} [{}] {detail}  {sec:.1}s",
+            row.id, row.tag
+        )
     } else {
-        let mut out: String = single_line.chars().take(max_chars - 1).collect();
-        out.push('…');
-        out
-    }
+        format!(
+            "  {tree_ch} {glyph} branch #{} [{}] {detail}  {sec:.1}s",
+            row.id, row.tag
+        )
+    };
+    clamp_line(&raw, max_cols)
 }
 
 /// Format a single permanent scrollback line for a finished theorem.
@@ -350,6 +363,33 @@ pub fn format_theorem_scrollback_line(
     format!("  {glyph} {short_name:<28} {route_label:<24} {sec:>5.1}s  {tail}")
 }
 
+fn format_styled_scrollback_line(
+    name: &str,
+    proved: bool,
+    route_label: &str,
+    tactic: Option<&str>,
+    diag: Option<&str>,
+    elapsed_ms: u64,
+) -> String {
+    let glyph = if proved {
+        style("✓").green().bold().to_string()
+    } else {
+        style("✗").red().bold().to_string()
+    };
+    let sec = (elapsed_ms as f64) / 1000.0;
+    let short_name = clamp_line(name, 28);
+    let route_styled = style(format!("{route_label:<24}")).dim().to_string();
+    let time_styled = style(format!("{sec:>5.1}s")).dim().to_string();
+    let tail = if proved {
+        let t = tactic.unwrap_or("done");
+        format!("[{}]", clamp_line(t, 48))
+    } else {
+        let d = diag.unwrap_or("failed");
+        style(format!("[{}]", clamp_line(d, 48))).red().to_string()
+    };
+    format!("  {glyph} {short_name:<28} {route_styled} {time_styled}  {tail}")
+}
+
 /// Format the final workspace summary footer line.
 #[must_use]
 pub fn format_workspace_footer(
@@ -365,7 +405,119 @@ pub fn format_workspace_footer(
     )
 }
 
-/// Active UI session owning the background renderer thread and `Drop` cursor-restore guard.
+struct LiveBars {
+    mp: Arc<MultiProgress>,
+    header: Option<ProgressBar>,
+    route: Option<ProgressBar>,
+    branches: Vec<(usize, ProgressBar)>,
+    overflow: Option<ProgressBar>,
+}
+
+impl LiveBars {
+    fn new(mode: UiMode) -> Self {
+        let draw_target = if mode == UiMode::TtyLive {
+            ProgressDrawTarget::stderr_with_hz(12)
+        } else {
+            ProgressDrawTarget::hidden()
+        };
+        Self {
+            mp: Arc::new(MultiProgress::with_draw_target(draw_target)),
+            header: None,
+            route: None,
+            branches: Vec::new(),
+            overflow: None,
+        }
+    }
+
+    fn sync_from_state(&mut self, mode: UiMode, state: &RendererState) {
+        if mode != UiMode::TtyLive || state.active_name.is_empty() {
+            return;
+        }
+        let max_cols = term_width_cap();
+        let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]);
+        let plain_style = ProgressStyle::with_template("{msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
+
+        let hdr_msg = state.format_header_line(max_cols);
+        let hdr = self.header.get_or_insert_with(|| {
+            let pb = self.mp.add(ProgressBar::new_spinner());
+            pb.set_style(spinner_style.clone());
+            pb.enable_steady_tick(Duration::from_millis(TICK_MS));
+            pb
+        });
+        hdr.set_message(hdr_msg);
+
+        if let Some(route_msg) = state.format_route_line(max_cols) {
+            let rpb = self.route.get_or_insert_with(|| {
+                let pb = self.mp.add(ProgressBar::new_spinner());
+                pb.set_style(plain_style.clone());
+                pb
+            });
+            rpb.set_message(route_msg);
+        }
+
+        let total_branches = state.branches.len();
+        let show_cap = if total_branches > MAX_BRANCH_ROWS {
+            MAX_BRANCH_ROWS - 1
+        } else {
+            total_branches
+        };
+
+        for (i, row) in state.branches.iter().take(show_cap).enumerate() {
+            let is_last = total_branches <= MAX_BRANCH_ROWS && i + 1 == show_cap;
+            let msg = format_branch_line(row, is_last, max_cols);
+            let pb = if let Some((_, existing)) = self.branches.iter().find(|(id, _)| *id == row.id)
+            {
+                existing
+            } else {
+                let new_pb = self.mp.add(ProgressBar::new_spinner());
+                new_pb.enable_steady_tick(Duration::from_millis(TICK_MS));
+                self.branches.push((row.id, new_pb));
+                &self.branches.last().expect("just pushed").1
+            };
+            if matches!(row.status, BranchStatus::Running | BranchStatus::Queued) {
+                pb.set_style(spinner_style.clone());
+            } else {
+                pb.set_style(plain_style.clone());
+                pb.disable_steady_tick();
+            }
+            pb.set_message(msg);
+        }
+
+        if total_branches > MAX_BRANCH_ROWS {
+            let rem = total_branches - show_cap;
+            let ov_msg = clamp_line(&format!("  └─ … +{rem} queued"), max_cols);
+            let ov = self.overflow.get_or_insert_with(|| {
+                let pb = self.mp.add(ProgressBar::new_spinner());
+                pb.set_style(plain_style.clone());
+                pb
+            });
+            ov.set_message(ov_msg);
+        } else if let Some(ov) = self.overflow.take() {
+            ov.finish_and_clear();
+        }
+    }
+
+    fn clear_active(&mut self) {
+        if let Some(ov) = self.overflow.take() {
+            ov.finish_and_clear();
+        }
+        for (_, pb) in self.branches.drain(..) {
+            pb.finish_and_clear();
+        }
+        if let Some(r) = self.route.take() {
+            r.finish_and_clear();
+        }
+        if let Some(h) = self.header.take() {
+            h.finish_and_clear();
+        }
+        let _ = self.mp.clear();
+    }
+}
+
+/// Active UI session owning the background renderer thread.
 pub struct UiSession {
     mode: UiMode,
     tx: Option<Sender<UiEvent>>,
@@ -376,7 +528,7 @@ pub struct UiSession {
 }
 
 impl UiSession {
-    /// Start a UI session in the requested mode (`Auto` checks `stderr().is_terminal()`).
+    /// Start a UI session in the requested mode (`Auto` checks `console::Term::stderr().is_term()`).
     #[must_use]
     pub fn start(requested_mode: UiMode) -> Self {
         let mode = requested_mode.resolve();
@@ -391,55 +543,33 @@ impl UiSession {
 
         let join = std::thread::spawn(move || {
             let mut state = RendererState::default();
-            let mut stderr = std::io::stderr();
-            if mode == UiMode::TtyLive {
-                let _ = write!(stderr, "\x1b[?25l");
-                let _ = stderr.flush();
-            }
+            let mut bars = LiveBars::new(mode);
 
             loop {
                 match rx.recv_timeout(Duration::from_millis(TICK_MS)) {
                     Ok(ev) => {
-                        process_event(mode, &mut state, &ev, &json_buf, &mut stderr);
+                        process_event(mode, &mut state, &mut bars, &ev, &json_buf);
                         while let Ok(more) = rx.try_recv() {
-                            process_event(mode, &mut state, &more, &json_buf, &mut stderr);
+                            process_event(mode, &mut state, &mut bars, &more, &json_buf);
                         }
-                        if mode == UiMode::TtyLive {
-                            state.tick = state.tick.wrapping_add(1);
-                            redraw_ephemeral(&mut state, &mut stderr);
-                        }
+                        bars.sync_from_state(mode, &state);
                         if stop_bg.load(Ordering::Acquire) {
-                            if mode == UiMode::TtyLive {
-                                clear_ephemeral(&mut state, &mut stderr);
-                                let _ = write!(stderr, "\x1b[?25h");
-                                let _ = stderr.flush();
-                            }
+                            bars.clear_active();
                             break;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         if stop_bg.load(Ordering::Acquire) {
                             while let Ok(more) = rx.try_recv() {
-                                process_event(mode, &mut state, &more, &json_buf, &mut stderr);
+                                process_event(mode, &mut state, &mut bars, &more, &json_buf);
                             }
-                            if mode == UiMode::TtyLive {
-                                clear_ephemeral(&mut state, &mut stderr);
-                                let _ = write!(stderr, "\x1b[?25h");
-                                let _ = stderr.flush();
-                            }
+                            bars.clear_active();
                             break;
                         }
-                        if mode == UiMode::TtyLive && !state.active_name.is_empty() {
-                            state.tick = state.tick.wrapping_add(1);
-                            redraw_ephemeral(&mut state, &mut stderr);
-                        }
+                        bars.sync_from_state(mode, &state);
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        if mode == UiMode::TtyLive {
-                            clear_ephemeral(&mut state, &mut stderr);
-                            let _ = write!(stderr, "\x1b[?25h");
-                            let _ = stderr.flush();
-                        }
+                        bars.clear_active();
                         break;
                     }
                 }
@@ -468,7 +598,7 @@ impl UiSession {
         self.mode
     }
 
-    /// Flush remaining UI events, stop the renderer thread, restore cursor, and return any captured NDJSON lines.
+    /// Flush remaining UI events, stop the renderer thread, and return any captured NDJSON lines.
     pub fn finish(mut self) -> Vec<String> {
         self.shutdown();
         self.json_lines
@@ -496,9 +626,9 @@ impl Drop for UiSession {
 fn process_event(
     mode: UiMode,
     state: &mut RendererState,
+    bars: &mut LiveBars,
     ev: &UiEvent,
     json_buf: &Arc<Mutex<Vec<String>>>,
-    stderr: &mut std::io::Stderr,
 ) {
     if mode == UiMode::Json {
         if let Ok(line) = serde_json::to_string(ev)
@@ -513,8 +643,11 @@ fn process_event(
 
     match ev {
         UiEvent::StageLogReady { log_block } if mode == UiMode::Verbose => {
-            let _ = writeln!(stderr, "{log_block}");
-            let _ = stderr.flush();
+            bars.clear_active();
+            let _ = bars.mp.println(log_block);
+            if !Term::stderr().is_term() {
+                eprintln!("{log_block}");
+            }
         }
         UiEvent::TheoremFinished {
             name,
@@ -525,8 +658,8 @@ fn process_event(
             elapsed_ms,
         } => {
             if mode == UiMode::TtyLive {
-                clear_ephemeral(state, stderr);
-                let line = format_theorem_scrollback_line(
+                bars.clear_active();
+                let line = format_styled_scrollback_line(
                     name,
                     *proved,
                     route_label,
@@ -534,8 +667,7 @@ fn process_event(
                     diag.as_deref(),
                     *elapsed_ms,
                 );
-                let _ = writeln!(stderr, "{line}");
-                let _ = stderr.flush();
+                let _ = bars.mp.println(line);
                 state.active_name.clear();
                 state.branches.clear();
             } else if mode == UiMode::Plain {
@@ -547,8 +679,7 @@ fn process_event(
                     diag.as_deref(),
                     *elapsed_ms,
                 );
-                let _ = writeln!(stderr, "{line}");
-                let _ = stderr.flush();
+                eprintln!("{line}");
             }
         }
         UiEvent::WorkspaceFinished {
@@ -558,42 +689,21 @@ fn process_event(
             escalated_count,
             elapsed_ms,
         } => {
+            bars.clear_active();
+            let footer = format_workspace_footer(
+                *proved,
+                *total,
+                *direct_count,
+                *escalated_count,
+                *elapsed_ms,
+            );
             if mode == UiMode::TtyLive {
-                clear_ephemeral(state, stderr);
-            }
-            if mode == UiMode::TtyLive || mode == UiMode::Plain {
-                let footer = format_workspace_footer(
-                    *proved,
-                    *total,
-                    *direct_count,
-                    *escalated_count,
-                    *elapsed_ms,
-                );
-                let _ = writeln!(stderr, "{footer}");
-                let _ = stderr.flush();
+                let _ = bars.mp.println(style(footer).bold().to_string());
+            } else if mode == UiMode::Plain {
+                eprintln!("{footer}");
             }
         }
         _ => {}
-    }
-}
-
-fn clear_ephemeral(state: &mut RendererState, stderr: &mut std::io::Stderr) {
-    if state.drawn_lines > 0 {
-        let _ = write!(stderr, "\x1b[{}A\r\x1b[J", state.drawn_lines);
-        let _ = stderr.flush();
-        state.drawn_lines = 0;
-    }
-}
-
-fn redraw_ephemeral(state: &mut RendererState, stderr: &mut std::io::Stderr) {
-    clear_ephemeral(state, stderr);
-    let lines = state.render_ephemeral_lines();
-    if !lines.is_empty() {
-        for line in &lines {
-            let _ = writeln!(stderr, "{line}");
-        }
-        let _ = stderr.flush();
-        state.drawn_lines = lines.len();
     }
 }
 
@@ -644,15 +754,13 @@ mod tests {
             });
         }
 
-        let lines = state.render_ephemeral_lines();
-        // 1 header + 1 route + 5 branches + 1 "+3 more branches" = 8 lines
+        let lines = state.render_ephemeral_lines(78);
+        // 1 header + 1 route + 5 branches + 1 "+3 queued" = 8 lines
         assert_eq!(lines.len(), 8, "unexpected viewport lines: {lines:?}");
-        assert!(lines.last().unwrap().contains("+3 more branches"));
+        assert!(lines.last().unwrap().contains("+3 queued"));
         assert!(
-            lines
-                .iter()
-                .all(|l| l.chars().count() <= MAX_VIEWPORT_WIDTH),
-            "all lines must clamp to <= {MAX_VIEWPORT_WIDTH} chars: {lines:?}"
+            lines.iter().all(|l| l.chars().count() <= 78),
+            "all lines must clamp to <= 78 chars: {lines:?}"
         );
 
         let scroll = format_theorem_scrollback_line(
@@ -672,5 +780,39 @@ mod tests {
             footer,
             "Proved 6/6 theorems in 41.8s (4 DirectExecute, 2 Escalated, 0 sorryAx)"
         );
+    }
+
+    #[test]
+    fn test_ui_indicatif_modes_and_json_no_ansi() {
+        let session = UiSession::start(UiMode::Json);
+        let ui = session.handle();
+        ui.send(UiEvent::WorkspaceStarted { total: 1 });
+        ui.send(UiEvent::TheoremStarted {
+            index: 1,
+            total: 1,
+            name: "Demo.id".to_string(),
+        });
+        ui.send(UiEvent::TheoremFinished {
+            name: "Demo.id".to_string(),
+            proved: true,
+            route_label: "DirectExecute(AtomicClose)".to_string(),
+            tactic: Some("rfl".to_string()),
+            diag: None,
+            elapsed_ms: 120,
+        });
+        ui.send(UiEvent::WorkspaceFinished {
+            proved: 1,
+            total: 1,
+            direct_count: 1,
+            escalated_count: 0,
+            elapsed_ms: 120,
+        });
+        drop(ui);
+        let ndjson = session.finish();
+        assert_eq!(ndjson.len(), 4);
+        for line in &ndjson {
+            assert!(!line.contains('\x1b'), "JSON line contained ANSI escape: {line}");
+            let _: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON");
+        }
     }
 }
