@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Embedded Vector DB (HNSW + SQ8), Two-Stage Dynamic Import Resolver, and Episodic Subgoal Cache.
 
 use serde::{Deserialize, Serialize};

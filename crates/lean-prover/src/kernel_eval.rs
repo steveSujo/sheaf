@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Hybrid Kernel Evaluator: Single-file batched probes with `maxHeartbeats` isolation
 //! and Multi-file ephemeral dirty-worktree evaluation with early cancellation.
 

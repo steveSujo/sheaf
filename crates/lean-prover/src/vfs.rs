@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Content-addressed in-memory Virtual File System (`BlobStore` + `TreeSnapshot`).
 
 use std::collections::{BTreeMap, HashMap};

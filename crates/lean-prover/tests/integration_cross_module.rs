@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 use lean_canonicalizer::{
     HeadSymbol, collapse_implicit_instances, extract_head_symbol, normalize_alpha_vars,
     prune_disjoint_hypotheses,

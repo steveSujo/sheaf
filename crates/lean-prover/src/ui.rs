@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Event-driven `uv`-style terminal UI for `sheaf` backed by `indicatif` + `console`:
 //! two-zone `stderr` viewport, 12 Hz `MultiProgress`, automatic non-TTY degradation, and `--json` NDJSON mode.
 

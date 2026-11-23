@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Rust native inference runtime for `Lean-Sys1` (`lean_sys1.onnx` + `temperatures.json` + `tokenizer.json`).
 
 use serde::{Deserialize, Serialize};

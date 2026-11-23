@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Pantograph JSON-RPC stdio client, metavariable coupling analyzer, and axiom verifier.
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Deep (>= 3-step) Best-First compositional search tree with two-tier deduplication.
 
 use crate::vfs::{BlobHash, BlobStore, TreeSnapshot};

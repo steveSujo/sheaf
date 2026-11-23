@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match lean_prover::run_cli_args(&args) {

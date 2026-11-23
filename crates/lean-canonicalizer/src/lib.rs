@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Zero-allocation Lean 4 expression canonicalizer and head-symbol extractor.
 
 use serde::{Deserialize, Serialize};

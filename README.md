@@ -129,11 +129,21 @@ Three instant diagnostic modes are available from the command line:
   - `--max-nodes <1..1024>` caps expanded Best-First search nodes per theorem (default `64`).
   - `--max-workers <1..8>` sets concurrent Lean workers for multi-file worktree evaluation (default `2`).
   - `--max-heartbeats <>=10000>` sets per-probe `set_option maxHeartbeats` isolation (default `200000`).
+  - `--strict-lint` enforces `unusedVariables` and `unusedSimpArgs` on the target theorem during `--write` verification.
+  - `--plain` disables live TTY spinners for plain single-line `stderr` output.
+  - `--json` emits NDJSON progress events on `stdout`.
+  - `-v`, `--verbose` prints full 5-stage per-theorem telemetry.
 
 ## Verification
 
 Run the full Rust workspace test suite:
 
 ```powershell
-cargo test --workspace
+cargo test --workspace --release
 ```
+
+## License & Author
+
+Licensed under [AGPL-3.0-only](LICENSE).
+
+Author: Steve Sujo Pulikottil

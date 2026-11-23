@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 use lean_prover::{TheoremProblem, prove_and_verify_with_lean4};
 use lean_repl::{ReplError, verify_theorem_with_lean4_kernel};
 use lean_sys1_ort::{CalibrationTemperatures, PremiseFitWeights};

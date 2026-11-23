@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Best-First Prover Search Loop, Content-Addressed VFS, Deep Tree Search, and Hybrid Kernel Evaluator.
 
 pub mod kernel_eval;
