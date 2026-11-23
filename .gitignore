@@ -1,4 +1,5 @@
 # Rough works
+.agents/
 tasks/
 LEAN4_COMPOSER_SPEC.md
 M2_COLAB_TRAINING_SPEC.md
@@ -17,7 +18,6 @@ uv.lock
 pyproject.toml
 python/
 tests/
-scripts/
 __pycache__/
 *.py[cod]
 *$py.class
