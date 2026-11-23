@@ -348,62 +348,63 @@ fn audit_and_prune_unused_simp_args(
     prune_unused_simp: bool,
     strict_lint: bool,
 ) -> Result<Result<(String, Vec<String>), String>, ProverError> {
-    let (res, body, audit_src, stdout) =
+    let (res, mut cur_body, mut cur_audit, mut cur_stdout) =
         audit_single_candidate_raw(src, thm_name, full_name, script, lake_root, false)?;
-    let Ok(cand_src) = res else {
+    let Ok(mut cur_src) = res else {
         return Ok(Err(res.unwrap_err()));
     };
+    let mut cur_script = script.to_vec();
 
-    let has_simp_list = script
+    let has_simp_list = cur_script
         .iter()
         .any(|l| l.contains("simp [") || l.contains("simp_all ["));
-    if !prune_unused_simp || !has_simp_list {
-        if strict_lint {
-            let (strict_res, _, _, _) = audit_single_candidate_raw(
-                src, thm_name, full_name, script, lake_root, true,
+    if prune_unused_simp && has_simp_list {
+        for _ in 0..2 {
+            let occurrences = collect_unused_simp_occurrences(&cur_audit, &cur_stdout);
+            if occurrences.is_empty() {
+                break;
+            }
+            let pruned_body = prune_unused_simp_args_by_span(&cur_body, &cur_audit, &occurrences);
+            let pruned_script: Vec<String> = pruned_body
+                .lines()
+                .map(|l| l.strip_prefix("  ").unwrap_or(l).to_string())
+                .collect();
+            if pruned_script == cur_script {
+                break;
+            }
+            let (re_res, re_body, re_audit, re_stdout) = audit_single_candidate_raw(
+                src,
+                thm_name,
+                full_name,
+                &pruned_script,
+                lake_root,
+                false,
             )?;
-            return Ok(strict_res.map(|s| (s, script.to_vec())));
-        }
-        return Ok(Ok((cand_src, script.to_vec())));
-    }
-
-    let occurrences = collect_unused_simp_occurrences(&audit_src, &stdout);
-    if occurrences.is_empty() {
-        if strict_lint {
-            let (strict_res, _, _, _) = audit_single_candidate_raw(
-                src, thm_name, full_name, script, lake_root, true,
-            )?;
-            return Ok(strict_res.map(|s| (s, script.to_vec())));
-        }
-        return Ok(Ok((cand_src, script.to_vec())));
-    }
-
-    let pruned_body = prune_unused_simp_args_by_span(&body, &audit_src, &occurrences);
-    let pruned_script: Vec<String> = pruned_body
-        .lines()
-        .map(|l| l.strip_prefix("  ").unwrap_or(l).to_string())
-        .collect();
-
-    if pruned_script == script {
-        return Ok(Ok((cand_src, script.to_vec())));
-    }
-
-    let (re_res, _, re_audit, re_stdout) = audit_single_candidate_raw(
-        src,
-        thm_name,
-        full_name,
-        &pruned_script,
-        lake_root,
-        strict_lint,
-    )?;
-    if let Ok(pruned_src) = re_res {
-        let remaining = collect_unused_simp_occurrences(&re_audit, &re_stdout);
-        if remaining.len() < occurrences.len() {
-            return Ok(Ok((pruned_src, pruned_script)));
+            let Ok(pruned_src) = re_res else {
+                break;
+            };
+            let remaining = collect_unused_simp_occurrences(&re_audit, &re_stdout);
+            if remaining.len() >= occurrences.len() {
+                break;
+            }
+            cur_src = pruned_src;
+            cur_body = re_body;
+            cur_audit = re_audit;
+            cur_stdout = re_stdout;
+            cur_script = pruned_script;
+            if remaining.is_empty() {
+                break;
+            }
         }
     }
 
-    Ok(Ok((cand_src, script.to_vec())))
+    if strict_lint {
+        let (strict_res, _, _, _) =
+            audit_single_candidate_raw(src, thm_name, full_name, &cur_script, lake_root, true)?;
+        return Ok(strict_res.map(|s| (s, cur_script)));
+    }
+
+    Ok(Ok((cur_src, cur_script)))
 }
 
 fn strip_trailing_docstrings_and_attrs(prefix: &str) -> &str {
@@ -1109,6 +1110,40 @@ theorem branch_simp_prune (n : Nat) (h : n = 0) : n + 0 = 0 ∧ 0 + n = 0 := by
         assert!(
             !script[0].contains("Nat.mul_comm") && !script[0].contains("Nat.mul_assoc"),
             "expected unused simp args stripped per occurrence: {script:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_strict_lint_rejects_unprunable_warning_without_silent_fallback() {
+        let dir = std::env::temp_dir().join("lean_prover_strict_lint_hard_gate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("StrictReject.lean");
+        let src = "\
+import Init
+theorem strict_reject (unused_n : Nat) : 0 = 0 := by
+  sorry
+";
+        std::fs::write(&f, src).unwrap();
+        let thms = discover_sorry_theorems(&f).unwrap();
+        let cands = vec![vec!["simp [Nat.add_zero]".to_string()]];
+        let (solved, diag, _) = verify_candidates_batched_with_options_and_ui(
+            src,
+            &thms[0],
+            "strict_reject",
+            &cands,
+            None,
+            200_000,
+            &UiHandle::noop(),
+            0,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(
+            solved.is_none(),
+            "strict_lint must reject unprunable unusedVariables warning, got: {solved:?} ({diag})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
