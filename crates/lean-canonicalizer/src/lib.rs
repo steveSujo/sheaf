@@ -175,28 +175,79 @@ fn is_hygienic_instance(ident: &str) -> bool {
     ident.starts_with("inst✝") || ident.starts_with("_inst_")
 }
 
-/// Extract the `head_symbol` of target type `T` after stripping leading `∀` / `→`.
+/// Strip balanced outer `(...)` wrappers if the opening `(` at byte 0 closes at the last byte.
+fn strip_balanced_outer_parens(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+        let mut depth = 0usize;
+        let mut closes_at_end = false;
+        for (idx, ch) in trimmed.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        closes_at_end = idx + ch.len_utf8() == trimmed.len();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if closes_at_end {
+            s = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// Extract the `head_symbol` of target type `T` after stripping outer parens, `∀`, and checking connectives.
 pub fn extract_head_symbol(target: &str) -> Result<HeadSymbol, CanonicalizerError> {
-    let mut s = target.trim();
+    let mut s = strip_balanced_outer_parens(target);
     if s.is_empty() {
         return Err(CanonicalizerError::EmptyTarget);
     }
 
-    // Strip leading `∀ ...,` binders
+    // Strip leading `∀ ...,` binders and any nested outer parentheses
     loop {
-        let trimmed = s.trim_start();
-        if trimmed.starts_with('∀')
-            && let Some(comma_idx) = trimmed.find(',')
+        s = strip_balanced_outer_parens(s);
+        if s.starts_with('∀')
+            && let Some(comma_idx) = s.find(',')
         {
-            s = trimmed[comma_idx + 1..].trim_start();
+            s = strip_balanced_outer_parens(&s[comma_idx + 1..]);
             continue;
         }
         break;
     }
 
-    // Strip top-level `... →` implications
-    if let Some(arrow_idx) = find_top_level_char(s, '→') {
-        s = s[arrow_idx + '→'.len_utf8()..].trim_start();
+    // Check prefix logical connectives before stripping `→` or scanning infix relations
+    if s.starts_with('∃') {
+        return Ok(HeadSymbol::Named("Exists".to_string()));
+    }
+    if s.starts_with('¬') {
+        return Ok(HeadSymbol::Named("Not".to_string()));
+    }
+
+    // Strip top-level `... →` implications and re-check outer parens / prefix connectives
+    while let Some(arrow_idx) = find_top_level_char(s, '→') {
+        s = strip_balanced_outer_parens(&s[arrow_idx + '→'.len_utf8()..]);
+        if s.starts_with('∃') {
+            return Ok(HeadSymbol::Named("Exists".to_string()));
+        }
+        if s.starts_with('¬') {
+            return Ok(HeadSymbol::Named("Not".to_string()));
+        }
+    }
+
+    // Check top-level binary propositional connectives before infix relations
+    for (op, name) in [('↔', "Iff"), ('∧', "And"), ('∨', "Or")] {
+        if find_top_level_char(s, op).is_some() {
+            return Ok(HeadSymbol::Named(name.to_string()));
+        }
     }
 
     // Check top-level infix relation operators
@@ -206,6 +257,7 @@ pub fn extract_head_symbol(target: &str) -> Result<HeadSymbol, CanonicalizerErro
         ('<', "LT.lt"),
         ('≥', "GE.ge"),
         ('>', "GT.gt"),
+        ('≠', "Ne"),
         ('∈', "Membership.mem"),
     ] {
         if find_top_level_char(s, op).is_some() {
@@ -357,6 +409,39 @@ mod tests {
         assert_eq!(
             extract_head_symbol("_v0 _v1").unwrap(),
             HeadSymbol::Polymorphic
+        );
+        assert_eq!(
+            extract_head_symbol("(∃ _v0, _v0 + 1 = 2)").unwrap(),
+            HeadSymbol::Named("Exists".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("(∀ (_v0 _v1 : Nat), (∃ _v2 _v3 : Nat, _v2 + _v3 = _v0 + _v1))")
+                .unwrap(),
+            HeadSymbol::Named("Exists".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("∃ _v0, _v0 = 0 → _v0 ≤ 1").unwrap(),
+            HeadSymbol::Named("Exists".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("(¬ (_v0 = _v1))").unwrap(),
+            HeadSymbol::Named("Not".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("_v0 = _v1 ∧ _v1 ≤ _v2").unwrap(),
+            HeadSymbol::Named("And".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("_v0 = _v1 ∨ _v1 = _v2").unwrap(),
+            HeadSymbol::Named("Or".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("_v0 = _v1 ↔ _v1 = _v0").unwrap(),
+            HeadSymbol::Named("Iff".to_string())
+        );
+        assert_eq!(
+            extract_head_symbol("_v0 ≠ _v1").unwrap(),
+            HeadSymbol::Named("Ne".to_string())
         );
     }
 

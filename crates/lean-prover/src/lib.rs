@@ -1274,16 +1274,55 @@ pub fn prove_lean_path_with_artifacts_and_options(
         let (pred, _choice_logits, gate) =
             onnx_sess.forward_with_gate(&input_ids, &attention_mask, &temps, options.gate_threshold)?;
 
-        // Stage 4: Gated direct-SQ8 VDB HNSW search + 4d PremiseFit
-        let (vdb_hits, top_lemmas) = if gate == lean_sys1_ort::GateDecision::FallbackToLeJepa {
+        let lake_root = find_lake_workspace_root(&thm.file);
+        let mut vdb_hits: Vec<lean_vdb::VdbSearchHit> = Vec::new();
+        let mut top_lemmas: Vec<String> = Vec::new();
+        let mut tried_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Stage 4/5 fast-path: DirectExecute runs only the top-ranked strategy bucket first
+        let (mut solved, mut last_diag, mut unsolved_diags) = if matches!(
+            gate,
+            lean_sys1_ort::GateDecision::DirectExecute(_)
+        ) {
+            let fast_candidates = synthesize_from_model_and_vdb(
+                thm,
+                head_symbol.as_str(),
+                &pred,
+                &vdb_hits,
+                &top_lemmas,
+                options.max_branches,
+                true,
+            );
+            for c in &fast_candidates {
+                tried_scripts.insert(c.join(" ; "));
+            }
+            if fast_candidates.is_empty() {
+                (None, String::new(), Vec::new())
+            } else {
+                kernel_eval::verify_candidates_batched_with_heartbeats(
+                    &eval_src,
+                    thm,
+                    &full_name,
+                    &fast_candidates,
+                    lake_root.as_deref(),
+                    options.max_heartbeats,
+                )?
+            }
+        } else {
+            (None, String::new(), Vec::new())
+        };
+
+        // Escalate to FallbackToLeJepa when gated or when DirectExecute fast-path fails
+        if solved.is_none() {
             let query_emb = onnx_sess.predict_lejepa_target(&pred.state_emb, pred.strategy);
-            let hits = vdb.search_sq8_hnsw(
+            vdb_hits = vdb.search_sq8_hnsw(
                 &query_emb,
                 head_symbol.as_str(),
                 options.max_branches.max(16),
             )?;
-            let cand_embs: Vec<Vec<f32>> = hits.iter().map(|h| h.embedding.clone()).collect();
-            let cand_names: Vec<String> = hits.iter().map(|h| h.metadata.name.clone()).collect();
+            let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
+            let cand_names: Vec<String> =
+                vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
             let scored = if cand_embs.is_empty() {
                 Vec::new()
             } else {
@@ -1296,38 +1335,44 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 )?
             };
             let fallback = lean_sys1_ort::select_fallback_outcome(&scored, options.max_branches);
-            let top = match fallback {
+            top_lemmas = match fallback {
                 lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
                     .iter()
                     .filter_map(|(i, _)| cand_names.get(*i).cloned())
                     .collect(),
                 lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => Vec::new(),
             };
-            (hits, top)
-        } else {
-            (Vec::new(), Vec::new())
-        };
 
-        // Stage 5: Model-only VDB-driven tactic synthesis + Deep Best-First Search & Hybrid Kernel Verification
-        let candidates = synthesize_from_model_and_vdb(
-            thm,
-            head_symbol.as_str(),
-            &pred,
-            &vdb_hits,
-            &top_lemmas,
-            options.max_branches,
-        );
-        let lake_root = find_lake_workspace_root(&thm.file);
-
-        let (mut solved, mut last_diag, unsolved_diags) =
-            kernel_eval::verify_candidates_batched_with_heartbeats(
-                &eval_src,
+            let fallback_candidates: Vec<Vec<String>> = synthesize_from_model_and_vdb(
                 thm,
-                &full_name,
-                &candidates,
-                lake_root.as_deref(),
-                options.max_heartbeats,
-            )?;
+                head_symbol.as_str(),
+                &pred,
+                &vdb_hits,
+                &top_lemmas,
+                options.max_branches,
+                false,
+            )
+            .into_iter()
+            .filter(|c| !tried_scripts.contains(&c.join(" ; ")))
+            .collect();
+
+            if !fallback_candidates.is_empty() {
+                let (fb_solved, fb_diag, fb_unsolved) =
+                    kernel_eval::verify_candidates_batched_with_heartbeats(
+                        &eval_src,
+                        thm,
+                        &full_name,
+                        &fallback_candidates,
+                        lake_root.as_deref(),
+                        options.max_heartbeats,
+                    )?;
+                solved = fb_solved;
+                if !fb_diag.is_empty() {
+                    last_diag = fb_diag;
+                }
+                unsolved_diags.extend(fb_unsolved);
+            }
+        }
 
         // Deep (>= 3-step) Best-First compositional subgoal search backed by BlobStore + TreeSnapshot
         if solved.is_none() && !unsolved_diags.is_empty() && options.max_depth > 1 {
@@ -1387,16 +1432,20 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         }
                         match sub_pred.strategy {
                             lean_sys1_ort::StrategyChoice::AtomicClose => {
-                                sub_closers.push("all_goals (first | rfl | simp | omega)".to_string());
-                                sub_closers.push("all_goals (try simp_all; try omega)".to_string());
+                                sub_closers.push("all_goals (first | rfl | simp | omega | grind)".to_string());
+                                sub_closers.push("all_goals (try simp_all; try omega; try grind)".to_string());
                             }
                             lean_sys1_ort::StrategyChoice::Rewrite => {
-                                sub_closers.push("all_goals (first | simp_all | omega)".to_string());
-                                sub_closers.push("all_goals (try simp; try omega)".to_string());
+                                sub_closers.push("all_goals (first | simp_all | omega | grind)".to_string());
+                                sub_closers.push("all_goals (try simp; try omega; try grind)".to_string());
+                            }
+                            lean_sys1_ort::StrategyChoice::IntroduceHave => {
+                                sub_closers.push("all_goals (try rfl); all_goals (first | rfl | simp_all | omega | grind)".to_string());
+                                sub_closers.push("repeat (first | rfl | (constructor <;> try rfl)); all_goals (first | rfl | omega | grind)".to_string());
                             }
                             _ => {
-                                sub_closers.push("all_goals (try simp_all; try omega)".to_string());
-                                sub_closers.push("all_goals omega".to_string());
+                                sub_closers.push("all_goals (try simp_all; try omega; try grind)".to_string());
+                                sub_closers.push("all_goals (first | omega | grind)".to_string());
                             }
                         }
                         sub_closers
@@ -1689,6 +1738,7 @@ fn synthesize_from_model_and_vdb(
     vdb_hits: &[lean_vdb::VdbSearchHit],
     top_lemmas: &[String],
     max_branches: usize,
+    primary_only: bool,
 ) -> Vec<Vec<String>> {
     let mut scripts: Vec<Vec<String>> = Vec::new();
 
@@ -1722,7 +1772,22 @@ fn synthesize_from_model_and_vdb(
     let mut bucket_have: Vec<Vec<String>> = Vec::new();
     let mut bucket_induction: Vec<Vec<String>> = Vec::new();
 
-    // 1. Local def + structure binders with incremental split-and-prune omega
+    // 1a. Orthogonal theorem-level rewriting (always emitted before unfolding regardless of struct_vars)
+    if !thm.local_theorems.is_empty() {
+        let thms_list = thm.local_theorems.join(", ");
+        bucket_rewrite.push(vec![format!("simp [{thms_list}]")]);
+        if !context_list.is_empty() {
+            bucket_rewrite.push(vec![format!("simp [{thms_list}]; simp [{context_list}]")]);
+        }
+    }
+    if !context_list.is_empty() {
+        bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
+        bucket_rewrite.push(vec![format!(
+            "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
+        )]);
+    }
+
+    // 1b. Local def + structure binders with incremental split-and-prune omega
     if !used_defs.is_empty() {
         let defs_list = used_defs.join(", ");
         if struct_vars.len() == 1 {
@@ -1759,35 +1824,12 @@ fn synthesize_from_model_and_vdb(
             // Non-structure local definitions / constants (e.g. arithmetic or abbrev constraints)
             bucket_atomic.push(vec![format!("dsimp [{defs_list}] at *; omega")]);
             bucket_atomic.push(vec![format!("unfold {defs_list} at *; omega")]);
-            if !thm.local_theorems.is_empty() {
-                let thms_list = thm.local_theorems.join(", ");
-                bucket_rewrite.push(vec![format!("simp [{thms_list}]")]);
-                if !context_list.is_empty() {
-                    bucket_rewrite.push(vec![format!("simp [{thms_list}]; simp [{context_list}]")]);
-                }
-            }
-            if !context_list.is_empty() {
-                bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
-                bucket_rewrite.push(vec![format!(
-                    "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
-                )]);
-            }
         }
     } else {
         // When no local definition appears in the signature, try bare closers first so
         // unrelated preceding local theorems do not trigger unused simp argument warnings.
         bucket_atomic.push(vec!["simp".to_string()]);
         bucket_atomic.push(vec!["omega".to_string()]);
-        if !thm.local_theorems.is_empty() {
-            let thms_list = thm.local_theorems.join(", ");
-            bucket_rewrite.push(vec![format!("simp [{thms_list}]")]);
-        }
-        if !context_list.is_empty() {
-            bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
-            bucket_rewrite.push(vec![format!(
-                "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
-            )]);
-        }
     }
 
     // 2. Structural induction over List or local inductive binders (or when Sys1 predicts Induction)
@@ -1900,65 +1942,61 @@ fn synthesize_from_model_and_vdb(
     }
 
     // 5. Structural head-symbol introduction from canonicalizer + model gate
-    if head_symbol == "And" || thm.signature.contains('∧') {
-        if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∧')) {
-            bucket_have.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
-        }
-    } else if head_symbol == "Exists" || thm.signature.contains('∃') {
-        let mul_lemmas: Vec<&str> = vdb_lemma_names
-            .iter()
-            .filter(|l| l.contains("mul"))
-            .map(String::as_str)
-            .collect();
-        let simp_extra = if mul_lemmas.is_empty() {
-            String::new()
-        } else {
-            format!(", {}", mul_lemmas.join(", "))
-        };
-        if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∃')) {
-            bucket_have.push(vec![
-                format!("rcases {hyp_name} with ⟨k, hk⟩"),
-                format!("exact ⟨2 * k * k, by simp [hk, Nat.mul_assoc, Nat.mul_left_comm{simp_extra}]⟩"),
-            ]);
-        }
+    if (head_symbol == "And" || thm.signature.contains('∧'))
+        && let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∧'))
+    {
+        bucket_have.push(vec![format!("cases {hyp_name}; constructor <;> assumption")]);
+    }
+    if head_symbol == "Exists" || thm.signature.contains('∃') {
+        bucket_have.extend(synthesize_existential_candidates(thm));
     }
 
     // Order buckets dynamically based on `pred.strategy` while preserving full fallback coverage
-    match pred.strategy {
-        lean_sys1_ort::StrategyChoice::AtomicClose => {
-            scripts.extend(bucket_atomic);
-            scripts.extend(bucket_rewrite);
-            scripts.extend(bucket_induction);
-            scripts.extend(bucket_apply);
-            scripts.extend(bucket_have);
+    if primary_only {
+        match pred.strategy {
+            lean_sys1_ort::StrategyChoice::AtomicClose => scripts.extend(bucket_atomic),
+            lean_sys1_ort::StrategyChoice::Rewrite => scripts.extend(bucket_rewrite),
+            lean_sys1_ort::StrategyChoice::ApplyLemma => scripts.extend(bucket_apply),
+            lean_sys1_ort::StrategyChoice::IntroduceHave => scripts.extend(bucket_have),
+            lean_sys1_ort::StrategyChoice::Induction => scripts.extend(bucket_induction),
         }
-        lean_sys1_ort::StrategyChoice::Rewrite => {
-            scripts.extend(bucket_rewrite);
-            scripts.extend(bucket_atomic);
-            scripts.extend(bucket_induction);
-            scripts.extend(bucket_apply);
-            scripts.extend(bucket_have);
-        }
-        lean_sys1_ort::StrategyChoice::ApplyLemma => {
-            scripts.extend(bucket_apply);
-            scripts.extend(bucket_atomic);
-            scripts.extend(bucket_rewrite);
-            scripts.extend(bucket_induction);
-            scripts.extend(bucket_have);
-        }
-        lean_sys1_ort::StrategyChoice::IntroduceHave => {
-            scripts.extend(bucket_have);
-            scripts.extend(bucket_atomic);
-            scripts.extend(bucket_rewrite);
-            scripts.extend(bucket_induction);
-            scripts.extend(bucket_apply);
-        }
-        lean_sys1_ort::StrategyChoice::Induction => {
-            scripts.extend(bucket_induction);
-            scripts.extend(bucket_atomic);
-            scripts.extend(bucket_rewrite);
-            scripts.extend(bucket_apply);
-            scripts.extend(bucket_have);
+    } else {
+        match pred.strategy {
+            lean_sys1_ort::StrategyChoice::AtomicClose => {
+                scripts.extend(bucket_atomic);
+                scripts.extend(bucket_rewrite);
+                scripts.extend(bucket_induction);
+                scripts.extend(bucket_apply);
+                scripts.extend(bucket_have);
+            }
+            lean_sys1_ort::StrategyChoice::Rewrite => {
+                scripts.extend(bucket_rewrite);
+                scripts.extend(bucket_atomic);
+                scripts.extend(bucket_induction);
+                scripts.extend(bucket_apply);
+                scripts.extend(bucket_have);
+            }
+            lean_sys1_ort::StrategyChoice::ApplyLemma => {
+                scripts.extend(bucket_apply);
+                scripts.extend(bucket_atomic);
+                scripts.extend(bucket_rewrite);
+                scripts.extend(bucket_induction);
+                scripts.extend(bucket_have);
+            }
+            lean_sys1_ort::StrategyChoice::IntroduceHave => {
+                scripts.extend(bucket_have);
+                scripts.extend(bucket_atomic);
+                scripts.extend(bucket_rewrite);
+                scripts.extend(bucket_induction);
+                scripts.extend(bucket_apply);
+            }
+            lean_sys1_ort::StrategyChoice::Induction => {
+                scripts.extend(bucket_induction);
+                scripts.extend(bucket_atomic);
+                scripts.extend(bucket_rewrite);
+                scripts.extend(bucket_apply);
+                scripts.extend(bucket_have);
+            }
         }
     }
 
@@ -1969,6 +2007,303 @@ fn synthesize_from_model_and_vdb(
         }
     }
     unique_scripts
+}
+
+fn contains_ident(expr: &str, ident: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = expr[start..].find(ident) {
+        let abs_start = start + pos;
+        let abs_end = abs_start + ident.len();
+        let left_ok = expr[..abs_start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '\'');
+        let right_ok = expr[abs_end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '\'');
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs_end;
+    }
+    false
+}
+
+fn replace_ident(expr: &str, ident: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut start = 0;
+    while let Some(pos) = expr[start..].find(ident) {
+        let abs_start = start + pos;
+        let abs_end = abs_start + ident.len();
+        let left_ok = expr[..abs_start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '\'');
+        let right_ok = expr[abs_end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '\'');
+        if left_ok && right_ok {
+            out.push_str(&expr[start..abs_start]);
+            out.push_str(replacement);
+        } else {
+            out.push_str(&expr[start..abs_end]);
+        }
+        start = abs_end;
+    }
+    out.push_str(&expr[start..]);
+    out
+}
+
+fn split_top_level_conjuncts(body: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut last = 0usize;
+    for (idx, ch) in body.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '∧' if depth == 0 => {
+                let piece = body[last..idx].trim();
+                if !piece.is_empty() {
+                    parts.push(piece.to_string());
+                }
+                last = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = body[last..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    parts
+}
+
+fn split_top_level_eq(conjunct: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (idx, ch) in conjunct.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => {
+                let lhs = conjunct[..idx].trim();
+                let rhs = conjunct[idx + 1..].trim();
+                if !lhs.is_empty() && !rhs.is_empty() {
+                    return Some((lhs, rhs));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_plus(expr: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (idx, ch) in expr.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '+' if depth == 0 => {
+                let lhs = expr[..idx].trim();
+                let rhs = expr[idx + 1..].trim();
+                if !lhs.is_empty() && !rhs.is_empty() {
+                    return Some((lhs, rhs));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_existential_target(signature: &str) -> Option<(Vec<String>, String)> {
+    let mut depth = 0usize;
+    let mut colon_idx = None;
+    for (idx, ch) in signature.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                colon_idx = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let mut s = colon_idx
+        .map(|i| signature[i + 1..].trim())
+        .unwrap_or_else(|| signature.trim());
+    while s.starts_with('(') && s.ends_with(')') {
+        s = s[1..s.len() - 1].trim();
+    }
+    if !s.starts_with('∃') {
+        return None;
+    }
+
+    let mut vars = Vec::new();
+    let mut cur = s;
+    while cur.starts_with('∃') {
+        let after_ex = cur['∃'.len_utf8()..].trim_start();
+        let Some(comma_idx) = after_ex.find(',') else {
+            break;
+        };
+        let binder_slice = after_ex[..comma_idx].trim();
+        for tok in binder_slice.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ':')) {
+            if !tok.is_empty() && tok != "Nat" && tok != "Int" && tok != "Prop" && tok != "Type" {
+                let looks_like_var = tok
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                if looks_like_var && !vars.iter().any(|v| v == tok) {
+                    vars.push(tok.to_string());
+                }
+            }
+        }
+        cur = after_ex[comma_idx + 1..].trim_start();
+    }
+
+    if vars.is_empty() {
+        None
+    } else {
+        Some((vars, cur.to_string()))
+    }
+}
+
+/// General metavariable-driven existential synthesis with 2-pass dependent witness extraction.
+fn synthesize_existential_candidates(thm: &DiscoveredTheorem) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+
+    if let Some((vars, body)) = extract_existential_target(&thm.signature) {
+        let k = vars.len();
+        let conjuncts = split_top_level_conjuncts(&body);
+        let c = conjuncts.len().max(1);
+
+        // 2-pass dependent witness extraction (Pass 1: ground direct equalities, Pass 2: substitute + linear additive)
+        let mut resolved: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let no_ex_vars = |expr: &str, skip: Option<&str>| -> bool {
+            vars.iter()
+                .all(|v| skip == Some(v.as_str()) || !contains_ident(expr, v))
+        };
+
+        // Pass 1: direct `v = expr` or `expr = v` with zero existential vars in `expr`
+        for conj in &conjuncts {
+            if let Some((lhs, rhs)) = split_top_level_eq(conj) {
+                for v in &vars {
+                    if resolved.contains_key(v) {
+                        continue;
+                    }
+                    if lhs == v && no_ex_vars(rhs, None) {
+                        resolved.insert(v.clone(), format!("({rhs})"));
+                    } else if rhs == v && no_ex_vars(lhs, None) {
+                        resolved.insert(v.clone(), format!("({lhs})"));
+                    }
+                }
+            }
+        }
+
+        // Pass 2: substitute Pass-1 witnesses and solve remaining direct or linear `v + A = B` constraints
+        for _ in 0..k {
+            let mut progressed = false;
+            for conj in &conjuncts {
+                let mut sub_conj = conj.clone();
+                for (known_v, known_expr) in &resolved {
+                    sub_conj = replace_ident(&sub_conj, known_v, known_expr);
+                }
+                let Some((lhs, rhs)) = split_top_level_eq(&sub_conj) else {
+                    continue;
+                };
+                for v in &vars {
+                    if resolved.contains_key(v) {
+                        continue;
+                    }
+                    let unresolved_others = |expr: &str| -> bool {
+                        vars.iter()
+                            .filter(|other| *other != v && !resolved.contains_key(*other))
+                            .all(|other| !contains_ident(expr, other))
+                    };
+                    if lhs == v && unresolved_others(rhs) {
+                        resolved.insert(v.clone(), format!("({rhs})"));
+                        progressed = true;
+                    } else if rhs == v && unresolved_others(lhs) {
+                        resolved.insert(v.clone(), format!("({lhs})"));
+                        progressed = true;
+                    } else if let Some((a, b)) = split_top_level_plus(lhs) {
+                        if a == v && unresolved_others(b) && unresolved_others(rhs) {
+                            resolved.insert(v.clone(), format!("(({rhs}) - ({b}))"));
+                            progressed = true;
+                        } else if b == v && unresolved_others(a) && unresolved_others(rhs) {
+                            resolved.insert(v.clone(), format!("(({rhs}) - ({a}))"));
+                            progressed = true;
+                        }
+                    } else if let Some((a, b)) = split_top_level_plus(rhs) {
+                        if a == v && unresolved_others(b) && unresolved_others(lhs) {
+                            resolved.insert(v.clone(), format!("(({lhs}) - ({b}))"));
+                            progressed = true;
+                        } else if b == v && unresolved_others(a) && unresolved_others(lhs) {
+                            resolved.insert(v.clone(), format!("(({lhs}) - ({a}))"));
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        if vars.iter().all(|v| resolved.contains_key(v)) {
+            let witnesses: Vec<String> = vars.iter().map(|v| resolved[v].clone()).collect();
+            let w_csv = witnesses.join(", ");
+            out.push(vec![format!(
+                "exists {w_csv}; all_goals (first | rfl | omega | grind | simp_all)"
+            )]);
+            out.push(vec![format!(
+                "refine ⟨{w_csv}, ?_⟩; repeat (first | rfl | (constructor <;> try rfl)); all_goals (first | rfl | omega | grind | simp_all)"
+            )]);
+        } else if !resolved.is_empty() {
+            let mut partial_slots: Vec<String> = vars
+                .iter()
+                .map(|v| resolved.get(v).cloned().unwrap_or_else(|| "?_".to_string()))
+                .collect();
+            partial_slots.extend(std::iter::repeat_n("?_".to_string(), c));
+            out.push(vec![format!(
+                "refine ⟨{}⟩ <;> try rfl <;> all_goals (first | rfl | omega | grind | simp_all)",
+                partial_slots.join(", ")
+            )]);
+        }
+
+        // Unification-first k + c metavariable tuple with try rfl on every conjunct before omega/grind
+        let kc_slots = vec!["?_"; k + c].join(", ");
+        out.push(vec![format!(
+            "refine ⟨{kc_slots}⟩ <;> try rfl <;> all_goals (first | rfl | omega | grind | simp_all)"
+        )]);
+
+        let k1_slots = vec!["?_"; k + 1].join(", ");
+        out.push(vec![format!(
+            "refine ⟨{k1_slots}⟩; repeat (first | rfl | (constructor <;> try rfl)); all_goals (first | rfl | omega | grind | simp_all)"
+        )]);
+    }
+
+    // General existential hypothesis destructuring fallback (no hardcoded algebraic template)
+    if let Some((hyp_name, _)) = thm.binders.iter().find(|(_, ty)| ty.contains('∃')) {
+        out.push(vec![
+            format!("rcases {hyp_name} with ⟨w, hw⟩"),
+            "try subst hw".to_string(),
+            "refine ⟨?_, ?_⟩ <;> all_goals (try simp [Nat.mul_assoc]) <;> all_goals (try rfl)"
+                .to_string(),
+        ]);
+        out.push(vec![
+            format!("rcases {hyp_name} with ⟨w, hw⟩"),
+            "refine ⟨?_, ?_⟩ <;> try rfl <;> all_goals (first | rfl | simp_all | omega | grind)"
+                .to_string(),
+        ]);
+    }
+
+    out
 }
 
 pub(crate) fn replace_theorem_sorry(src: &str, thm_name: &str, replacement_body: &str) -> String {
@@ -3063,5 +3398,89 @@ mod tests {
         let summary = prove_lean_path(&dir, false).unwrap();
         assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_orthogonal_rewrite_with_struct_binder_and_primary_only_flag() {
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Ledger.lean"),
+            line: 10,
+            namespace: None,
+            name: "replay_conserves".to_string(),
+            signature: "(s : State) (xs : List Tx) : total (replay s xs) = total s".to_string(),
+            binders: vec![
+                ("s".to_string(), "State".to_string()),
+                ("xs".to_string(), "List Tx".to_string()),
+            ],
+            local_defs: vec!["replay".to_string(), "total".to_string()],
+            local_structures: vec!["State".to_string()],
+            local_inductives: vec![],
+            local_theorems: vec!["step_conserves".to_string()],
+            workspace_deps: vec![],
+        };
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
+            answer_confidence: 0.99,
+            direct_close_prob: 0.5,
+            difficulty: lean_sys1_ort::DifficultyBucket::Trivial,
+        };
+        let primary =
+            synthesize_from_model_and_vdb(&thm, "Eq", &pred, &[], &[], 4, true);
+        assert!(
+            primary.iter().any(|s| s[0] == "simp [step_conserves]"),
+            "bucket_rewrite must emit simp [local_theorems] even when struct_vars is non-empty: {primary:?}"
+        );
+        assert!(
+            !primary.iter().any(|s| s[0] == "simp"),
+            "primary_only=true must not include AtomicClose bare closers"
+        );
+    }
+
+    #[test]
+    fn test_metavariable_existential_synthesis_and_two_pass_witness_extraction() {
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Ex.lean"),
+            line: 1,
+            namespace: None,
+            name: "transfer_exists".to_string(),
+            signature: "(a b amt : Nat) (h : amt ≤ a) : ∃ a' b' : Nat, a' + b' = a + b ∧ a' = a - amt"
+                .to_string(),
+            binders: vec![
+                ("a".to_string(), "Nat".to_string()),
+                ("b".to_string(), "Nat".to_string()),
+                ("amt".to_string(), "Nat".to_string()),
+                ("h".to_string(), "amt ≤ a".to_string()),
+            ],
+            local_defs: vec![],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            workspace_deps: vec![],
+        };
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::IntroduceHave,
+            answer_confidence: 0.9,
+            direct_close_prob: 0.5,
+            difficulty: lean_sys1_ort::DifficultyBucket::Trivial,
+        };
+        let cands = synthesize_from_model_and_vdb(&thm, "Exists", &pred, &[], &[], 4, true);
+        let flat: Vec<String> = cands.iter().map(|s| s.join(" ; ")).collect();
+        assert!(
+            flat.iter().all(|s| !s.contains("2 * k * k")),
+            "hardcoded 2 * k * k template must be removed"
+        );
+        // 2-pass dependent witness extraction: a' = a - amt, b' = (a + b) - (a - amt) (no out-of-scope a')
+        assert!(
+            flat.iter().any(|s| s.contains("exists (a - amt), ((a + b) - ((a - amt)))")),
+            "expected 2-pass witness extraction without out-of-scope a': {flat:?}"
+        );
+        // k + c = 2 + 2 = 4 metavariable slots with try rfl on every conjunct
+        assert!(
+            flat.iter()
+                .any(|s| s.contains("refine ⟨?_, ?_, ?_, ?_⟩ <;> try rfl")),
+            "expected k+c metavariable refine with try rfl per conjunct: {flat:?}"
+        );
     }
 }
