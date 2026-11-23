@@ -6,16 +6,8 @@ Sheaf embeds a quantized RoPE encoder, a scalar-quantized HNSW premise index, a 
 
 [Demo](#30-second-self-verification-demo) • [Benchmarks](#empirical-benchmarks) • [Architecture](docs/ARCHITECTURE.md) • [How to Use](#how-to-use)
 
-<!-- TODO: Replace with recorded CLI demo GIF -->
-<!-- ![sheaf live demo](assets/sheaf-demo.gif) -->
+![sheaf live demo](assets/sheaf-demo.gif)
 
-```text
-✓ SheafSpec.allowlist_nil          Escalated -> VDB (7 hits)  5.3s  [simp [isAllowedAxiom, allowlistOk]]
-✓ SheafSpec.verify_rejects_sorry   DirectExecute(Induction)   4.9s  [induction rest <;> simp_all [...]]
-✓ SheafSpec.allowlist_append       DirectExecute(Induction)   5.4s  [induction xs generalizing ys ...]
-...
-Proved 8/8 theorems in 38.2s (6 DirectExecute, 2 Escalated, 0 sorryAx)
-```
 
 ## Why sheaf?
 
@@ -52,16 +44,15 @@ cargo build --release
 ```
 
 ## Empirical Benchmarks
+Evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM, CPU-only, Lean 4.36.0) with zero `sorryAx` accepted:
 
-Evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM, CPU-only, Lean 4.36.0) across blind single-module, multi-folder, and open-hypothesis suites:
-
-| Suite | Scope | Proved | Notes |
-| --- | --- | --- | --- |
-| Single-module (Test A1..A5, B1..B10) | Arithmetic, List, BinTree, 3-record associativity | **15 / 15** | 159.65s, zero sorryAx |
-| 4-folder diamond (Test C1..C5) | Cross-module import composition | **5 / 5** | 46.46s, zero sorryAx |
-| 4-folder state-machine (Test D1..D6) | Structure + List replay + dependent existentials | **6 / 6** | 51.77s, dynamic DirectExecute to VDB escalation |
-| Open-hypothesis anti-cheat (Test E1..E3) | 2 provable + 1 open conjecture | **2 / 3** | 17.17s, bounded termination (exit 1), zero sorryAx |
-| Self-verification (`examples/sheaf_self_verify`) | AxiomGate, GateSpec, VfsSpec | **8 / 8** | Standalone import Init spec |
+| Suite | Scope | Proved |
+| :--- | :--- | :---: |
+| Single-module (`Test A1..A5`, `B1..B10`) | Arithmetic, `List`, `BinTree`, 3-record associativity | **15 / 15** (`159.7s`) |
+| 4-folder diamond (`Test C1..C5`) | Cross-module import composition | **5 / 5** (`46.5s`) |
+| 4-folder state-machine (`Test D1..D6`) | `structure` + `List` replay + dependent existentials | **6 / 6** (`51.8s`) |
+| Open-hypothesis (`Test E1..E3`) | 2 provable + 1 unprovable conjecture (exits `1`) | **2 / 3** (`17.2s`) |
+| Self-verification (`examples/sheaf_self_verify`) | `AxiomGate`, `GateSpec`, `VfsSpec` (`import Init`) | **8 / 8** (`38.2s`) |
 
 ## Operational Modes
 

@@ -433,6 +433,27 @@ pub fn format_workspace_footer(
     )
 }
 
+/// Format the final workspace summary footer line with optional ANSI bold green/yellow/red styling.
+#[must_use]
+pub fn format_styled_workspace_footer(
+    proved: usize,
+    total: usize,
+    direct_count: usize,
+    escalated_count: usize,
+    elapsed_ms: u64,
+    with_color: bool,
+) -> String {
+    let footer = format_workspace_footer(proved, total, direct_count, escalated_count, elapsed_ms);
+    let styled_obj = if proved == total {
+        style(footer).green().bold()
+    } else if proved > 0 {
+        style(footer).yellow().bold()
+    } else {
+        style(footer).red().bold()
+    };
+    styled_obj.force_styling(with_color).to_string()
+}
+
 struct LiveBars {
     mp: Arc<MultiProgress>,
     header: Option<ProgressBar>,
@@ -538,17 +559,28 @@ impl LiveBars {
     }
 
     fn clear_active(&mut self) {
+        let had_bars = self.overflow.is_some()
+            || !self.branches.is_empty()
+            || self.route.is_some()
+            || self.header.is_some();
+        if !had_bars {
+            return;
+        }
         if let Some(ov) = self.overflow.take() {
             ov.finish_and_clear();
+            self.mp.remove(&ov);
         }
         for (_, pb) in self.branches.drain(..) {
             pb.finish_and_clear();
+            self.mp.remove(&pb);
         }
         if let Some(r) = self.route.take() {
             r.finish_and_clear();
+            self.mp.remove(&r);
         }
         if let Some(h) = self.header.take() {
             h.finish_and_clear();
+            self.mp.remove(&h);
         }
         let _ = self.mp.clear();
         let _ = std::io::stderr().flush();
@@ -607,6 +639,9 @@ impl UiSession {
                         bars.sync_from_state(mode, &state);
                     }
                     Err(RecvTimeoutError::Disconnected) => {
+                        while let Ok(more) = rx.try_recv() {
+                            process_event(mode, &mut state, &mut bars, &more, &json_buf);
+                        }
                         bars.clear_active();
                         break;
                     }
@@ -711,7 +746,7 @@ fn process_event(
                     diag.as_deref(),
                     *elapsed_ms,
                 );
-                let _ = bars.mp.println(line);
+                eprintln!("\r{line}");
                 let _ = std::io::stderr().flush();
                 state.active_name.clear();
                 state.branches.clear();
@@ -735,18 +770,25 @@ fn process_event(
             elapsed_ms,
         } => {
             bars.clear_active();
-            let footer = format_workspace_footer(
-                *proved,
-                *total,
-                *direct_count,
-                *escalated_count,
-                *elapsed_ms,
-            );
             if mode == UiMode::TtyLive {
-                let styled = style(footer).bold().force_styling(use_color()).to_string();
-                let _ = bars.mp.println(format!("\n{styled}"));
+                let styled = format_styled_workspace_footer(
+                    *proved,
+                    *total,
+                    *direct_count,
+                    *escalated_count,
+                    *elapsed_ms,
+                    use_color(),
+                );
+                eprintln!("\n{styled}");
                 let _ = std::io::stderr().flush();
             } else if mode == UiMode::Plain {
+                let footer = format_workspace_footer(
+                    *proved,
+                    *total,
+                    *direct_count,
+                    *escalated_count,
+                    *elapsed_ms,
+                );
                 eprintln!("{footer}");
             }
         }

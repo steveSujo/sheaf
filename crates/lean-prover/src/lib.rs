@@ -494,6 +494,9 @@ pub struct WorkspaceProveSummary {
     pub discovered: usize,
     pub proved: usize,
     pub failed: usize,
+    pub direct_count: usize,
+    pub escalated_count: usize,
+    pub elapsed_ms: u64,
     pub files_written: usize,
     pub is_interactive_tty: bool,
     pub proved_names: Vec<String>,
@@ -1774,12 +1777,13 @@ pub fn prove_lean_path_with_artifacts_and_options(
     }
 
     let is_interactive_tty = ui_session.is_interactive_tty();
+    let elapsed_ms = ws_start.elapsed().as_millis() as u64;
     ui.send(ui::UiEvent::WorkspaceFinished {
         proved,
         total,
         direct_count,
         escalated_count,
-        elapsed_ms: ws_start.elapsed().as_millis() as u64,
+        elapsed_ms,
     });
     drop(ui);
     let json_events = ui_session.finish();
@@ -1788,6 +1792,9 @@ pub fn prove_lean_path_with_artifacts_and_options(
         discovered: total,
         proved,
         failed,
+        direct_count,
+        escalated_count,
+        elapsed_ms,
         files_written,
         is_interactive_tty,
         proved_names,

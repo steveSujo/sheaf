@@ -1,8 +1,21 @@
 # Changelog
 
-All notable changes to `sheaf` (formerly `lean-prover`) are documented in this file.
+All notable changes to sheaf are documented in this file.
 
-## `[1.4.0]` - 2026-11-22 (tag `v1.4.0`)
+## [1.8.1] - 2026-11-23 (tag v1.8.1)
+
+### Added
+- Ergonomic CLI short flags (`-w` / `--write`, `-s` / `--strict-lint`, `-j` / `--max-workers`, `-h`, `-V`) and default `.` path for `sheaf prove` and `sheaf check`.
+- Standalone `import Init` self-verification suite (`examples/sheaf_self_verify`) modeling sheaf's axiom gate, routing gate, and VFS invariants.
+- Public PyTorch training and L-BFGS calibration pipeline (`scripts/colab_stage1_train.py`, `scripts/colab_stage3_4_tune_and_promote.py`, `scripts/requirements-train.txt`) with `T_choice = 1.6071` OOD calibration and trained PremiseFit weights in `crates/lean-prover/assets/lean_sys1.onnx`.
+- Architecture guide (`docs/ARCHITECTURE.md`), training guide (`scripts/README.md`), `assets/sheaf-demo.gif`, plain-white `sheaf doctor` ASCII banner, and `AGPL-3.0-only` licensing with SPDX headers.
+- `NO_COLOR` support and clean interactive TTY summary footers.
+
+### Fixed
+- Scoped `--strict-lint` warnings to the target theorem's line span after up to two `unusedSimpArgs` pruning passes so sibling `sorry` declarations do not fail per-theorem audits while unprunable target warnings are rejected without silent fallback.
+- Aligned live branch tree prefixes before spinners with pink `⊘` markers on failed/canceled branches and deterministic `MultiProgress` / `stderr` flushing before exit.
+
+## [1.4.0] - 2026-11-22 (tag `v1.4.0`)
 
 ### Added
 - Delimiter pre-splitting (`pre_tokenize_lean_canonical`), `<s>`/`</s>` framing, greedy subword fallback, and expanded 277-token `tokenizer.json` achieving `< 10%` `<unk>` rate (`crates/lean-sys1-ort`).
