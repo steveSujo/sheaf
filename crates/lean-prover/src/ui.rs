@@ -4,6 +4,7 @@
 
 use console::{Term, style, truncate_str};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,10 @@ use std::time::{Duration, Instant};
 const MAX_BRANCH_ROWS: usize = 6;
 const TICK_MS: u64 = 80;
 const FALLBACK_COLS: usize = 80;
+
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && Term::stderr().is_term()
+}
 
 /// Terminal rendering mode selected via CLI flags or `stderr` TTY detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -256,7 +261,7 @@ impl RendererState {
             )
         } else {
             format!(
-                "  Proving [{}/{}] {} ({:.1}s)",
+                "Proving [{}/{}] {} ({:.1}s)",
                 self.active_index, self.total_theorems, self.active_name, elapsed_s
             )
         };
@@ -291,11 +296,11 @@ impl RendererState {
         };
         for (i, row) in self.branches.iter().take(show_cap).enumerate() {
             let is_last = total_branches <= MAX_BRANCH_ROWS && i + 1 == show_cap;
-            lines.push(format_branch_line(row, is_last, max_cols));
+            lines.push(format_branch_line(row, is_last, max_cols, false));
         }
         if total_branches > MAX_BRANCH_ROWS {
             let rem = total_branches - show_cap;
-            lines.push(clamp_line(&format!("  └─ … +{rem} queued"), max_cols));
+            lines.push(clamp_line(&format!("  └─ +{rem} queued"), max_cols));
         }
         lines
     }
@@ -317,28 +322,40 @@ pub fn clamp_line(s: &str, max_chars: usize) -> String {
     truncate_str(&single_line, max_chars.max(1), "…").into_owned()
 }
 
-fn format_branch_line(row: &BranchRow, is_last: bool, max_cols: usize) -> String {
-    let tree_ch = if is_last { "└─" } else { "├─" };
+fn format_branch_body(row: &BranchRow, max_cols: usize, with_color: bool) -> String {
     let sec = (row.elapsed_ms as f64) / 1000.0;
-    let (glyph, detail) = match &row.status {
-        BranchStatus::Queued => ("·", row.preview.clone()),
-        BranchStatus::Running => ("", row.preview.clone()),
-        BranchStatus::Verified { tactic } => ("✓", tactic.clone()),
-        BranchStatus::Failed { reason } => ("✗", format!("{} ({reason})", row.preview)),
-        BranchStatus::Canceled => ("⊘", format!("{} (canceled)", row.preview)),
+    let body = match &row.status {
+        BranchStatus::Queued => format!("· branch #{} [{}] {}  {sec:.1}s", row.id, row.tag, row.preview),
+        BranchStatus::Running => format!("branch #{} [{}] {}  {sec:.1}s", row.id, row.tag, row.preview),
+        BranchStatus::Verified { tactic } => format!(
+            "{} branch #{} [{}] {tactic}  {sec:.1}s",
+            style("✓").green().force_styling(with_color),
+            row.id,
+            row.tag
+        ),
+        BranchStatus::Failed { reason } => format!(
+            "{} branch #{} [{}] {} ({reason})  {sec:.1}s",
+            style("⊘").magenta().bright().force_styling(with_color),
+            row.id,
+            row.tag,
+            row.preview
+        ),
+        BranchStatus::Canceled => format!(
+            "{} branch #{} [{}] {} (canceled)  {sec:.1}s",
+            style("⊘").magenta().bright().force_styling(with_color),
+            row.id,
+            row.tag,
+            row.preview
+        ),
     };
-    let raw = if glyph.is_empty() {
-        format!(
-            "  {tree_ch} branch #{} [{}] {detail}  {sec:.1}s",
-            row.id, row.tag
-        )
-    } else {
-        format!(
-            "  {tree_ch} {glyph} branch #{} [{}] {detail}  {sec:.1}s",
-            row.id, row.tag
-        )
-    };
-    clamp_line(&raw, max_cols)
+    clamp_line(&body, max_cols.saturating_sub(8))
+}
+
+#[cfg(test)]
+fn format_branch_line(row: &BranchRow, is_last: bool, max_cols: usize, with_color: bool) -> String {
+    let tree_ch = if is_last { "└─" } else { "├─" };
+    let body = format_branch_body(row, max_cols, with_color);
+    clamp_line(&format!("  │  {tree_ch} {body}"), max_cols)
 }
 
 /// Format a single permanent scrollback line for a finished theorem.
@@ -372,21 +389,31 @@ fn format_styled_scrollback_line(
     diag: Option<&str>,
     elapsed_ms: u64,
 ) -> String {
+    let with_color = use_color();
     let glyph = if proved {
-        style("✓").green().bold().to_string()
+        style("✓").green().bold().force_styling(with_color).to_string()
     } else {
-        style("✗").red().bold().to_string()
+        style("✗").red().bold().force_styling(with_color).to_string()
     };
     let sec = (elapsed_ms as f64) / 1000.0;
     let short_name = clamp_line(name, 28);
-    let route_styled = style(format!("{route_label:<24}")).dim().to_string();
-    let time_styled = style(format!("{sec:>5.1}s")).dim().to_string();
+    let route_styled = style(format!("{route_label:<24}"))
+        .dim()
+        .force_styling(with_color)
+        .to_string();
+    let time_styled = style(format!("{sec:>5.1}s"))
+        .dim()
+        .force_styling(with_color)
+        .to_string();
     let tail = if proved {
         let t = tactic.unwrap_or("done");
         format!("[{}]", clamp_line(t, 48))
     } else {
         let d = diag.unwrap_or("failed");
-        style(format!("[{}]", clamp_line(d, 48))).red().to_string()
+        style(format!("[{}]", clamp_line(d, 48)))
+            .red()
+            .force_styling(with_color)
+            .to_string()
     };
     format!("  {glyph} {short_name:<28} {route_styled} {time_styled}  {tail}")
 }
@@ -435,9 +462,16 @@ impl LiveBars {
             return;
         }
         let max_cols = term_width_cap();
+        let with_color = use_color();
         let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner())
             .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]);
+        let branch_spinner_style =
+            ProgressStyle::with_template("  │  {prefix} {spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "]);
+        let branch_done_style = ProgressStyle::with_template("  │  {prefix} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner());
         let plain_style = ProgressStyle::with_template("{msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner());
 
@@ -468,7 +502,8 @@ impl LiveBars {
 
         for (i, row) in state.branches.iter().take(show_cap).enumerate() {
             let is_last = total_branches <= MAX_BRANCH_ROWS && i + 1 == show_cap;
-            let msg = format_branch_line(row, is_last, max_cols);
+            let tree_ch = if is_last { "└─" } else { "├─" };
+            let body = format_branch_body(row, max_cols, with_color);
             let pb = if let Some((_, existing)) = self.branches.iter().find(|(id, _)| *id == row.id)
             {
                 existing
@@ -478,18 +513,19 @@ impl LiveBars {
                 self.branches.push((row.id, new_pb));
                 &self.branches.last().expect("just pushed").1
             };
+            pb.set_prefix(tree_ch);
             if matches!(row.status, BranchStatus::Running | BranchStatus::Queued) {
-                pb.set_style(spinner_style.clone());
+                pb.set_style(branch_spinner_style.clone());
             } else {
-                pb.set_style(plain_style.clone());
+                pb.set_style(branch_done_style.clone());
                 pb.disable_steady_tick();
             }
-            pb.set_message(msg);
+            pb.set_message(body);
         }
 
         if total_branches > MAX_BRANCH_ROWS {
             let rem = total_branches - show_cap;
-            let ov_msg = clamp_line(&format!("  └─ … +{rem} queued"), max_cols);
+            let ov_msg = clamp_line(&format!("  └─ +{rem} queued"), max_cols);
             let ov = self.overflow.get_or_insert_with(|| {
                 let pb = self.mp.add(ProgressBar::new_spinner());
                 pb.set_style(plain_style.clone());
@@ -515,6 +551,7 @@ impl LiveBars {
             h.finish_and_clear();
         }
         let _ = self.mp.clear();
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -599,6 +636,12 @@ impl UiSession {
         self.mode
     }
 
+    /// True when both `stderr` and `stdout` are interactive TTYs and no `--plain`/`--verbose`/`--json` override is active.
+    #[must_use]
+    pub fn is_interactive_tty(&self) -> bool {
+        self.mode == UiMode::TtyLive && Term::stdout().is_term()
+    }
+
     /// Flush remaining UI events, stop the renderer thread, and return any captured NDJSON lines.
     pub fn finish(mut self) -> Vec<String> {
         self.shutdown();
@@ -669,6 +712,7 @@ fn process_event(
                     *elapsed_ms,
                 );
                 let _ = bars.mp.println(line);
+                let _ = std::io::stderr().flush();
                 state.active_name.clear();
                 state.branches.clear();
             } else if mode == UiMode::Plain {
@@ -699,7 +743,9 @@ fn process_event(
                 *elapsed_ms,
             );
             if mode == UiMode::TtyLive {
-                let _ = bars.mp.println(style(footer).bold().to_string());
+                let styled = style(footer).bold().force_styling(use_color()).to_string();
+                let _ = bars.mp.println(format!("\n{styled}"));
+                let _ = std::io::stderr().flush();
             } else if mode == UiMode::Plain {
                 eprintln!("{footer}");
             }
@@ -758,7 +804,9 @@ mod tests {
         let lines = state.render_ephemeral_lines(78);
         // 1 header + 1 route + 5 branches + 1 "+3 queued" = 8 lines
         assert_eq!(lines.len(), 8, "unexpected viewport lines: {lines:?}");
-        assert!(lines.last().unwrap().contains("+3 queued"));
+        assert!(lines[2].starts_with("  │  ├─ "), "unexpected branch row: {}", lines[2]);
+        assert!(lines[6].starts_with("  │  ├─ "), "must keep ├─ when queued > 0: {}", lines[6]);
+        assert!(lines.last().unwrap().contains("└─ +3 queued"));
         assert!(
             lines.iter().all(|l| l.chars().count() <= 78),
             "all lines must clamp to <= 78 chars: {lines:?}"

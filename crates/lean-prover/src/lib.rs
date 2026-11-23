@@ -494,6 +494,8 @@ pub struct WorkspaceProveSummary {
     pub discovered: usize,
     pub proved: usize,
     pub failed: usize,
+    pub files_written: usize,
+    pub is_interactive_tty: bool,
     pub proved_names: Vec<String>,
     pub proved_scripts: Vec<(String, Vec<String>)>,
     pub failed_theorems: Vec<(String, String)>,
@@ -1068,14 +1070,14 @@ impl ProveArgs {
     pub fn try_from_args(args: &[String]) -> Result<Self, String> {
         let mut parsed = Self::default();
         if let Some(target) = args.get(2)
-            && !target.starts_with("--")
+            && !target.starts_with('-')
         {
             parsed.target = target.clone();
         }
         let mut i = 2usize;
         while i < args.len() {
             match args[i].as_str() {
-                "--write" => parsed.write = true,
+                "-w" | "--write" => parsed.write = true,
                 "--gate-pct" => {
                     let raw = args
                         .get(i + 1)
@@ -1146,7 +1148,7 @@ impl ProveArgs {
                     parsed.max_nodes = n;
                     i += 1;
                 }
-                "--max-workers" => {
+                "-j" | "--max-workers" => {
                     let raw = args
                         .get(i + 1)
                         .ok_or_else(|| "error: --max-workers requires a value".to_string())?;
@@ -1175,11 +1177,11 @@ impl ProveArgs {
                 "-v" | "--verbose" => parsed.verbose = true,
                 "--plain" => parsed.plain = true,
                 "--json" => parsed.json = true,
-                "--strict-lint" => parsed.strict_lint = true,
+                "-s" | "--strict-lint" => parsed.strict_lint = true,
                 "--help" | "-h" => return Err("__HELP__".to_string()),
-                unknown if unknown.starts_with("--") => {
+                unknown if unknown.starts_with('-') => {
                     return Err(format!(
-                        "error: unknown flag '{unknown}'. Run `sheaf --help` for usage."
+                        "error: unknown flag '{unknown}'\nRun 'sheaf --help' for usage."
                     ));
                 }
                 _ => {}
@@ -1760,15 +1762,18 @@ pub fn prove_lean_path_with_artifacts_and_options(
     }
 
     // Atomic commit: write all dirty files from final root_tree once at exit when --write is set
+    let mut files_written = 0usize;
     if options.write_in_place {
         for dirty_path in root_tree.dirty_paths(&initial_tree) {
             if let Some(content) = root_tree.read_file(&blob_store, dirty_path) {
                 std::fs::write(dirty_path, content.as_ref())
                     .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+                files_written += 1;
             }
         }
     }
 
+    let is_interactive_tty = ui_session.is_interactive_tty();
     ui.send(ui::UiEvent::WorkspaceFinished {
         proved,
         total,
@@ -1783,6 +1788,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
         discovered: total,
         proved,
         failed,
+        files_written,
+        is_interactive_tty,
         proved_names,
         proved_scripts,
         failed_theorems,
@@ -2598,13 +2605,33 @@ fn cli_help_text() -> String {
     concat!(
         "sheaf ",
         env!("CARGO_PKG_VERSION"),
-        "\n\nUsage:\n",
-        "  sheaf prove <PATH> [--write] [--strict-lint] [-v|--verbose] [--plain] [--json] [--gate-pct <0..100>] [--max-branches <N>=4]\n",
-        "                     [--premise-tau <0..1>] [--max-depth <1..16>=4] [--max-nodes <1..1024>=64] [--max-workers <1..8>=2] [--max-heartbeats <N>=200000]\n",
-        "  sheaf check <PATH>             List remaining sorry theorems in a file or workspace\n",
-        "  sheaf init [--dir <PATH>]      Bootstrap default runtime artifacts\n",
-        "  sheaf doctor                   Verify Lean 4, Lake, and artifact readiness\n",
-        "  sheaf --version                Print version\n",
+        " - Local-first Lean 4 auto-prover\n\n",
+        "Usage:\n",
+        "  sheaf <COMMAND> [OPTIONS]\n\n",
+        "Commands:\n",
+        "  prove [PATH]     Prove sorry theorems in a file or workspace (default: .)\n",
+        "  check [PATH]     List remaining sorry theorems (default: .)\n",
+        "  init             Extract embedded ONNX/VDB runtime artifacts\n",
+        "  doctor           Verify Lean 4, Lake, and embedded asset readiness\n\n",
+        "Common Options (prove):\n",
+        "  -w, --write              Write verified proofs to disk atomically\n",
+        "  -s, --strict-lint        Reject proofs with unusedVariables / unusedSimpArgs\n",
+        "  -j, --max-workers <N>    Concurrent Lean workers [1..8] (default: 2)\n\n",
+        "Output Options:\n",
+        "  -v, --verbose            Show full 5-stage telemetry per theorem\n",
+        "      --plain              Disable spinners and ANSI colors (CI-friendly)\n",
+        "      --json               Emit NDJSON events on stdout\n\n",
+        "Search Tuning (Advanced):\n",
+        "      --gate-pct <0..100>  System-1 confidence threshold (default: 50)\n",
+        "      --max-branches <N>   Max VDB branches per step [1..16] (default: 4)\n",
+        "      --premise-tau <0..1> Minimum PremiseFit score (default: 0.50)\n",
+        "      --max-depth <N>      Max search depth [1..16] (default: 4)\n",
+        "      --max-nodes <N>      Max search nodes [1..1024] (default: 64)\n",
+        "      --max-heartbeats <N> Per-probe Lean heartbeat cap (default: 200000)\n\n",
+        "Examples:\n",
+        "  sheaf check examples/sheaf_self_verify\n",
+        "  sheaf prove examples/sheaf_self_verify\n",
+        "  sheaf prove . -w -s\n",
     )
     .to_string()
 }
@@ -2616,6 +2643,9 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
         "--help" | "-h" | "help" => Ok((0, cli_help_text())),
         "--version" | "-V" => Ok((0, format!("sheaf {}", env!("CARGO_PKG_VERSION")))),
         "doctor" => {
+            if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
+                return Ok((0, cli_help_text()));
+            }
             let lean_out = std::process::Command::new("lean").arg("--version").output();
             let lean_ver = match lean_out {
                 Ok(o) if o.status.success() => {
@@ -2640,6 +2670,9 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             ))
         }
         "init" => {
+            if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
+                return Ok((0, cli_help_text()));
+            }
             let dir = args
                 .iter()
                 .position(|a| a == "--dir")
@@ -2658,7 +2691,13 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             ))
         }
         "check" => {
-            let target = args.get(2).map_or(".", String::as_str);
+            if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
+                return Ok((0, cli_help_text()));
+            }
+            let target = args
+                .get(2)
+                .filter(|t| !t.starts_with('-'))
+                .map_or(".", String::as_str);
             let target_path = std::path::Path::new(target);
             if !target_path.exists() {
                 return Ok((2, format!("error: path '{target}' does not exist")));
@@ -2691,31 +2730,40 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             if options.json {
                 return Ok((code, summary.json_events.join("\n")));
             }
-            let failed_names: Vec<&str> = summary
-                .failed_theorems
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect();
-            let mut lines = vec![format!(
-                "discovered={} proved={} failed={} theorems={:?} failed_theorems={:?}",
-                summary.discovered, summary.proved, summary.failed, summary.proved_names, failed_names
-            )];
-            if !options.write_in_place {
-                for (name, script) in &summary.proved_scripts {
-                    lines.push(format!("[PROVED] {name} := by\n  {}", script.join("\n  ")));
+            let mut lines = Vec::new();
+            if !summary.is_interactive_tty {
+                let failed_names: Vec<&str> = summary
+                    .failed_theorems
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                lines.push(format!(
+                    "discovered={} proved={} failed={} theorems={:?} failed_theorems={:?}",
+                    summary.discovered,
+                    summary.proved,
+                    summary.failed,
+                    summary.proved_names,
+                    failed_names
+                ));
+                if !options.write_in_place {
+                    for (name, script) in &summary.proved_scripts {
+                        lines.push(format!("[PROVED] {name} := by\n  {}", script.join("\n  ")));
+                    }
                 }
             }
             for (name, diag) in &summary.failed_theorems {
                 lines.push(format!("[FAILED] {name}: {diag}"));
             }
-            if !options.write_in_place && summary.proved > 0 {
+            if options.write_in_place {
+                lines.push(format!("Wrote {} file(s) in place.", summary.files_written));
+            } else if summary.proved > 0 {
                 lines.push("Dry run complete. Re-run with --write to update files.".to_string());
             }
             Ok((code, lines.join("\n")))
         }
         other => Ok((
             2,
-            format!("Unknown command '{other}'. Run `sheaf --help` for usage."),
+            format!("error: unknown command '{other}'\nRun 'sheaf --help' for usage."),
         )),
     }
 }
@@ -2844,6 +2892,42 @@ mod tests {
         assert_eq!(code, 0);
         assert!(out.contains("prove"));
         assert!(out.contains("doctor"));
+    }
+
+    #[test]
+    fn test_cli_short_flags_and_default_path() {
+        let parsed = ProveArgs::try_from_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            "-w".into(),
+            "-s".into(),
+            "-j".into(),
+            "4".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.target, ".");
+        assert!(parsed.write);
+        assert!(parsed.strict_lint);
+        assert_eq!(parsed.max_workers, 4);
+
+        let err = ProveArgs::try_from_args(&["sheaf".into(), "prove".into(), "-x".into()])
+            .unwrap_err();
+        assert!(err.contains("unknown flag '-x'"));
+    }
+
+    #[test]
+    fn test_subcommand_help_flags() {
+        let (c1, o1) = run_cli_args(&["sheaf".into(), "prove".into(), "-h".into()]).unwrap();
+        assert_eq!(c1, 0);
+        assert!(o1.contains("Common Options (prove):"));
+
+        let (c2, o2) = run_cli_args(&["sheaf".into(), "check".into(), "-h".into()]).unwrap();
+        assert_eq!(c2, 0);
+        assert!(o2.contains("check [PATH]"));
+
+        let (c3, o3) = run_cli_args(&["sheaf".into(), "-V".into()]).unwrap();
+        assert_eq!(c3, 0);
+        assert!(o3.starts_with("sheaf "));
     }
 
     #[test]
