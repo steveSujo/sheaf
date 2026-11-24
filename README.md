@@ -58,8 +58,8 @@ Evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM,
 
 - **Interactive TTY (default):** Live 12 Hz branch viewport on stderr, collapsing each proved theorem into a single permanent scrollback line.
 - **Plain / CI (`--plain` or piped stderr):** Disables spinners and ANSI colors automatically (also respects NO_COLOR).
-- **Verbose (`-v` / `--verbose`):** Prints the full 5-stage telemetry tree per theorem.
-- **Machine JSON (`--json`):** Silences stderr and emits NDJSON events on stdout for editor integrations and benchmark harnesses.
+- **Verbose (`-v` / `--verbose`):** Prints the full 5-stage telemetry tree per theorem and surfaces the lowest-goal-count stuck goal state on failures or OOD budget exhaustion.
+- **Machine JSON (`--json`):** Silences stderr and emits NDJSON events on stdout (`TheoremFinished` includes `status`, `vdb_hits`, and `stuck_goal`, and `--diff --json` emits `WorkspaceDiff` events without breaking NDJSON parsers).
 
 ## Reproducing Model Training & Calibration
 
@@ -85,13 +85,16 @@ cargo test --workspace --release       # Run the full Rust test suite
 
 - `sheaf doctor`: Checks `lean --version`, embedded ONNX readiness, and artifact status.
 - `sheaf init [--dir <PATH>]`: Extracts embedded model and index assets to disk.
-- `sheaf check [PATH]`: Lists every remaining sorry theorem (default: `.`).
+- `sheaf check [PATH] [--diagnose]`: Lists every remaining sorry theorem (default: `.`). Passing `--diagnose` runs a zero-ONNX pre-flight build and sanity probe to classify `Trivial`, `ValidOpen`, `FalseSpec`, or compile errors in under 2 seconds.
 - `sheaf prove [PATH] [FLAGS]`: Runs the prover and kernel verifier (default: `.`).
 
 ### Key Flags (`sheaf prove`)
 
+- `-k`, `--filter <PATTERN>`: Prove only theorems whose name matches `<PATTERN>` (warns and exits `1` if zero theorems match).
 - `-w`, `--write`: Commit verified proofs to disk atomically at exit.
-- `-s`, `--strict-lint`: Enforce unusedVariables and unusedSimpArgs on the target theorem during `--write`.
+- `--diff`: Print a unified diff of synthesized proofs without modifying files (emits a `WorkspaceDiff` NDJSON event when combined with `--json`).
+- `-s`, `--strict-lint`: Enforce `unusedVariables` and `unusedSimpArgs` pruning and verification (including compound `simp_all [...]; grind` scripts).
+- `--ood-timeout <1..300>`: Per-theorem escalation budget in seconds for out-of-distribution goals (default `15`).
 - `-j`, `--max-workers <1..8>`: Concurrent Lean workers for multi-file evaluation (default 2).
 - `--gate-pct <0..100>`: Confidence threshold for System 1 direct execution (default 50.0).
 - `--max-branches <1..16>`: Max VDB-backed branches per step (default 4).
@@ -103,8 +106,9 @@ cargo test --workspace --release       # Run the full Rust test suite
 ### Exit Codes
 
 - 0: All discovered sorry theorems proved and kernel-verified (or `sheaf check` found zero sorrys).
-- 1: One or more theorems failed kernel verification (or `sheaf check` found remaining sorrys).
-- 2: Invalid CLI usage, missing path, or asset loading error.
+- 1: One or more theorems failed kernel verification, `-k` matched zero theorems, or `sheaf check` found remaining sorrys.
+- 2: Invalid CLI usage, missing path, asset loading error, or Lean compile error.
+- 3: `FalseSpec` detected during pre-flight sanity probing (`sheaf check --diagnose` or `sheaf prove`).
 
 </details>
 
