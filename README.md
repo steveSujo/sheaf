@@ -120,6 +120,13 @@ Contributions are most useful in three areas:
 - **Tactic synthesis templates:** General-purpose existential, structural induction, and rewrite patterns.
 - **Cross-platform testing:** Linux and macOS builds plus verification against newer Lean 4.x toolchains.
 
+## Acknowledgments
+
+- **Lean 4 & Lean FRO:** For the Lean 4 kernel, `lake` build system, and `lean --json` verification toolchain.
+- **Mathlib4:** For the open-source theorem and premise corpus indexed in `mathlib_sq8.vdb`.
+- **LeJEPA:** Architectural inspiration for `FallbackToLeJepa` next-state embedding prediction and SIGReg regularization.
+- **Upstream Rust ecosystem:** For the open-source crates compiled into `sheaf` (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full crate names, versions, and SPDX licenses).
+
 ## License & Author
 
 Licensed under [AGPL-3.0-only](LICENSE).
