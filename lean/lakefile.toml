@@ -1,0 +1,6 @@
+name = "sheaf_self_verify"
+version = "0.1.0"
+defaultTargets = ["SheafSpec"]
+
+[[lean_lib]]
+name = "SheafSpec"
