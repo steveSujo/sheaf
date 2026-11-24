@@ -154,6 +154,7 @@ fn is_decl_boundary_line(trimmed: &str) -> bool {
         "section ",
         "end ",
         "/--",
+        "/-!",
         "#print axioms ",
     ];
     PREFIXES.iter().any(|p| trimmed.starts_with(p))
@@ -480,12 +481,34 @@ fn audit_and_prune_unused_simp_args(
     Ok(Ok((cur_src, cur_script)))
 }
 
+fn find_matching_block_comment_start(s: &str) -> Option<usize> {
+    if !s.ends_with("-/") {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = bytes.len();
+    while i >= 2 {
+        if bytes[i - 2] == b'-' && bytes[i - 1] == b'/' {
+            depth += 1;
+            i -= 2;
+        } else if bytes[i - 2] == b'/' && bytes[i - 1] == b'-' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i - 2);
+            }
+            i -= 2;
+        } else {
+            i -= 1;
+        }
+    }
+    None
+}
+
 fn strip_trailing_docstrings_and_attrs(prefix: &str) -> &str {
     let mut s = prefix.trim_end();
     loop {
-        if s.ends_with("-/")
-            && let Some(start) = s.rfind("/--")
-        {
+        if let Some(start) = find_matching_block_comment_start(s) {
             s = s[..start].trim_end();
             continue;
         }
@@ -505,6 +528,91 @@ fn strip_trailing_docstrings_and_attrs(prefix: &str) -> &str {
         break;
     }
     s
+}
+
+fn run_lean_src_messages(
+    src: &str,
+    lake_root: Option<&std::path::Path>,
+) -> Result<Vec<serde_json::Value>, ProverError> {
+    let dir = std::env::temp_dir().join("sheaf_preflight_probe");
+    let _ = std::fs::create_dir_all(&dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp_file = dir.join(format!("probe_{}_{nanos}.lean", std::process::id()));
+    std::fs::write(&tmp_file, src)
+        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+    let out = run_lean_json_with_strict(&tmp_file, lake_root, false);
+    let _ = std::fs::remove_file(&tmp_file);
+    let out = out?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut msgs = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(m) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            msgs.push(m);
+        }
+    }
+    Ok(msgs)
+}
+
+/// Pre-flight kernel probe classifying `(BuildStatus, SanityStatus, Option<winning_script_or_diag>)`
+/// before entering ONNX / VDB / tree search.
+pub fn probe_preflight_build_and_sanity(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    _full_name: &str,
+    lake_root: Option<&std::path::Path>,
+) -> Result<(crate::BuildStatus, crate::SanityStatus, Option<String>), ProverError> {
+    let triv_tactic = "first | rfl | decide | trivial";
+    let triv_src = crate::replace_theorem_sorry(src, &thm.name, &format!("  {triv_tactic}"));
+    let triv_msgs = run_lean_src_messages(&triv_src, lake_root)?;
+    let (span_start, span_end) = target_theorem_line_span(&triv_src, &thm.name);
+
+    let mut has_error = false;
+    let mut external_err: Option<String> = None;
+    for msg in &triv_msgs {
+        if msg.get("severity").and_then(|s| s.as_str()) == Some("error") {
+            has_error = true;
+            let line = msg
+                .get("pos")
+                .and_then(|p| p.get("line"))
+                .and_then(|l| l.as_u64())
+                .unwrap_or(0) as usize;
+            let data = msg.get("data").and_then(|d| d.as_str()).unwrap_or("").trim();
+            if (line == 0 || line < span_start || line > span_end) && external_err.is_none() {
+                external_err = Some(format!("compile error: {data}"));
+            }
+        }
+    }
+    if let Some(err) = external_err {
+        return Ok((crate::BuildStatus::CompileError, crate::SanityStatus::ValidOpen, Some(err)));
+    }
+    if !has_error {
+        return Ok((
+            crate::BuildStatus::Ok,
+            crate::SanityStatus::Trivial,
+            Some(triv_tactic.to_string()),
+        ));
+    }
+
+    let false_src = crate::replace_theorem_sorry(
+        src,
+        &thm.name,
+        "  intros; try simp_all; trace_state; sorry",
+    );
+    let false_msgs = run_lean_src_messages(&false_src, lake_root)?;
+    for msg in &false_msgs {
+        let d = msg.get("data").and_then(|s| s.as_str()).unwrap_or("");
+        if d.contains("⊢ False") || d.contains("⊢ true = false") || d.contains("⊢ false = true") {
+            return Ok((
+                crate::BuildStatus::Ok,
+                crate::SanityStatus::FalseSpec,
+                Some(format!("false spec: {}", d.trim())),
+            ));
+        }
+    }
+
+    Ok((crate::BuildStatus::Ok, crate::SanityStatus::ValidOpen, None))
 }
 
 /// Evaluate candidate scripts in batches of 8 with per-probe `set_option maxHeartbeats <N> in` isolation.
@@ -1255,6 +1363,67 @@ theorem thm_two (m : Nat) : m = m := by
             panic!("strict_lint must ignore sorry warnings in thm_two, got diag: {diag}")
         });
         assert_eq!(script, vec!["simp [Nat.add_zero]".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_strip_trailing_docstrings_handles_module_docstring() {
+        let prefix = concat!(
+            "/-- Helper doc -/\n",
+            "def route (x : Nat) : Nat := x\n",
+            "/-! ### 1. Section Header -/\n",
+        );
+        let stripped = strip_trailing_docstrings_and_attrs(prefix);
+        assert!(
+            stripped.contains("def route (x : Nat) : Nat := x"),
+            "module docstring /-! ... -/ must not strip preceding def: {stripped}"
+        );
+        assert!(!stripped.contains("Section Header"));
+    }
+
+    #[test]
+    fn test_m21_002_probe_preflight_build_and_sanity() {
+        let dir = std::env::temp_dir().join("sheaf_m21_002_preflight_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let f_err = dir.join("CompileErr.lean");
+        let src_err = "import Init\ndef bad : Nat := true\ntheorem t (n : Nat) : n = n := by\n  sorry\n";
+        std::fs::write(&f_err, src_err).unwrap();
+        let thms_err = discover_sorry_theorems(&f_err).unwrap();
+        let (b_err, _, diag_err) =
+            probe_preflight_build_and_sanity(src_err, &thms_err[0], "t", None).unwrap();
+        assert_eq!(b_err, crate::BuildStatus::CompileError);
+        assert!(diag_err.is_some());
+
+        let f_triv = dir.join("Triv.lean");
+        let src_triv = "import Init\ntheorem t_triv (n : Nat) : n + 0 = n := by\n  sorry\n";
+        std::fs::write(&f_triv, src_triv).unwrap();
+        let thms_triv = discover_sorry_theorems(&f_triv).unwrap();
+        let (b_triv, s_triv, tactic_triv) =
+            probe_preflight_build_and_sanity(src_triv, &thms_triv[0], "t_triv", None).unwrap();
+        assert_eq!(b_triv, crate::BuildStatus::Ok);
+        assert_eq!(s_triv, crate::SanityStatus::Trivial);
+        assert!(tactic_triv.is_some());
+
+        let f_false = dir.join("FalseSpec.lean");
+        let src_false = "import Init\ntheorem t_false : (0 : Nat) = 1 := by\n  sorry\n";
+        std::fs::write(&f_false, src_false).unwrap();
+        let thms_false = discover_sorry_theorems(&f_false).unwrap();
+        let (b_false, s_false, _) =
+            probe_preflight_build_and_sanity(src_false, &thms_false[0], "t_false", None).unwrap();
+        assert_eq!(b_false, crate::BuildStatus::Ok);
+        assert_eq!(s_false, crate::SanityStatus::FalseSpec);
+
+        let f_open = dir.join("Open.lean");
+        let src_open = "import Init\ntheorem t_open (xs ys : List Nat) : (xs ++ ys).length = xs.length + ys.length := by\n  sorry\n";
+        std::fs::write(&f_open, src_open).unwrap();
+        let thms_open = discover_sorry_theorems(&f_open).unwrap();
+        let (b_open, s_open, _) =
+            probe_preflight_build_and_sanity(src_open, &thms_open[0], "t_open", None).unwrap();
+        assert_eq!(b_open, crate::BuildStatus::Ok);
+        assert_eq!(s_open, crate::SanityStatus::ValidOpen);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
