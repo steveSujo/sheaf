@@ -361,7 +361,7 @@ fn prune_unused_simp_args_by_span(
     // Collect all `simp [` and `simp_all [` bracket ranges in `body` from back to front so
     // replacing a range never shifts earlier offsets.
     let mut brackets: Vec<(usize, usize, &'static str)> = Vec::new();
-    for kw in ["simp_all [", "simp ["] {
+    for kw in ["simp_all [", "simp only [", "dsimp only [", "dsimp [", "simp ["] {
         let mut search_from = 0usize;
         while let Some(rel) = body[search_from..].find(kw) {
             let kw_start = search_from + rel;
@@ -429,11 +429,15 @@ fn audit_and_prune_unused_simp_args(
     };
     let mut cur_script = script.to_vec();
 
-    let has_simp_list = cur_script
-        .iter()
-        .any(|l| l.contains("simp [") || l.contains("simp_all ["));
+    let has_simp_list = cur_script.iter().any(|l| {
+        l.contains("simp [")
+            || l.contains("simp_all [")
+            || l.contains("simp only [")
+            || l.contains("dsimp only [")
+            || l.contains("dsimp [")
+    });
     if prune_unused_simp && has_simp_list {
-        for _ in 0..2 {
+        for _ in 0..4 {
             let occurrences = collect_unused_simp_occurrences(&cur_audit, &cur_stdout);
             if occurrences.is_empty() {
                 break;
@@ -1425,5 +1429,36 @@ theorem thm_two (m : Nat) : m = m := by
         assert_eq!(s_open, crate::SanityStatus::ValidOpen);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m23_task3_strict_lint_prunes_compound_simp_all_grind() {
+        let src = concat!(
+            "import Init\n",
+            "def d1 (x : Nat) : Nat := x + 1\n",
+            "def d2 (x : Nat) : Nat := x + 2\n",
+            "def d3 (x : Nat) : Nat := x + 3\n",
+            "def d4 (x : Nat) : Nat := x + 4\n",
+            "def d5 (x : Nat) : Nat := x + 5\n",
+            "theorem only_d1_needed (a b : Nat) (h1 : a + 1 ≤ b) (h2 : b ≤ a + 1) : d1 a = b := by\n",
+            "  sorry\n",
+        );
+        let script = vec!["simp_all [d1, d2, d3, d4, d5]; grind".to_string()];
+        let audited = audit_and_prune_unused_simp_args(
+            src,
+            "only_d1_needed",
+            "only_d1_needed",
+            &script,
+            None,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("compound simp_all; grind must prune unused defs and pass strict_lint");
+        let joined = audited.1.join("; ");
+        assert!(joined.contains("d1"), "must keep needed d1: {joined}");
+        for unused in ["d2", "d3", "d4", "d5"] {
+            assert!(!joined.contains(unused), "must prune unused {unused}: {joined}");
+        }
     }
 }
