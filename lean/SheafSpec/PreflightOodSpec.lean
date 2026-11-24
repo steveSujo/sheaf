@@ -125,4 +125,39 @@ theorem in_dist_low_conf_escalates
     routePipeline .prove .ok .validOpen .inDist conf baseTau oodDrop vdbHits = .escalateVdb := by
   simp [effectiveThreshold, routePipeline] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [isProverAction, effectiveThreshold, routePipeline, compile_error_aborts, false_spec_aborts, check_mode_never_proves, trivial_bypasses_search, ood_relaxes_threshold, ood_zero_vdb_hits_avoids_loop]) | omega))
 
+-- ### 3. Cross-File OOD, Exit Codes & OOD Timeout Guard
+
+def classifyOod (hasLocalCustom hasWorkspaceDeps : Bool) : OodStatus :=
+  if hasLocalCustom || hasWorkspaceDeps then .oodDomain else .inDist
+
+theorem workspace_deps_triggers_ood (hasLocal : Bool) :
+    classifyOod hasLocal true = .oodDomain := by
+  simp_all [classifyOod]
+
+def exitCode (outcome : RouteOutcome) (proved : Bool) : Nat :=
+  match outcome with
+  | .abortCompileError => 2
+  | .abortFalseSpec => 3
+  | .reportOnly => 0
+  | .directTrivial => 0
+  | .directExecute => if proved then 0 else 1
+  | .escalateVdb => if proved then 0 else 1
+
+theorem compile_error_exit_2 (proved : Bool) :
+    exitCode .abortCompileError proved = 2 := by
+  first | rfl | decide | trivial
+
+theorem false_spec_exit_3 (proved : Bool) :
+    exitCode .abortFalseSpec proved = 3 := by
+  first | rfl | decide | trivial
+
+def shouldAbortOodSearch (ood : OodStatus) (elapsedMs timeoutMs : Nat) : Bool :=
+  match ood with
+  | .oodDomain => decide (elapsedMs >= timeoutMs)
+  | .inDist => false
+
+theorem ood_budget_exceeded_stops (elapsedMs timeoutMs : Nat) (h : elapsedMs ≥ timeoutMs) :
+    shouldAbortOodSearch .oodDomain elapsedMs timeoutMs = true := by
+  induction elapsedMs <;> simp_all [shouldAbortOodSearch]
+
 end SheafSpec
