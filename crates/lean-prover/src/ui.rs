@@ -100,11 +100,17 @@ pub enum UiEvent {
     },
     TheoremFinished {
         name: String,
+        status: String,
         proved: bool,
         route_label: String,
+        vdb_hits: usize,
         tactic: Option<String>,
         diag: Option<String>,
+        stuck_goal: Option<String>,
         elapsed_ms: u64,
+    },
+    WorkspaceDiff {
+        diffs: Vec<String>,
     },
     WorkspaceFinished {
         proved: usize,
@@ -239,6 +245,7 @@ impl RendererState {
             }
             UiEvent::TheoremFinished { .. }
             | UiEvent::StageLogReady { .. }
+            | UiEvent::WorkspaceDiff { .. }
             | UiEvent::WorkspaceFinished { .. } => {}
         }
     }
@@ -735,6 +742,7 @@ fn process_event(
             tactic,
             diag,
             elapsed_ms,
+            ..
         } => {
             if mode == UiMode::TtyLive {
                 bars.clear_active();
@@ -885,10 +893,13 @@ mod tests {
         });
         ui.send(UiEvent::TheoremFinished {
             name: "Demo.id".to_string(),
+            status: "proved".to_string(),
             proved: true,
             route_label: "DirectExecute(AtomicClose)".to_string(),
+            vdb_hits: 0,
             tactic: Some("rfl".to_string()),
             diag: None,
+            stuck_goal: None,
             elapsed_ms: 120,
         });
         ui.send(UiEvent::WorkspaceFinished {
