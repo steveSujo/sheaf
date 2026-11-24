@@ -114,8 +114,17 @@ pub fn route_pipeline(
 /// Classify whether a theorem references custom domain definitions, structures, or inductives.
 #[must_use]
 pub fn classify_ood_status(thm: &DiscoveredTheorem) -> OodStatus {
-    let _ = thm;
-    todo!("TASK-M21-003")
+    let has_custom = thm
+        .local_defs
+        .iter()
+        .chain(thm.local_structures.iter())
+        .chain(thm.local_inductives.iter())
+        .any(|sym| contains_ident(&thm.signature, sym));
+    if has_custom {
+        OodStatus::OodDomain
+    } else {
+        OodStatus::InDist
+    }
 }
 
 use std::collections::HashSet;
@@ -1495,6 +1504,69 @@ pub fn prove_lean_path_with_artifacts_and_options(
             name: full_name.clone(),
         });
 
+        let lake_root = find_lake_workspace_root(&thm.file);
+        let (build_status, sanity_status, preflight_note) =
+            kernel_eval::probe_preflight_build_and_sanity(
+                &eval_src,
+                thm,
+                &full_name,
+                lake_root.as_deref(),
+            )?;
+        let ood_status = classify_ood_status(thm);
+        let preflight_route = route_pipeline(
+            CmdMode::Prove,
+            build_status,
+            sanity_status,
+            ood_status,
+            0,
+            (options.gate_threshold * 100.0).round() as u32,
+            15,
+            1,
+        );
+        match preflight_route {
+            RouteOutcome::AbortCompileError | RouteOutcome::AbortFalseSpec => {
+                let diag = preflight_note.unwrap_or_else(|| "preflight aborted".to_string());
+                let elapsed_ms = thm_start.elapsed().as_millis() as u64;
+                let route_label = if preflight_route == RouteOutcome::AbortCompileError {
+                    "AbortCompileError"
+                } else {
+                    "AbortFalseSpec"
+                };
+                ui.send(ui::UiEvent::TheoremFinished {
+                    name: full_name.clone(),
+                    proved: false,
+                    route_label: route_label.to_string(),
+                    tactic: None,
+                    diag: Some(diag.clone()),
+                    elapsed_ms,
+                });
+                failed += 1;
+                failed_theorems.push((full_name, diag));
+                continue;
+            }
+            RouteOutcome::DirectTrivial => {
+                let tactic_str = preflight_note.unwrap_or_else(|| "rfl".to_string());
+                let script = vec![tactic_str.clone()];
+                let elapsed_ms = thm_start.elapsed().as_millis() as u64;
+                direct_count += 1;
+                ui.send(ui::UiEvent::TheoremFinished {
+                    name: full_name.clone(),
+                    proved: true,
+                    route_label: "DirectTrivial".to_string(),
+                    tactic: Some(tactic_str.clone()),
+                    diag: None,
+                    elapsed_ms,
+                });
+                let new_src = replace_theorem_sorry(&src, &thm.name, &format!("  {tactic_str}"));
+                root_tree = root_tree.with_updates(&mut blob_store, &[(thm.file.clone(), new_src)]);
+                proved += 1;
+                proved_names.push(full_name.clone());
+                proved_scripts.push((full_name, script));
+                continue;
+            }
+            _ => {}
+        }
+
         // Stage 1: Canonicalize
         let target_str = extract_theorem_target(&thm.signature);
         let hyp_strs: Vec<String> = thm
@@ -1513,9 +1585,15 @@ pub fn prove_lean_path_with_artifacts_and_options(
             lean_sys1_ort::encode_canonical_text(tokenizer_json, &canonical, 512)?;
         let non_pad = attention_mask.iter().filter(|&&m| m == 1).count();
 
-        // Stage 3: Lean-Sys1 ONNX forward pass with configurable confidence gate
+        // Stage 3: Lean-Sys1 ONNX forward pass with OOD-relaxed confidence gate
+        let eff_gate_threshold = effective_threshold(
+            ood_status,
+            (options.gate_threshold * 100.0).round() as u32,
+            15,
+        ) as f32
+            / 100.0;
         let (pred, _choice_logits, gate) =
-            onnx_sess.forward_with_gate(&input_ids, &attention_mask, &temps, options.gate_threshold)?;
+            onnx_sess.forward_with_gate(&input_ids, &attention_mask, &temps, eff_gate_threshold)?;
         let gate_label = match &gate {
             lean_sys1_ort::GateDecision::DirectExecute(_) => "DirectExecute",
             lean_sys1_ort::GateDecision::FallbackToLeJepa => "FallbackToLeJepa",
@@ -1526,7 +1604,6 @@ pub fn prove_lean_path_with_artifacts_and_options(
             gate: gate_label.to_string(),
         });
 
-        let lake_root = find_lake_workspace_root(&thm.file);
         let mut vdb_hits: Vec<lean_vdb::VdbSearchHit> = Vec::new();
         let mut top_lemmas: Vec<String> = Vec::new();
         let mut tried_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4275,7 +4352,6 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
     }
 
     #[test]
-    #[ignore = "TDD: TASK-M21-003"]
     fn test_m21_003_end_to_end_preflight_and_ood_routing() {
         let in_dist_thm = DiscoveredTheorem {
             file: std::path::PathBuf::from("NatBasic.lean"),
