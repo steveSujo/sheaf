@@ -618,6 +618,7 @@ pub struct DiscoveredTheorem {
     pub local_structures: Vec<String>,
     pub local_inductives: Vec<String>,
     pub local_theorems: Vec<String>,
+    pub local_struct_laws: Vec<(String, String)>,
     pub workspace_deps: Vec<std::path::PathBuf>,
 }
 
@@ -854,6 +855,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
         let mut local_structures: Vec<String> = Vec::new();
         let mut local_inductives: Vec<String> = Vec::new();
         let mut local_theorems: Vec<String> = Vec::new();
+        let mut local_struct_laws: Vec<(String, String)> = Vec::new();
 
         for dep in deps {
             if let Some(exp) = exports_by_file.get(dep) {
@@ -902,6 +904,34 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                         file_exports
                             .structures
                             .push((current_ns.clone(), sname.to_string()));
+                    }
+                    let mut scan = idx + 1;
+                    while scan < lines.len() {
+                        let raw_line = lines[scan];
+                        let nt = raw_line.trim();
+                        if nt.is_empty() {
+                            scan += 1;
+                            continue;
+                        }
+                        if !raw_line.starts_with(char::is_whitespace)
+                            || is_top_level_decl_boundary(nt)
+                        {
+                            break;
+                        }
+                        if let Some((lhs, rhs)) = nt.split_once(':') {
+                            let fname = lhs.trim();
+                            let is_ident = !fname.is_empty()
+                                && fname
+                                    .chars()
+                                    .all(|c| c.is_alphanumeric() || c == '_' || c == '\'');
+                            if is_ident
+                                && (rhs.contains('∀') || rhs.contains('→') || rhs.contains('='))
+                            {
+                                local_struct_laws
+                                    .push((sname.to_string(), fname.to_string()));
+                            }
+                        }
+                        scan += 1;
                     }
                 }
             } else if let Some(after_ind) = decl_trimmed.strip_prefix("inductive ") {
@@ -970,6 +1000,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                         local_structures: local_structures.clone(),
                         local_inductives: local_inductives.clone(),
                         local_theorems: local_theorems.clone(),
+                        local_struct_laws: local_struct_laws.clone(),
                         workspace_deps: deps.clone(),
                     });
                 }
@@ -1722,8 +1753,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     options.max_heartbeats,
                     &ui,
                     0,
-                    options.write_in_place,
-                    options.strict_lint && options.write_in_place,
+                    options.write_in_place || options.strict_lint,
+                    options.strict_lint,
                 )?
             }
         } else {
@@ -1802,8 +1833,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         options.max_heartbeats,
                         &ui,
                         tried_scripts.len(),
-                        options.write_in_place,
-                        options.strict_lint && options.write_in_place,
+                        options.write_in_place || options.strict_lint,
+                        options.strict_lint,
                     )?;
                 solved = fb_solved;
                 if !fb_diag.is_empty() {
@@ -2331,6 +2362,63 @@ fn synthesize_from_model_and_vdb(
     let mut bucket_have: Vec<Vec<String>> = Vec::new();
     let mut bucket_induction: Vec<Vec<String>> = Vec::new();
 
+    // 1. Cheap non-inductive hypothesis, prev-theorem, structure-law & early simp_all closers before cases/VDB
+    let mut early_direct: Vec<Vec<String>> = Vec::new();
+    for prev_thm in thm.local_theorems.iter().rev().take(8) {
+        if !all_defs.is_empty() {
+            let defs_all = all_defs.join(", ");
+            early_direct.push(vec![format!(
+                "dsimp only [{defs_all}]; apply {prev_thm} <;> assumption"
+            )]);
+            early_direct.push(vec![format!(
+                "dsimp only [{defs_all}]; apply {prev_thm} <;> omega"
+            )]);
+        }
+        early_direct.push(vec![format!("apply {prev_thm} <;> assumption")]);
+    }
+    let has_prop_hyp = thm.binders.iter().any(|(hyp, ty)| {
+        ty.contains('∀')
+            || ty.contains('→')
+            || ty.contains('∧')
+            || ty.contains('=')
+            || hyp.starts_with("h_")
+            || hyp == "h"
+    });
+    if !all_defs.is_empty() {
+        let defs_all = all_defs.join(", ");
+        early_direct.push(vec![format!("simp_all [{defs_all}]")]);
+    } else if has_prop_hyp {
+        early_direct.push(vec!["simp_all".to_string()]);
+    }
+    for (hyp, ty) in &thm.binders {
+        let is_prop_hyp = ty.contains('∀')
+            || ty.contains('→')
+            || ty.contains('∧')
+            || ty.contains('=')
+            || hyp.starts_with("h_")
+            || hyp == "h";
+        if is_prop_hyp {
+            early_direct.push(vec![format!("apply {hyp} <;> assumption")]);
+            if !all_defs.is_empty() {
+                let defs_all = all_defs.join(", ");
+                early_direct.push(vec![format!("apply {hyp} <;> simp_all [{defs_all}]")]);
+            } else {
+                early_direct.push(vec![format!("apply {hyp} <;> simp_all")]);
+            }
+            early_direct.push(vec![format!("exact {hyp}")]);
+        }
+    }
+    for (sname, fname) in &thm.local_struct_laws {
+        early_direct.push(vec![format!("apply {sname}.{fname} <;> assumption")]);
+        for (s_var, s_ty) in &thm.binders {
+            if s_ty == sname {
+                early_direct.push(vec![format!("apply {s_var}.{fname} <;> assumption")]);
+            }
+        }
+    }
+    bucket_atomic.extend(early_direct.iter().cloned());
+    bucket_apply.extend(early_direct.iter().cloned());
+
     // 1a. Orthogonal theorem-level rewriting (always emitted before unfolding regardless of struct_vars)
     if !thm.local_theorems.is_empty() {
         let thms_list = thm.local_theorems.join(", ");
@@ -2359,6 +2447,34 @@ fn synthesize_from_model_and_vdb(
         bucket_rewrite.push(vec![format!(
             "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
         )]);
+    }
+    if (thm.signature.contains('≤') || thm.signature.contains("<="))
+        && (thm.signature.contains("List.take")
+            || thm.signature.contains(".take")
+            || thm.signature.contains("List.flatten")
+            || thm.signature.contains(".flatten")
+            || thm.signature.contains("List.sum")
+            || thm.signature.contains(".sum"))
+    {
+        let list_vars: Vec<&str> = thm
+            .binders
+            .iter()
+            .filter(|(_, ty)| ty == "List" || ty.starts_with("List "))
+            .map(|(v, _)| v.as_str())
+            .collect();
+        let nat_vars: Vec<&str> = thm
+            .binders
+            .iter()
+            .filter(|(_, ty)| ty == "Nat")
+            .map(|(v, _)| v.as_str())
+            .collect();
+        if let (Some(&xs), true) = (list_vars.first(), nat_vars.len() >= 2) {
+            let d1 = nat_vars[0];
+            let d2 = nat_vars[1];
+            bucket_rewrite.push(vec![format!(
+                "induction {xs} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all <;> omega"
+            )]);
+        }
     }
     bucket_rewrite.push(vec!["grind".to_string()]);
 
@@ -2503,6 +2619,40 @@ fn synthesize_from_model_and_vdb(
         }
 
         for (v_ind, is_list) in induction_targets {
+            if is_list
+                && (thm.signature.contains('≤') || thm.signature.contains("<="))
+                && (thm.signature.contains("List.take")
+                    || thm.signature.contains(".take")
+                    || thm.signature.contains("List.flatten")
+                    || thm.signature.contains(".flatten")
+                    || thm.signature.contains("List.sum")
+                    || thm.signature.contains(".sum"))
+            {
+                let nat_vars: Vec<&str> = thm
+                    .binders
+                    .iter()
+                    .filter(|(v, ty)| v.as_str() != v_ind && ty == "Nat")
+                    .map(|(v, _)| v.as_str())
+                    .collect();
+                if nat_vars.len() >= 2 {
+                    let d1 = nat_vars[0];
+                    let d2 = nat_vars[1];
+                    bucket_induction.insert(
+                        0,
+                        vec![format!(
+                            "induction {v_ind} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all <;> omega"
+                        )],
+                    );
+                    if !ind_ctx_list.is_empty() {
+                        bucket_induction.insert(
+                            1,
+                            vec![format!(
+                                "induction {v_ind} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all [{ind_ctx_list}] <;> omega"
+                            )],
+                        );
+                    }
+                }
+            }
             let other_vars: Vec<&str> = thm
                 .binders
                 .iter()
@@ -2595,6 +2745,7 @@ fn synthesize_from_model_and_vdb(
             lean_sys1_ort::StrategyChoice::Induction => scripts.extend(bucket_induction),
         }
     } else {
+        scripts.extend(early_direct);
         match pred.strategy {
             lean_sys1_ort::StrategyChoice::AtomicClose => {
                 scripts.extend(bucket_atomic);
@@ -4350,6 +4501,7 @@ mod tests {
             local_structures: vec!["State".to_string()],
             local_inductives: vec![],
             local_theorems: vec!["step_conserves".to_string()],
+            local_struct_laws: Vec::new(),
             workspace_deps: vec![],
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4390,6 +4542,7 @@ mod tests {
             local_structures: vec![],
             local_inductives: vec![],
             local_theorems: vec![],
+            local_struct_laws: Vec::new(),
             workspace_deps: vec![],
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4466,6 +4619,7 @@ theorem still_open (a b : Nat) : a + b = b + a := by
             local_structures: vec![],
             local_inductives: vec![],
             local_theorems: vec![],
+            local_struct_laws: Vec::new(),
             workspace_deps: vec![],
         };
         let cands = synthesize_existential_candidates(&thm);
@@ -4591,6 +4745,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_structures: Vec::new(),
             local_inductives: vec!["BuildStatus".to_string(), "SanityStatus".to_string()],
             local_theorems: vec!["helper_ok".to_string()],
+            local_struct_laws: Vec::new(),
             workspace_deps: Vec::new(),
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4698,6 +4853,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_structures: Vec::new(),
             local_inductives: Vec::new(),
             local_theorems: Vec::new(),
+            local_struct_laws: Vec::new(),
             workspace_deps: Vec::new(),
         };
         assert_eq!(classify_ood_status(&in_dist_thm), OodStatus::InDist);
@@ -4763,6 +4919,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_structures: Vec::new(),
             local_inductives: Vec::new(),
             local_theorems: Vec::new(),
+            local_struct_laws: Vec::new(),
             workspace_deps: vec![std::path::PathBuf::from("Types.lean")],
         };
         assert_eq!(classify_ood_status(&thm), OodStatus::OodDomain);
@@ -4953,6 +5110,100 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
         .unwrap();
         assert_eq!(c_false_prove, 3);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m23_task1_direct_hyp_struct_law_and_early_simp_all() {
+        let dir = std::env::temp_dir().join("sheaf_m23_task1_direct_hyp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("DirectHyp.lean");
+        std::fs::write(
+            &f,
+            concat!(
+                "import Init\n",
+                "structure Coord where\n",
+                "  x : Nat\n",
+                "def Coord.isValid (c : Coord) : Bool := c.x < 10\n",
+                "theorem hyp_bool_pred (c : Coord) (h : Coord.isValid c = true) : c.x < 10 := by\n",
+                "  sorry\n",
+                "theorem hyp_univ_inv (P : Nat → Prop) (h_valid : ∀ n, n < 5 → P n) (k : Nat) (hk : k < 5) : P k := by\n",
+                "  sorry\n",
+                "structure LawBox where\n",
+                "  val : Nat → Nat\n",
+                "  law : ∀ n, val n = n\n",
+                "theorem struct_law_direct (b : LawBox) (n : Nat) : b.val n = n := by\n",
+                "  sorry\n",
+            ),
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 3);
+        assert_eq!(summary.proved, 3, "failed: {:?}", summary.failed_theorems);
+        for (name, script) in &summary.proved_scripts {
+            let tactic = script.join("; ");
+            assert!(
+                !tactic.contains("cases "),
+                "{name} must prove without cases, got: {tactic}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m23_task2_list_take_generalized_induction() {
+        let dir = std::env::temp_dir().join("sheaf_m23_task2_take_mono");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("TakeMono.lean");
+        std::fs::write(
+            &f,
+            concat!(
+                "import Init\n",
+                "theorem take_len_mono (xs : List Nat) (d1 d2 : Nat) (h : d1 ≤ d2) : (xs.take d1).length ≤ (xs.take d2).length := by\n",
+                "  sorry\n",
+            ),
+        )
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let summary = prove_lean_path(&f, false).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
+        let tactic = summary.proved_scripts[0].1.join("; ");
+        assert!(
+            tactic.contains("generalizing d1 d2"),
+            "expected generalized induction tactic, got: {tactic}"
+        );
+        assert!(
+            elapsed.as_secs_f64() < 30.0,
+            "take_len_mono took too long: {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m23_dsimp_apply_prev_theorem_before_simp_all() {
+        let dir = std::env::temp_dir().join("sheaf_m23_dsimp_apply_prev");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("DsimpApplyPrev.lean");
+        std::fs::write(
+            &f,
+            concat!(
+                "import Init\n",
+                "def wrappedLen (xs : List (List Nat)) (d : Nat) : Nat := ((xs.take d).flatten).length\n",
+                "theorem take_flat_mono (xs : List (List Nat)) (d1 d2 : Nat) (h : d1 ≤ d2) : ((xs.take d1).flatten).length ≤ ((xs.take d2).flatten).length := by\n",
+                "  induction xs generalizing d1 d2 <;> cases d1 <;> cases d2 <;> simp_all <;> omega\n",
+                "theorem wrapped_mono (xs : List (List Nat)) (d1 d2 : Nat) (h : d1 ≤ d2) : wrappedLen xs d1 ≤ wrappedLen xs d2 := by\n",
+                "  sorry\n",
+            ),
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
