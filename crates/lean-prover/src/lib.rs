@@ -111,16 +111,28 @@ pub fn route_pipeline(
     }
 }
 
-/// Classify whether a theorem references custom domain definitions, structures, or inductives.
+/// Classify whether a theorem references custom domain definitions, structures, inductives,
+/// or cross-file workspace dependencies.
 #[must_use]
 pub fn classify_ood_status(thm: &DiscoveredTheorem) -> OodStatus {
-    let has_custom = thm
+    const STD_BINDER_TYPES: &[&str] = &[
+        "Nat", "Int", "Bool", "String", "Char", "UInt8", "Prop", "Type", "Unit",
+    ];
+    let has_custom_sym = thm
         .local_defs
         .iter()
         .chain(thm.local_structures.iter())
         .chain(thm.local_inductives.iter())
         .any(|sym| contains_ident(&thm.signature, sym));
-    if has_custom {
+    let has_custom_binder = thm.binders.iter().any(|(_, ty)| {
+        let head = ty.split_whitespace().next().unwrap_or("");
+        !STD_BINDER_TYPES.contains(&ty.as_str())
+            && !matches!(head, "List" | "Option" | "Array" | "Fin")
+            && !ty.contains('∧')
+            && !ty.contains('∃')
+            && !ty.contains('→')
+    });
+    if !thm.workspace_deps.is_empty() || has_custom_sym || has_custom_binder {
         OodStatus::OodDomain
     } else {
         OodStatus::InDist
@@ -620,6 +632,10 @@ pub struct WorkspaceProveSummary {
     pub elapsed_ms: u64,
     pub files_written: usize,
     pub is_interactive_tty: bool,
+    pub has_compile_error: bool,
+    pub has_false_spec: bool,
+    pub filter_miss: Option<String>,
+    pub diff_outputs: Vec<String>,
     pub proved_names: Vec<String>,
     pub proved_scripts: Vec<(String, Vec<String>)>,
     pub failed_theorems: Vec<(String, String)>,
@@ -1138,7 +1154,10 @@ fn collect_lean_files(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProveArgs {
     pub target: String,
+    pub filter: Option<String>,
     pub write: bool,
+    pub diff: bool,
+    pub ood_timeout_secs: u64,
     pub gate_pct: f32,
     pub max_branches: usize,
     pub premise_tau: f32,
@@ -1156,7 +1175,10 @@ impl Default for ProveArgs {
     fn default() -> Self {
         Self {
             target: ".".to_string(),
+            filter: None,
             write: false,
+            diff: false,
+            ood_timeout_secs: 15,
             gate_pct: 50.0,
             max_branches: 4,
             premise_tau: 0.50,
@@ -1203,6 +1225,27 @@ impl ProveArgs {
         while i < args.len() {
             match args[i].as_str() {
                 "-w" | "--write" => parsed.write = true,
+                "--diff" => parsed.diff = true,
+                "-k" | "--filter" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --filter requires a pattern".to_string())?;
+                    parsed.filter = Some(raw.clone());
+                    i += 1;
+                }
+                "--ood-timeout" => {
+                    let raw = args
+                        .get(i + 1)
+                        .ok_or_else(|| "error: --ood-timeout requires a value".to_string())?;
+                    let secs = raw
+                        .parse::<u64>()
+                        .map_err(|_| format!("error: invalid --ood-timeout '{raw}'"))?;
+                    if !(1..=300).contains(&secs) {
+                        return Err("error: --ood-timeout must be in 1..=300".to_string());
+                    }
+                    parsed.ood_timeout_secs = secs;
+                    i += 1;
+                }
                 "--gate-pct" => {
                     let raw = args
                         .get(i + 1)
@@ -1320,7 +1363,10 @@ impl ProveArgs {
 /// Runtime configuration derived from `ProveArgs` for `sheaf prove`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProverConfig {
+    pub filter: Option<String>,
     pub write_in_place: bool,
+    pub diff: bool,
+    pub ood_timeout_secs: u64,
     pub gate_threshold: f32,
     pub max_branches: usize,
     pub premise_tau: f32,
@@ -1345,7 +1391,10 @@ impl Default for ProverConfig {
 impl From<&ProveArgs> for ProverConfig {
     fn from(args: &ProveArgs) -> Self {
         Self {
+            filter: args.filter.clone(),
             write_in_place: args.write,
+            diff: args.diff,
+            ood_timeout_secs: args.ood_timeout_secs,
             gate_threshold: args.gate_pct / 100.0,
             max_branches: args.max_branches,
             premise_tau: args.premise_tau,
@@ -1429,7 +1478,20 @@ pub fn prove_lean_path_with_artifacts_and_options(
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Json(e)))?;
     let (vdb, _resolver) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(vdb_bytes)?;
 
-    let theorems = discover_sorry_theorems(path)?;
+    let mut theorems = discover_sorry_theorems(path)?;
+    let mut filter_miss: Option<String> = None;
+    if let Some(pat) = &options.filter {
+        theorems.retain(|t| {
+            let full = match &t.namespace {
+                Some(ns) => format!("{ns}.{}", t.name),
+                None => t.name.clone(),
+            };
+            full.contains(pat) || t.name.contains(pat)
+        });
+        if theorems.is_empty() {
+            filter_miss = Some(pat.clone());
+        }
+    }
     let total = theorems.len();
     let ui_mode = if options.json {
         ui::UiMode::Json
@@ -1449,6 +1511,8 @@ pub fn prove_lean_path_with_artifacts_and_options(
     let mut failed = 0usize;
     let mut direct_count = 0usize;
     let mut escalated_count = 0usize;
+    let mut has_compile_error = false;
+    let mut has_false_spec = false;
     let mut proved_names = Vec::new();
     let mut proved_scripts = Vec::new();
     let mut failed_theorems = Vec::new();
@@ -1528,16 +1592,21 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 let diag = preflight_note.unwrap_or_else(|| "preflight aborted".to_string());
                 let elapsed_ms = thm_start.elapsed().as_millis() as u64;
                 let route_label = if preflight_route == RouteOutcome::AbortCompileError {
+                    has_compile_error = true;
                     "AbortCompileError"
                 } else {
+                    has_false_spec = true;
                     "AbortFalseSpec"
                 };
                 ui.send(ui::UiEvent::TheoremFinished {
                     name: full_name.clone(),
+                    status: "failed".to_string(),
                     proved: false,
                     route_label: route_label.to_string(),
+                    vdb_hits: 0,
                     tactic: None,
                     diag: Some(diag.clone()),
+                    stuck_goal: Some(diag.clone()),
                     elapsed_ms,
                 });
                 failed += 1;
@@ -1548,13 +1617,28 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 let tactic_str = preflight_note.unwrap_or_else(|| "rfl".to_string());
                 let script = vec![tactic_str.clone()];
                 let elapsed_ms = thm_start.elapsed().as_millis() as u64;
+                let log_block = format!(
+                    "[{}/{}] {full_name} ({}:{})\n  ├─ 1. Canonicalize : {}\n  ├─ 2. Tokenize     : skipped (DirectTrivial)\n  ├─ 3. Lean-Sys1    : skipped (DirectTrivial)\n  ├─ 4. Orion VDB    : skipped (DirectTrivial)\n  └─ 5. Lean Kernel  : VERIFIED in {elapsed_ms}ms [tactic: {tactic_str}]",
+                    idx + 1,
+                    total,
+                    thm.file.display(),
+                    thm.line,
+                    extract_theorem_target(&thm.signature),
+                );
+                ui.send(ui::UiEvent::StageLogReady {
+                    log_block: log_block.clone(),
+                });
+                stage_logs.push(log_block);
                 direct_count += 1;
                 ui.send(ui::UiEvent::TheoremFinished {
                     name: full_name.clone(),
+                    status: "proved".to_string(),
                     proved: true,
                     route_label: "DirectTrivial".to_string(),
+                    vdb_hits: 0,
                     tactic: Some(tactic_str.clone()),
                     diag: None,
+                    stuck_goal: None,
                     elapsed_ms,
                 });
                 let new_src = replace_theorem_sorry(&src, &thm.name, &format!("  {tactic_str}"));
@@ -1659,6 +1743,18 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 vdb_hits: vdb_hits.len(),
                 tau: options.premise_tau,
             });
+            let post_vdb_route = route_pipeline(
+                CmdMode::Prove,
+                build_status,
+                sanity_status,
+                ood_status,
+                (pred.answer_confidence * 100.0).round() as u32,
+                (options.gate_threshold * 100.0).round() as u32,
+                15,
+                vdb_hits.len(),
+            );
+            let short_circuit_ood_empty_vdb =
+                ood_status == OodStatus::OodDomain && vdb_hits.is_empty() && post_vdb_route == RouteOutcome::DirectExecute;
             let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
             let cand_names: Vec<String> =
                 vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
@@ -1715,18 +1811,34 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 }
                 unsolved_diags.extend(fb_unsolved);
             }
+            if short_circuit_ood_empty_vdb && solved.is_none() {
+                unsolved_diags.clear();
+            }
         }
 
         // Deep (>= 3-step) Best-First compositional subgoal search backed by BlobStore + TreeSnapshot
         if solved.is_none() && !unsolved_diags.is_empty() && options.max_depth > 1 {
+            let search_max_nodes = if ood_status == OodStatus::OodDomain {
+                options.max_nodes.min(16)
+            } else {
+                options.max_nodes
+            };
             let search_res = search::run_best_first_tree_search(
                 &mut blob_store,
                 root_tree.clone(),
                 thm.file.clone(),
                 canonical.clone(),
                 options.max_depth,
-                options.max_nodes,
+                search_max_nodes,
                 |store, node, dedup| {
+                    if ood_status == OodStatus::OodDomain
+                        && thm_start.elapsed() >= std::time::Duration::from_secs(options.ood_timeout_secs)
+                    {
+                        return Ok(search::StepOutcome::Pruned(format!(
+                            "ood escalation budget exceeded ({}s)",
+                            options.ood_timeout_secs
+                        )));
+                    }
                     let cur_src = if node.depth == 0 {
                         eval_src.clone()
                     } else {
@@ -1893,6 +2005,26 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 last_diag = search_res.last_diag;
             }
         }
+        let stuck_goal = if solved.is_none() {
+            select_lowest_goal_diag(&unsolved_diags).or_else(|| {
+                if !last_diag.is_empty() {
+                    Some(last_diag.clone())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if solved.is_none()
+            && let Some(sg) = &stuck_goal
+            && (last_diag.contains("semantic loop pruned")
+                || last_diag.contains("made no progress")
+                || last_diag.contains("budget exceeded"))
+            && !last_diag.contains(sg.as_str())
+        {
+            last_diag = format!("{last_diag} | {sg}");
+        }
 
         let elapsed_ms = thm_start.elapsed().as_millis();
         let kernel_line = match &solved {
@@ -1926,14 +2058,21 @@ pub fn prove_lean_path_with_artifacts_and_options(
         };
         ui.send(ui::UiEvent::TheoremFinished {
             name: full_name.clone(),
+            status: if solved.is_some() {
+                "proved".to_string()
+            } else {
+                "failed".to_string()
+            },
             proved: solved.is_some(),
             route_label,
+            vdb_hits: vdb_hits.len(),
             tactic: solved.as_ref().map(|(_, s)| s.join("; ")),
             diag: if solved.is_none() {
                 Some(last_diag.clone())
             } else {
                 None
             },
+            stuck_goal,
             elapsed_ms: elapsed_ms as u64,
         });
 
@@ -1951,6 +2090,27 @@ pub fn prove_lean_path_with_artifacts_and_options(
         } else {
             failed += 1;
             failed_theorems.push((full_name, last_diag));
+        }
+    }
+
+    let mut diff_outputs = Vec::new();
+    if options.diff {
+        for dirty_path in root_tree.dirty_paths(&initial_tree) {
+            if let (Some(orig), Some(updated)) = (
+                initial_tree.read_file(&blob_store, dirty_path),
+                root_tree.read_file(&blob_store, dirty_path),
+            ) {
+                diff_outputs.push(format_unified_diff(
+                    dirty_path,
+                    orig.as_ref(),
+                    updated.as_ref(),
+                ));
+            }
+        }
+        if !diff_outputs.is_empty() {
+            ui.send(ui::UiEvent::WorkspaceDiff {
+                diffs: diff_outputs.clone(),
+            });
         }
     }
 
@@ -1987,6 +2147,10 @@ pub fn prove_lean_path_with_artifacts_and_options(
         elapsed_ms,
         files_written,
         is_interactive_tty,
+        has_compile_error,
+        has_false_spec,
+        filter_miss,
+        diff_outputs,
         proved_names,
         proved_scripts,
         failed_theorems,
@@ -2176,10 +2340,55 @@ fn synthesize_from_model_and_vdb(
         }
     }
     if !context_list.is_empty() {
+        if !all_defs.is_empty() {
+            let defs_all = all_defs.join(", ");
+            bucket_rewrite.push(vec![format!("simp_all [{defs_all}]")]);
+            bucket_rewrite.push(vec![format!("dsimp only [{defs_all}] at *; simp_all")]);
+            bucket_rewrite.push(vec![format!("simp_all [{defs_all}]; grind")]);
+            bucket_rewrite.push(vec![format!("unfold {defs_all} at *; grind")]);
+            bucket_rewrite.push(vec![format!("intro h; simp_all [{defs_all}]")]);
+            bucket_rewrite.push(vec![format!("dsimp [{defs_all}] at *; omega")]);
+            bucket_rewrite.push(vec![format!("unfold {defs_all} at *; simp_all; try omega")]);
+            bucket_atomic.push(vec![format!("simp_all [{defs_all}]")]);
+            bucket_atomic.push(vec![format!("dsimp only [{defs_all}] at *; simp_all")]);
+            bucket_atomic.push(vec![format!("simp_all [{defs_all}]; grind")]);
+            bucket_atomic.push(vec![format!("unfold {defs_all} at *; grind")]);
+            bucket_atomic.push(vec![format!("intro h; simp_all [{defs_all}]")]);
+        }
         bucket_rewrite.push(vec![format!("simp [{context_list}]")]);
         bucket_rewrite.push(vec![format!(
             "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
         )]);
+    }
+    bucket_rewrite.push(vec!["grind".to_string()]);
+
+    // 1c. General existential-conjunction & negation-by-contradiction closers
+    if thm.signature.contains('∧') || thm.signature.contains('∃') || head_symbol == "And" || head_symbol == "Exists" {
+        let structural_closer = if !all_defs.is_empty() {
+            let defs_all = all_defs.join(", ");
+            format!("unfold {defs_all}; constructor <;> (first | assumption | exact ⟨_, by assumption⟩ | simp_all | grind)")
+        } else {
+            "constructor <;> (first | assumption | exact ⟨_, by assumption⟩ | simp_all | grind)".to_string()
+        };
+        bucket_have.push(vec![structural_closer.clone()]);
+        bucket_rewrite.push(vec![structural_closer]);
+    }
+    if thm.signature.contains('¬') || thm.signature.contains('∉') {
+        let (neg_simp, neg_grind) = if !all_defs.is_empty() {
+            let defs_all = all_defs.join(", ");
+            (
+                format!("intro h_neg; simp_all [{defs_all}]"),
+                format!("intro h_neg; unfold {defs_all} at *; grind"),
+            )
+        } else {
+            (
+                "intro h_neg; simp_all".to_string(),
+                "intro h_neg; grind".to_string(),
+            )
+        };
+        bucket_have.push(vec![neg_simp.clone(), neg_grind.clone()]);
+        bucket_rewrite.push(vec![neg_simp]);
+        bucket_rewrite.push(vec![neg_grind]);
     }
 
     // 1b. Local def + structure binders with incremental split-and-prune omega
@@ -2831,6 +3040,54 @@ fn find_standalone_sorry_pos(code: &str) -> Option<usize> {
     None
 }
 
+fn select_lowest_goal_diag(unsolved_diags: &[(Vec<String>, String)]) -> Option<String> {
+    unsolved_diags
+        .iter()
+        .filter(|(_, d)| !d.trim().is_empty())
+        .min_by_key(|(_, d)| {
+            let goals = d.matches('⊢').count();
+            if goals == 0 { usize::MAX } else { goals }
+        })
+        .map(|(_, d)| d.trim().to_string())
+}
+
+fn format_unified_diff(path: &std::path::Path, orig: &str, updated: &str) -> String {
+    let orig_lines: Vec<&str> = orig.lines().collect();
+    let new_lines: Vec<&str> = updated.lines().collect();
+    let mut prefix = 0usize;
+    while prefix < orig_lines.len()
+        && prefix < new_lines.len()
+        && orig_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while prefix + suffix < orig_lines.len()
+        && prefix + suffix < new_lines.len()
+        && orig_lines[orig_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_end = orig_lines.len().saturating_sub(suffix);
+    let new_end = new_lines.len().saturating_sub(suffix);
+    let mut out = format!(
+        "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
+        path.display(),
+        path.display(),
+        prefix + 1,
+        old_end.saturating_sub(prefix),
+        prefix + 1,
+        new_end.saturating_sub(prefix),
+    );
+    for l in &orig_lines[prefix..old_end] {
+        out.push_str(&format!("-{l}\n"));
+    }
+    for l in &new_lines[prefix..new_end] {
+        out.push_str(&format!("+{l}\n"));
+    }
+    out
+}
+
 fn cli_help_text() -> String {
     concat!(
         "sheaf ",
@@ -2845,13 +3102,18 @@ fn cli_help_text() -> String {
         "  doctor           Verify Lean 4, Lake, and embedded asset readiness\n\n",
         "Common Options (prove):\n",
         "  -w, --write              Write verified proofs to disk atomically\n",
+        "      --diff               Preview unified diff of synthesized proofs\n",
+        "  -k, --filter <PATTERN>   Prove only theorems matching <PATTERN>\n",
         "  -s, --strict-lint        Reject proofs with unusedVariables / unusedSimpArgs\n",
         "  -j, --max-workers <N>    Concurrent Lean workers [1..8] (default: 2)\n\n",
+        "Common Options (check):\n",
+        "      --diagnose           Run zero-ONNX pre-flight build and sanity probe\n\n",
         "Output Options:\n",
-        "  -v, --verbose            Show full 5-stage telemetry per theorem\n",
+        "  -v, --verbose            Show full 5-stage telemetry and stuck goals\n",
         "      --plain              Disable spinners and ANSI colors (CI-friendly)\n",
         "      --json               Emit NDJSON events on stdout\n\n",
         "Search Tuning (Advanced):\n",
+        "      --ood-timeout <S>    OOD escalation wall-clock budget in secs [1..300] (default: 15)\n",
         "      --gate-pct <0..100>  System-1 confidence threshold (default: 50)\n",
         "      --max-branches <N>   Max VDB branches per step [1..16] (default: 4)\n",
         "      --premise-tau <0..1> Minimum PremiseFit score (default: 0.50)\n",
@@ -2859,8 +3121,8 @@ fn cli_help_text() -> String {
         "      --max-nodes <N>      Max search nodes [1..1024] (default: 64)\n",
         "      --max-heartbeats <N> Per-probe Lean heartbeat cap (default: 200000)\n\n",
         "Examples:\n",
-        "  sheaf check examples/sheaf_self_verify\n",
-        "  sheaf prove examples/sheaf_self_verify\n",
+        "  sheaf check --diagnose examples/sheaf_self_verify\n",
+        "  sheaf prove examples/sheaf_self_verify -k allowlist --diff\n",
         "  sheaf prove . -w -s\n",
     )
     .to_string()
@@ -2934,6 +3196,7 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
                 return Ok((0, cli_help_text()));
             }
+            let diagnose = args.iter().skip(2).any(|a| a == "--diagnose");
             let target = args
                 .get(2)
                 .filter(|t| !t.starts_with('-'))
@@ -2943,15 +3206,66 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                 return Ok((2, format!("error: path '{target}' does not exist")));
             }
             let found = discover_sorry_theorems(target_path)?;
-            let code = if found.is_empty() { 0 } else { 1 };
-            let mut lines = vec![format!("Found {} sorry theorem(s) in {target}", found.len())];
+            if !diagnose {
+                let code = if found.is_empty() { 0 } else { 1 };
+                let mut lines = vec![format!("Found {} sorry theorem(s) in {target}", found.len())];
+                for thm in &found {
+                    let full_name = match &thm.namespace {
+                        Some(ns) => format!("{ns}.{}", thm.name),
+                        None => thm.name.clone(),
+                    };
+                    lines.push(format!("  {}:{}: {full_name}", thm.file.display(), thm.line));
+                }
+                return Ok((code, lines.join("\n")));
+            }
+
+            let mut lines = vec![format!(
+                "Diagnosing {} sorry theorem(s) in {target} (zero-ONNX pre-flight):",
+                found.len()
+            )];
+            let mut has_compile_err = false;
+            let mut has_false = false;
+            let lake_root = find_lake_workspace_root(target_path);
             for thm in &found {
                 let full_name = match &thm.namespace {
                     Some(ns) => format!("{ns}.{}", thm.name),
                     None => thm.name.clone(),
                 };
-                lines.push(format!("  {}:{}: {full_name}", thm.file.display(), thm.line));
+                let src = std::fs::read_to_string(&thm.file).unwrap_or_default();
+                let (b, s, note) = kernel_eval::probe_preflight_build_and_sanity(
+                    &src,
+                    thm,
+                    &full_name,
+                    lake_root.as_deref(),
+                )?;
+                let tag = match (b, s) {
+                    (BuildStatus::CompileError, _) => {
+                        has_compile_err = true;
+                        "COMPILE_ERROR"
+                    }
+                    (BuildStatus::Ok, SanityStatus::FalseSpec) => {
+                        has_false = true;
+                        "FALSE_SPEC"
+                    }
+                    (BuildStatus::Ok, SanityStatus::Trivial) => "TRIVIAL",
+                    (BuildStatus::Ok, SanityStatus::ValidOpen) => "VALID_OPEN",
+                };
+                let detail = note.map_or_else(String::new, |n| format!(" ({n})"));
+                lines.push(format!(
+                    "  [{tag}] {}:{}: {full_name}{detail}",
+                    thm.file.display(),
+                    thm.line
+                ));
             }
+            let code = if has_compile_err {
+                2
+            } else if has_false {
+                3
+            } else if found.is_empty() {
+                0
+            } else {
+                1
+            };
             Ok((code, lines.join("\n")))
         }
         "prove" => {
@@ -2966,7 +3280,24 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             }
             let options = ProverConfig::from(&prove_args);
             let summary = prove_lean_path_with_options(target_path, &options)?;
-            let code = if summary.failed == 0 { 0 } else { 1 };
+            if let Some(pat) = &summary.filter_miss {
+                if options.json {
+                    return Ok((1, summary.json_events.join("\n")));
+                }
+                return Ok((
+                    1,
+                    format!("warning: 0 theorems matched filter \"{pat}\""),
+                ));
+            }
+            let code = if summary.has_compile_error {
+                2
+            } else if summary.has_false_spec {
+                3
+            } else if summary.failed > 0 {
+                1
+            } else {
+                0
+            };
             if options.json {
                 return Ok((code, summary.json_events.join("\n")));
             }
@@ -2985,11 +3316,14 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
                     summary.proved_names,
                     failed_names
                 ));
-                if !options.write_in_place {
+                if !options.write_in_place && !options.diff {
                     for (name, script) in &summary.proved_scripts {
                         lines.push(format!("[PROVED] {name} := by\n  {}", script.join("\n  ")));
                     }
                 }
+            }
+            if options.diff && !summary.diff_outputs.is_empty() {
+                lines.push(summary.diff_outputs.join("\n"));
             }
             for (name, diag) in &summary.failed_theorems {
                 lines.push(format!("[FAILED] {name}: {diag}"));
@@ -4412,6 +4746,212 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
         .unwrap();
         assert_eq!(check_code, 1);
         assert!(check_out.contains("Found 1 sorry theorem(s)"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m21_ood_workspace_deps_and_unfold_ordering() {
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Coord.lean"),
+            line: 10,
+            namespace: Some("Little2Engine".to_string()),
+            name: "coord_valid".to_string(),
+            signature: "theorem coord_valid (c : Coord) : validCoord c = true := by sorry".to_string(),
+            binders: vec![("c".to_string(), "Coord".to_string())],
+            local_defs: vec!["validCoord".to_string()],
+            local_structures: Vec::new(),
+            local_inductives: Vec::new(),
+            local_theorems: Vec::new(),
+            workspace_deps: vec![std::path::PathBuf::from("Types.lean")],
+        };
+        assert_eq!(classify_ood_status(&thm), OodStatus::OodDomain);
+
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
+            answer_confidence: 0.5,
+            direct_close_prob: 0.4,
+            difficulty: lean_sys1_ort::DifficultyBucket::Short,
+        };
+        let cands = synthesize_from_model_and_vdb(&thm, "Eq", &pred, &[], &[], 4, false);
+        let flat: Vec<String> = cands.into_iter().map(|c| c.join("; ")).collect();
+        let unfold_idx = flat
+            .iter()
+            .position(|s| s.starts_with("dsimp [validCoord]") || s.starts_with("unfold validCoord"))
+            .expect("missing dsimp/unfold candidate");
+        let simp_idx = flat
+            .iter()
+            .position(|s| s == "simp [validCoord]")
+            .expect("missing simp candidate");
+        assert!(
+            unfold_idx < simp_idx,
+            "dsimp/unfold must precede bare simp: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn test_m21_task2_local_def_simp_all_unfold() {
+        let dir = std::env::temp_dir().join("sheaf_m21_task2_local_defs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Preds.lean");
+        std::fs::write(
+            &f,
+            "import Init\nstructure Coord where\n  x : Nat\n  y : Nat\ndef Coord.isValid (c : Coord) : Bool := c.x < 10 && c.y < 10\ndef coordBound (c : Coord) : Prop := c.x < 10 ∧ c.y < 10\ntheorem valid_origin : Coord.isValid { x := 0, y := 0 } = true := by\n  sorry\ntheorem valid_implies_bound (c : Coord) (hx : c.x < 10) (hy : c.y < 10) : coordBound c := by\n  sorry\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m21_task3_existential_conjunction_and_negation() {
+        let dir = std::env::temp_dir().join("sheaf_m21_task3_ex_neg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("ExNeg.lean");
+        std::fs::write(
+            &f,
+            "import Init\ntheorem ex_conj_from_hyps (P Q : Nat → Prop) (h1 : P 1) (h2 : Q 2) : (∃ x, P x) ∧ (∃ y, Q y) := by\n  sorry\ntheorem neg_from_univ (P : Nat → Prop) (h : ∀ x, ¬ P x) (n : Nat) : ¬ P n := by\n  sorry\n",
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.proved, 2, "failed: {:?}", summary.failed_theorems);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m22_cli_filter_ood_timeout_diff_and_zero_match() {
+        let parsed = ProveArgs::try_from_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            ".".into(),
+            "-k".into(),
+            "coord".into(),
+            "--ood-timeout".into(),
+            "5".into(),
+            "--diff".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.filter.as_deref(), Some("coord"));
+        assert_eq!(parsed.ood_timeout_secs, 5);
+        assert!(parsed.diff);
+
+        let err = ProveArgs::try_from_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            ".".into(),
+            "--ood-timeout".into(),
+            "999".into(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("1..=300"));
+
+        let dir = std::env::temp_dir().join("sheaf_m22_filter_diff");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("Filter.lean");
+        std::fs::write(
+            &f,
+            "import Init\ntheorem alpha_one (n : Nat) : n = n := by\n  sorry\ntheorem beta_two (n : Nat) : n + 0 = n := by\n  sorry\n",
+        )
+        .unwrap();
+
+        let (miss_code, miss_out) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f.to_string_lossy().to_string(),
+            "-k".into(),
+            "nonexistent_thm".into(),
+        ])
+        .unwrap();
+        assert_eq!(miss_code, 1);
+        assert!(miss_out.contains("0 theorems matched filter \"nonexistent_thm\""));
+
+        let (diff_code, diff_out) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f.to_string_lossy().to_string(),
+            "-k".into(),
+            "alpha_one".into(),
+            "--diff".into(),
+        ])
+        .unwrap();
+        assert_eq!(diff_code, 0);
+        assert!(diff_out.contains("--- a/") && diff_out.contains("+++ b/"));
+        assert!(diff_out.contains("-  sorry") && diff_out.contains("+  first | rfl | decide | trivial"));
+
+        let (json_code, json_out) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f.to_string_lossy().to_string(),
+            "-k".into(),
+            "alpha_one".into(),
+            "--diff".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert_eq!(json_code, 0);
+        for line in json_out.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("pure NDJSON with --diff --json");
+            if v.get("event").and_then(|e| e.as_str()) == Some("theorem_finished") {
+                assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("proved"));
+                assert!(v.get("vdb_hits").is_some());
+            }
+        }
+        assert!(json_out.contains("\"workspace_diff\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m22_exit_codes_and_check_diagnose() {
+        let dir = std::env::temp_dir().join("sheaf_m22_exit_codes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let f_err = dir.join("Err.lean");
+        std::fs::write(
+            &f_err,
+            "import Init\ndef bad : Nat := true\ntheorem t (n : Nat) : n = n := by\n  sorry\n",
+        )
+        .unwrap();
+        let (c_err, out_err) = run_cli_args(&[
+            "sheaf".into(),
+            "check".into(),
+            f_err.to_string_lossy().to_string(),
+            "--diagnose".into(),
+        ])
+        .unwrap();
+        assert_eq!(c_err, 2);
+        assert!(out_err.contains("[COMPILE_ERROR]"));
+
+        let f_false = dir.join("FalseSpec.lean");
+        std::fs::write(
+            &f_false,
+            "import Init\ntheorem t_false : (0 : Nat) = 1 := by\n  sorry\n",
+        )
+        .unwrap();
+        let (c_false_chk, out_false_chk) = run_cli_args(&[
+            "sheaf".into(),
+            "check".into(),
+            f_false.to_string_lossy().to_string(),
+            "--diagnose".into(),
+        ])
+        .unwrap();
+        assert_eq!(c_false_chk, 3);
+        assert!(out_false_chk.contains("[FALSE_SPEC]"));
+
+        let (c_false_prove, _) = run_cli_args(&[
+            "sheaf".into(),
+            "prove".into(),
+            f_false.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(c_false_prove, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
