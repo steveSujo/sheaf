@@ -6,6 +6,118 @@ pub mod search;
 pub mod ui;
 pub mod vfs;
 
+/// Pre-flight Lean build status mirroring `SheafSpec.BuildStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStatus {
+    Ok,
+    CompileError,
+}
+
+/// Pre-flight theorem sanity classification mirroring `SheafSpec.SanityStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SanityStatus {
+    ValidOpen,
+    Trivial,
+    FalseSpec,
+}
+
+/// CLI command mode mirroring `SheafSpec.CmdMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdMode {
+    CheckOnly,
+    Prove,
+}
+
+/// Out-of-distribution domain status mirroring `SheafSpec.OodStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OodStatus {
+    InDist,
+    OodDomain,
+}
+
+/// Unified routing outcome mirroring `SheafSpec.RouteOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOutcome {
+    AbortCompileError,
+    AbortFalseSpec,
+    ReportOnly,
+    DirectTrivial,
+    DirectExecute,
+    EscalateVdb,
+}
+
+/// True iff `outcome` invokes prover tactic synthesis or search.
+#[must_use]
+pub fn is_prover_action(outcome: RouteOutcome) -> bool {
+    matches!(
+        outcome,
+        RouteOutcome::DirectTrivial | RouteOutcome::DirectExecute | RouteOutcome::EscalateVdb
+    )
+}
+
+/// Relax System 1 confidence threshold when custom domain symbols trigger OOD.
+#[must_use]
+pub fn effective_threshold(ood: OodStatus, base_tau: u32, ood_drop: u32) -> u32 {
+    match ood {
+        OodStatus::InDist => base_tau,
+        OodStatus::OodDomain => base_tau.saturating_sub(ood_drop),
+    }
+}
+
+/// Unified pre-flight and OOD-aware routing policy mirroring `SheafSpec.routePipeline`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn route_pipeline(
+    mode: CmdMode,
+    build: BuildStatus,
+    sanity: SanityStatus,
+    ood: OodStatus,
+    conf: u32,
+    base_tau: u32,
+    ood_drop: u32,
+    vdb_hits: usize,
+) -> RouteOutcome {
+    match build {
+        BuildStatus::CompileError => RouteOutcome::AbortCompileError,
+        BuildStatus::Ok => match sanity {
+            SanityStatus::FalseSpec => RouteOutcome::AbortFalseSpec,
+            SanityStatus::Trivial => match mode {
+                CmdMode::CheckOnly => RouteOutcome::ReportOnly,
+                CmdMode::Prove => RouteOutcome::DirectTrivial,
+            },
+            SanityStatus::ValidOpen => match mode {
+                CmdMode::CheckOnly => RouteOutcome::ReportOnly,
+                CmdMode::Prove => {
+                    let tau = effective_threshold(ood, base_tau, ood_drop);
+                    match ood {
+                        OodStatus::OodDomain => {
+                            if vdb_hits == 0 || conf >= tau {
+                                RouteOutcome::DirectExecute
+                            } else {
+                                RouteOutcome::EscalateVdb
+                            }
+                        }
+                        OodStatus::InDist => {
+                            if conf >= tau {
+                                RouteOutcome::DirectExecute
+                            } else {
+                                RouteOutcome::EscalateVdb
+                            }
+                        }
+                    }
+                }
+            },
+        },
+    }
+}
+
+/// Classify whether a theorem references custom domain definitions, structures, or inductives.
+#[must_use]
+pub fn classify_ood_status(thm: &DiscoveredTheorem) -> OodStatus {
+    let _ = thm;
+    todo!("TASK-M21-003")
+}
+
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -868,6 +980,7 @@ fn is_top_level_decl_boundary(trimmed: &str) -> bool {
         || decl.starts_with("instance ")
         || decl.starts_with("class ")
         || trimmed.starts_with("/--")
+        || trimmed.starts_with("/-!")
 }
 
 fn is_lean_ident_char(c: char) -> bool {
@@ -2069,6 +2182,39 @@ fn synthesize_from_model_and_vdb(
             ind_ctx.push("List.append_assoc".to_string());
         }
         let ind_ctx_list = ind_ctx.join(", ");
+        let thms_list = thm.local_theorems.join(", ");
+
+        // Try lemma-only `cases` before unfolding definitions so proven lemmas can match unexpanded calls
+        if !thms_list.is_empty() {
+            for (v_ind, is_list) in &induction_targets {
+                if !is_list {
+                    bucket_induction.push(vec![format!("cases {v_ind} <;> simp [{thms_list}]")]);
+                    if !ind_ctx_list.is_empty() {
+                        bucket_induction.push(vec![format!(
+                            "cases {v_ind} <;> simp [{thms_list}] <;> simp [{ind_ctx_list}]"
+                        )]);
+                    }
+                }
+            }
+        }
+
+        // Pairwise `cases` across 2+ finite (non-List) local inductive parameters
+        let finite_ind_vars: Vec<&str> = induction_targets
+            .iter()
+            .filter(|(_, is_list)| !is_list)
+            .map(|(v, _)| *v)
+            .collect();
+        if finite_ind_vars.len() >= 2 {
+            let v0 = finite_ind_vars[0];
+            let v1 = finite_ind_vars[1];
+            if !ind_ctx_list.is_empty() {
+                bucket_induction.push(vec![format!(
+                    "cases {v0} <;> cases {v1} <;> simp_all [{ind_ctx_list}]"
+                )]);
+            } else {
+                bucket_induction.push(vec![format!("cases {v0} <;> cases {v1} <;> simp_all")]);
+            }
+        }
 
         for (v_ind, is_list) in induction_targets {
             let other_vars: Vec<&str> = thm
@@ -4016,5 +4162,181 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
         assert_eq!(summary.discovered, 8);
         assert_eq!(summary.proved, 8, "failed: {:?}", summary.failed_theorems);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn test_module_docstring_and_two_inductive_cases_synthesis() {
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Spec.lean"),
+            line: 20,
+            namespace: Some("Spec".to_string()),
+            name: "check_mode_never_proves".to_string(),
+            signature: "theorem check_mode_never_proves (build : BuildStatus) (sanity : SanityStatus) : isProver (route build sanity) = false := by sorry".to_string(),
+            binders: vec![
+                ("build".to_string(), "BuildStatus".to_string()),
+                ("sanity".to_string(), "SanityStatus".to_string()),
+            ],
+            local_defs: vec!["isProver".to_string(), "route".to_string()],
+            local_structures: Vec::new(),
+            local_inductives: vec!["BuildStatus".to_string(), "SanityStatus".to_string()],
+            local_theorems: vec!["helper_ok".to_string()],
+            workspace_deps: Vec::new(),
+        };
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Induction,
+            answer_confidence: 0.9,
+            direct_close_prob: 0.5,
+            difficulty: lean_sys1_ort::DifficultyBucket::Short,
+        };
+        let cands = synthesize_from_model_and_vdb(&thm, "Eq", &pred, &[], &[], 4, true);
+        let flat: Vec<String> = cands.into_iter().map(|c| c.join("; ")).collect();
+        let lemma_idx = flat
+            .iter()
+            .position(|s| s == "cases build <;> simp [helper_ok]")
+            .expect("missing lemma-only cases tactic");
+        let unfold_idx = flat
+            .iter()
+            .position(|s| s.contains("induction build <;> simp_all [isProver, route"))
+            .expect("missing unfold induction tactic");
+        assert!(
+            lemma_idx < unfold_idx,
+            "lemma-only cases must come before definition-unfolding induction: {flat:?}"
+        );
+        assert!(
+            flat.iter().any(|s| s.starts_with("cases build <;> cases sanity <;> simp_all")),
+            "missing 2-binder cases tactic: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn test_m21_001_preflight_ood_route_pipeline_invariants() {
+        let modes = [CmdMode::CheckOnly, CmdMode::Prove];
+        let builds = [BuildStatus::Ok, BuildStatus::CompileError];
+        let sanities = [
+            SanityStatus::ValidOpen,
+            SanityStatus::Trivial,
+            SanityStatus::FalseSpec,
+        ];
+        let oods = [OodStatus::InDist, OodStatus::OodDomain];
+
+        for mode in modes {
+            for sanity in sanities {
+                for ood in oods {
+                    assert_eq!(
+                        route_pipeline(mode, BuildStatus::CompileError, sanity, ood, 90, 50, 15, 7),
+                        RouteOutcome::AbortCompileError
+                    );
+                }
+            }
+        }
+
+        for mode in modes {
+            for ood in oods {
+                assert_eq!(
+                    route_pipeline(mode, BuildStatus::Ok, SanityStatus::FalseSpec, ood, 90, 50, 15, 7),
+                    RouteOutcome::AbortFalseSpec
+                );
+            }
+        }
+
+        for build in builds {
+            for sanity in sanities {
+                for ood in oods {
+                    let out = route_pipeline(CmdMode::CheckOnly, build, sanity, ood, 80, 50, 15, 4);
+                    assert!(!is_prover_action(out));
+                }
+            }
+        }
+
+        for ood in oods {
+            assert_eq!(
+                route_pipeline(CmdMode::Prove, BuildStatus::Ok, SanityStatus::Trivial, ood, 10, 50, 15, 0),
+                RouteOutcome::DirectTrivial
+            );
+        }
+
+        assert!(
+            effective_threshold(OodStatus::OodDomain, 50, 15)
+                <= effective_threshold(OodStatus::InDist, 50, 15)
+        );
+        assert_eq!(effective_threshold(OodStatus::OodDomain, 50, 15), 35);
+        assert_eq!(effective_threshold(OodStatus::OodDomain, 10, 25), 0);
+
+        assert_eq!(
+            route_pipeline(CmdMode::Prove, BuildStatus::Ok, SanityStatus::ValidOpen, OodStatus::OodDomain, 20, 50, 15, 0),
+            RouteOutcome::DirectExecute
+        );
+
+        assert_eq!(
+            route_pipeline(CmdMode::Prove, BuildStatus::Ok, SanityStatus::ValidOpen, OodStatus::InDist, 42, 50, 15, 7),
+            RouteOutcome::EscalateVdb
+        );
+    }
+
+    #[test]
+    #[ignore = "TDD: TASK-M21-003"]
+    fn test_m21_003_end_to_end_preflight_and_ood_routing() {
+        let in_dist_thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("NatBasic.lean"),
+            line: 3,
+            namespace: None,
+            name: "nat_add_zero".to_string(),
+            signature: "theorem nat_add_zero (n : Nat) : n + 0 = n := by sorry".to_string(),
+            binders: vec![("n".to_string(), "Nat".to_string())],
+            local_defs: Vec::new(),
+            local_structures: Vec::new(),
+            local_inductives: Vec::new(),
+            local_theorems: Vec::new(),
+            workspace_deps: Vec::new(),
+        };
+        assert_eq!(classify_ood_status(&in_dist_thm), OodStatus::InDist);
+
+        let ood_thm = DiscoveredTheorem {
+            local_defs: vec!["routePipeline".to_string()],
+            local_inductives: vec!["BuildStatus".to_string()],
+            binders: vec![("b".to_string(), "BuildStatus".to_string())],
+            signature: "theorem t (b : BuildStatus) : routePipeline b = b := by sorry".to_string(),
+            ..in_dist_thm.clone()
+        };
+        assert_eq!(classify_ood_status(&ood_thm), OodStatus::OodDomain);
+
+        let dir = std::env::temp_dir().join("sheaf_m21_003_e2e_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad_file = dir.join("Broken.lean");
+        std::fs::write(
+            &bad_file,
+            "import Init\ndef broken : Nat := \"not_a_nat\"\ntheorem t (n : Nat) : n = n := by\n  sorry\n",
+        )
+        .unwrap();
+        let bad_summary = prove_lean_path(&bad_file, false).unwrap();
+        assert_eq!(bad_summary.proved, 0);
+        assert_eq!(bad_summary.failed, 1);
+        assert!(
+            bad_summary.failed_theorems[0].1.contains("compile error"),
+            "expected preflight compile error diagnostic, got: {:?}",
+            bad_summary.failed_theorems
+        );
+
+        let triv_file = dir.join("Trivial.lean");
+        std::fs::write(
+            &triv_file,
+            "import Init\ntheorem refl_nat (n : Nat) : n = n := by\n  sorry\n",
+        )
+        .unwrap();
+        let triv_summary = prove_lean_path(&triv_file, false).unwrap();
+        assert_eq!(triv_summary.proved, 1);
+
+        let (check_code, check_out) = run_cli_args(&[
+            "sheaf".into(),
+            "check".into(),
+            triv_file.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        assert_eq!(check_code, 1);
+        assert!(check_out.contains("Found 1 sorry theorem(s)"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
