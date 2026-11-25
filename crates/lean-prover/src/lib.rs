@@ -1184,9 +1184,10 @@ fn normalize_fs_path(path: &std::path::Path) -> std::path::PathBuf {
     } else {
         path.to_path_buf()
     };
-    std::fs::canonicalize(&abs)
+    let cleaned: std::path::PathBuf = abs.components().collect();
+    std::fs::canonicalize(&cleaned)
         .map(strip_windows_verbatim_prefix)
-        .unwrap_or(abs)
+        .unwrap_or_else(|_| strip_windows_verbatim_prefix(cleaned))
 }
 
 /// Find the nearest ancestor directory containing `lakefile.toml` or `lakefile.lean`.
@@ -1554,6 +1555,101 @@ pub fn prove_lean_path_with_artifacts(
     )
 }
 
+fn index_workspace_lemmas_into_vdb(
+    files: &std::collections::BTreeMap<std::path::PathBuf, vfs::BlobHash>,
+    blob_store: &vfs::BlobStore,
+    onnx_sess: &lean_sys1_ort::LeanSys1OnnxSession,
+    tokenizer_json: &str,
+    temps: &lean_sys1_ort::CalibrationTemperatures,
+    gate_threshold: f32,
+    vdb: &mut lean_vdb::StaticVdbIndex,
+) {
+    let mut entries: Vec<(lean_vdb::LemmaMetadata, Vec<f32>)> = Vec::new();
+    for hash in files.values() {
+        let Some(src) = blob_store.get(hash) else {
+            continue;
+        };
+        let lines: Vec<&str> = src.lines().collect();
+        let mut current_ns: Option<String> = None;
+        let mut idx = 0usize;
+        while idx < lines.len() {
+            let trimmed = lines[idx].trim();
+            if let Some(ns) = trimmed.strip_prefix("namespace ") {
+                current_ns = Some(ns.trim().to_string());
+            } else if trimmed.starts_with("end ") {
+                current_ns = None;
+            } else if let Some(after_thm) = trimmed
+                .strip_prefix("theorem ")
+                .or_else(|| trimmed.strip_prefix("lemma "))
+            {
+                let name = after_thm
+                    .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let mut decl_parts = vec![lean_canonicalizer::strip_lean_comments(trimmed).trim().to_string()];
+                let mut scan = idx;
+                while !decl_parts.last().is_some_and(|l| l.contains(":=")) && scan + 1 < lines.len() {
+                    scan += 1;
+                    let nt = lines[scan].trim();
+                    if is_top_level_decl_boundary(nt) {
+                        break;
+                    }
+                    let clean = lean_canonicalizer::strip_lean_comments(nt).trim().to_string();
+                    if !clean.is_empty() {
+                        decl_parts.push(clean);
+                    }
+                }
+                let full_decl = decl_parts.join(" ");
+                let mut bd = 0usize;
+                let mut has_sorry = full_decl
+                    .split_once(":=")
+                    .is_some_and(|(_, b)| contains_standalone_sorry(b, &mut bd));
+                if !has_sorry {
+                    for nl in lines.iter().skip(scan + 1) {
+                        let nt = nl.trim();
+                        if is_top_level_decl_boundary(nt) {
+                            break;
+                        }
+                        if contains_standalone_sorry(nt, &mut bd) {
+                            has_sorry = true;
+                            break;
+                        }
+                    }
+                }
+                if !has_sorry && !name.is_empty() {
+                    let full_name = match &current_ns {
+                        Some(ns) => format!("{ns}.{name}"),
+                        None => name.clone(),
+                    };
+                    let target = extract_theorem_target(&full_decl);
+                    if let Ok(goal) = lean_canonicalizer::canonicalize_goal(&[], target) {
+                        let text = format!("{} ⊢ {}", goal.hypotheses.join(", "), goal.target);
+                        if let Ok((ids, mask)) = lean_sys1_ort::encode_canonical_text(tokenizer_json, &text, 512)
+                            && let Ok((pred, _, _)) = onnx_sess.forward_with_gate(&ids, &mask, temps, gate_threshold)
+                        {
+                            entries.push((
+                                lean_vdb::LemmaMetadata {
+                                    name: full_name,
+                                    head_symbol: goal.head_symbol.as_str().to_string(),
+                                    module: "__workspace__".to_string(),
+                                    arity: parse_theorem_binders(&full_decl).len() as u32,
+                                    signature: target.to_string(),
+                                },
+                                pred.state_emb,
+                            ));
+                        }
+                    }
+                }
+            }
+            idx += 1;
+        }
+    }
+    if !entries.is_empty() {
+        let _ = vdb.extend_with_dynamic_entries(entries);
+    }
+}
+
 /// Prove all discovered `sorry` theorems with explicit artifacts and `ProveOptions`.
 pub fn prove_lean_path_with_artifacts_and_options(
     path: &std::path::Path,
@@ -1568,9 +1664,10 @@ pub fn prove_lean_path_with_artifacts_and_options(
     let onnx_sess = lean_sys1_ort::LeanSys1OnnxSession::from_onnx_bytes(onnx_bytes)?;
     let temps: lean_sys1_ort::CalibrationTemperatures = serde_json::from_str(temperatures_json)
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Json(e)))?;
-    let (vdb, _resolver) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(vdb_bytes)?;
+    let (mut vdb, _resolver) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(vdb_bytes)?;
 
-    let mut theorems = discover_sorry_theorems(path)?;
+    let norm_path = normalize_fs_path(path);
+    let mut theorems = discover_sorry_theorems(&norm_path)?;
     let mut filter_miss: Option<String> = None;
     if let Some(pat) = &options.filter {
         theorems.retain(|t| {
@@ -1627,17 +1724,26 @@ pub fn prove_lean_path_with_artifacts_and_options(
             initial_files.insert(thm.file.clone(), h);
         }
     }
-    let initial_tree = vfs::TreeSnapshot::from_map(initial_files);
+    let initial_tree = vfs::TreeSnapshot::from_map(initial_files.clone());
     let mut root_tree = initial_tree.clone();
-    let base_root = find_lake_workspace_root(path).unwrap_or_else(|| {
-        let norm = normalize_fs_path(path);
-        if norm.is_file() {
-            norm.parent()
+    index_workspace_lemmas_into_vdb(
+        &initial_files,
+        &blob_store,
+        &onnx_sess,
+        tokenizer_json,
+        &temps,
+        options.gate_threshold,
+        &mut vdb,
+    );
+    let base_root = find_lake_workspace_root(&norm_path).unwrap_or_else(|| {
+        if norm_path.is_file() {
+            norm_path
+                .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf()
         } else {
-            norm
+            norm_path.clone()
         }
     });
 
@@ -1789,11 +1895,20 @@ pub fn prove_lean_path_with_artifacts_and_options(
         let mut tried_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut did_escalate = false;
 
+        // Anchor OOD escalation budget; cap DirectExecute to a short slice so failed probes escalate to VDB
+        let ood_deadline = (ood_status == OodStatus::OodDomain)
+            .then(|| Instant::now() + std::time::Duration::from_secs(options.ood_timeout_secs));
+        let direct_deadline = ood_deadline.map(|dl| {
+            let slice_secs = (options.ood_timeout_secs / 3).clamp(3, 6);
+            dl.min(Instant::now() + std::time::Duration::from_secs(slice_secs))
+        });
+
         // Stage 4/5 fast-path: DirectExecute runs only the top-ranked strategy bucket first
         let (mut solved, mut last_diag, mut unsolved_diags) = if matches!(
             gate,
             lean_sys1_ort::GateDecision::DirectExecute(_)
-        ) {
+        ) && ood_deadline.is_none_or(|dl| Instant::now() < dl)
+        {
             let fast_candidates = synthesize_from_model_and_vdb(
                 thm,
                 head_symbol.as_str(),
@@ -1820,16 +1935,12 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     0,
                     options.write_in_place || options.strict_lint,
                     options.strict_lint,
-                    None,
+                    direct_deadline,
                 )?
             }
         } else {
             (None, String::new(), Vec::new())
         };
-
-        // Anchor OOD escalation budget after pre-flight and any DirectExecute fast-path
-        let ood_deadline = (ood_status == OodStatus::OodDomain)
-            .then(|| Instant::now() + std::time::Duration::from_secs(options.ood_timeout_secs));
 
         // Escalate to FallbackToLeJepa when gated or when DirectExecute fast-path fails
         if solved.is_none()
@@ -1840,8 +1951,10 @@ pub fn prove_lean_path_with_artifacts_and_options(
             vdb_hits = vdb.search_sq8_hnsw(
                 &query_emb,
                 head_symbol.as_str(),
-                options.max_branches.max(16),
+                options.max_branches.max(32),
             )?;
+            vdb_hits.retain(|h| !kernel_eval::is_unknown_constant(&h.metadata.name));
+            rerank_vdb_hits_lexical(&mut vdb_hits, &canonical);
             ui.send(ui::UiEvent::Escalated {
                 vdb_hits: vdb_hits.len(),
                 tau: options.premise_tau,
@@ -1967,7 +2080,27 @@ pub fn prove_lean_path_with_artifacts_and_options(
                             .unwrap_or_else(|| eval_src.clone())
                     };
                     let step_cands: Vec<Vec<String>> = if node.depth == 0 {
-                        unsolved_diags.iter().take(2).map(|(s, _)| s.clone()).collect()
+                        let mut seeds: Vec<Vec<String>> =
+                            unsolved_diags.iter().take(2).map(|(s, _)| s.clone()).collect();
+                        for prog in ["ext", "funext", "intro", "constructor"] {
+                            seeds.push(vec![prog.to_string()]);
+                        }
+                        if !thm.local_defs.is_empty() {
+                            let defs_list = thm.local_defs.join(", ");
+                            seeds.push(vec![format!("dsimp only [{defs_list}]")]);
+                            let mut combined: Vec<String> = thm.local_defs.clone();
+                            for tl in top_lemmas.iter().take(4) {
+                                if !combined.contains(tl) {
+                                    combined.push(tl.clone());
+                                }
+                            }
+                            seeds.push(vec![format!("simp_all [{}]", combined.join(", "))]);
+                        }
+                        for lemma in top_lemmas.iter().take(2) {
+                            seeds.push(vec![format!("rw [{lemma}]")]);
+                            seeds.push(vec![format!("rw [← {lemma}]")]);
+                        }
+                        seeds
                     } else {
                         let Ok((sub_ids, sub_mask)) = lean_sys1_ort::encode_canonical_text(
                             tokenizer_json,
@@ -1984,13 +2117,44 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         ) else {
                             return Ok(search::StepOutcome::Pruned("sys1 subgoal failed".into()));
                         };
-                        if !dedup.record_sys1_and_check_tier2(&sub_pred.state_emb) {
-                            return Ok(search::StepOutcome::Pruned("semantic loop pruned".into()));
+                        if !dedup.record_sys1_and_check_tier2_with_progress(
+                            &sub_pred.state_emb,
+                            node.parent_subgoal.as_deref(),
+                            &node.open_subgoal,
+                        ) {
+                            let reason = if node.parent_subgoal.as_deref()
+                                == Some(node.open_subgoal.as_str())
+                            {
+                                "no-progress loop pruned"
+                            } else {
+                                "semantic loop pruned"
+                            };
+                            return Ok(search::StepOutcome::Pruned(reason.into()));
                         }
+                        let sub_target_part = node
+                            .open_subgoal
+                            .split_once('⊢')
+                            .map(|(_, t)| t.trim())
+                            .unwrap_or(&node.open_subgoal);
+                        let sub_head = lean_canonicalizer::extract_head_symbol(sub_target_part)
+                            .map(|h| h.as_str().to_string())
+                            .unwrap_or_else(|_| head_symbol.as_str().to_string());
+                        let sub_query = onnx_sess.predict_lejepa_target(&sub_pred.state_emb, sub_pred.strategy);
+                        let mut sub_hits = vdb
+                            .search_sq8_hnsw(&sub_query, &sub_head, options.max_branches.max(16))
+                            .unwrap_or_default();
+                        sub_hits.retain(|h| !kernel_eval::is_unknown_constant(&h.metadata.name));
+                        rerank_vdb_hits_lexical(&mut sub_hits, &node.open_subgoal);
+
                         let mut search_ctx: Vec<String> = thm.local_defs.clone();
                         for lt in &thm.local_theorems {
                             if !search_ctx.contains(lt) {
                                 search_ctx.push(lt.clone());
+                            }
+                        }
+                        for hit in &sub_hits {
+                            if !search_ctx.contains(&hit.metadata.name) {
+                                search_ctx.push(hit.metadata.name.clone());
                             }
                         }
                         for tl in &top_lemmas {
@@ -2001,35 +2165,67 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         let search_ctx_list = search_ctx.join(", ");
                         let search_thms_list = thm.local_theorems.join(", ");
                         let mut sub_closers: Vec<String> = Vec::new();
+                        let transparency_hit = last_diag.contains("implicit transparency")
+                            || last_diag.contains("transparency level")
+                            || unsolved_diags.iter().any(|(_, d)| {
+                                d.contains("implicit transparency") || d.contains("transparency level")
+                            });
+                        if transparency_hit {
+                            for lemma in top_lemmas.iter().take(3) {
+                                sub_closers.push(format!("rw [{lemma}]"));
+                                sub_closers.push(format!("rw [← {lemma}]"));
+                            }
+                            if !top_lemmas.is_empty() {
+                                let tl_list = top_lemmas.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+                                sub_closers.push(format!("simp only [{tl_list}]"));
+                            }
+                        }
+                        if !thm.local_defs.is_empty() {
+                            let defs_list = thm.local_defs.join(", ");
+                            sub_closers.push(format!("dsimp only [{defs_list}]"));
+                            if !transparency_hit {
+                                let mut combined: Vec<String> = thm.local_defs.clone();
+                                for tl in top_lemmas.iter().take(4) {
+                                    if !combined.contains(tl) {
+                                        combined.push(tl.clone());
+                                    }
+                                }
+                                sub_closers.push(format!("simp_all [{}]", combined.join(", ")));
+                            }
+                        }
+                        for hit in sub_hits.iter().take(2) {
+                            let lname = &hit.metadata.name;
+                            sub_closers.push(format!("all_goals (try rw [{lname}]; all_goals (first | rfl | simp_all | omega | grind))"));
+                            sub_closers.push(format!("all_goals (try rw [← {lname}]; all_goals (first | rfl | simp_all | omega | grind))"));
+                        }
                         if !search_thms_list.is_empty() {
                             sub_closers.push(format!("all_goals (first | rfl | simp [{search_thms_list}] | omega)"));
                         }
-                        if !search_ctx_list.is_empty() {
+                        if !search_ctx_list.is_empty() && !transparency_hit {
                             sub_closers.push(format!(
                                 "all_goals (repeat (first | rfl | simp_all [{search_ctx_list}] | (split <;> try simp_all [{search_ctx_list}]) | omega))"
                             ));
                         }
+                        if thm.has_mathlib {
+                            sub_closers.push("all_goals (first | field_simp at * <;> (first | linarith | nlinarith | positivity) | rify at *; field_simp at * <;> (first | linarith | nlinarith | positivity) | ring | linarith | nlinarith | norm_num)".to_string());
+                        }
                         match sub_pred.strategy {
                             lean_sys1_ort::StrategyChoice::AtomicClose => {
-                                sub_closers.push("all_goals (first | rfl | simp | omega | grind)".to_string());
-                                sub_closers.push("all_goals (try simp_all; try omega; try grind)".to_string());
+                                sub_closers.push("all_goals (first | rfl | simp_all | omega | grind | tauto | contradiction)".to_string());
                             }
                             lean_sys1_ort::StrategyChoice::Rewrite => {
                                 sub_closers.push("all_goals (first | simp_all | omega | grind)".to_string());
-                                sub_closers.push("all_goals (try simp; try omega; try grind)".to_string());
                             }
                             lean_sys1_ort::StrategyChoice::IntroduceHave => {
                                 sub_closers.push("all_goals (try rfl); all_goals (first | rfl | simp_all | omega | grind)".to_string());
-                                sub_closers.push("repeat (first | rfl | (constructor <;> try rfl)); all_goals (first | rfl | omega | grind)".to_string());
                             }
                             _ => {
                                 sub_closers.push("all_goals (try simp_all; try omega; try grind)".to_string());
-                                sub_closers.push("all_goals (first | omega | grind)".to_string());
                             }
                         }
                         sub_closers
                             .into_iter()
-                            .take(4)
+                            .take(10)
                             .map(|c| {
                                 let mut s = node.partial_script.clone();
                                 if let Some(last) = s.last_mut() {
@@ -2075,9 +2271,28 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     }
 
                     let mut children = Vec::new();
-                    for (cand_script, goal_diag) in step_unsolved.into_iter().take(options.max_branches) {
-                        if let Some((sub_hyps, sub_target)) = parse_unsolved_goal_from_diag(&goal_diag)
-                        {
+                    let branch_cap = if node.depth == 0 {
+                        options.max_branches.max(6)
+                    } else {
+                        options.max_branches
+                    };
+                    for (cand_script, goal_diag) in step_unsolved.into_iter().take(branch_cap) {
+                        if ood_deadline.is_some_and(|dl| Instant::now() >= dl) {
+                            break;
+                        }
+                        let plain_goals = kernel_eval::query_plain_goals_for_script(
+                            &cur_src,
+                            &thm.name,
+                            &cand_script,
+                            lake_root.as_deref(),
+                            ood_deadline,
+                        )
+                        .unwrap_or_default();
+                        let parsed = plain_goals
+                            .first()
+                            .and_then(|g| parse_unsolved_goal_from_diag(g))
+                            .or_else(|| parse_unsolved_goal_from_diag(&goal_diag));
+                        if let Some((sub_hyps, sub_target)) = parsed {
                             let sub_collapsed =
                                 lean_canonicalizer::collapse_implicit_instances(&sub_target);
                             let (sub_norm_h, sub_norm_t) =
@@ -2105,6 +2320,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
                                 tree: child_tree,
                                 target_file: node.target_file.clone(),
                                 open_subgoal: sub_canon,
+                                parent_subgoal: Some(node.open_subgoal.clone()),
                                 partial_script: cand_script,
                                 priority: prio,
                             });
@@ -2126,9 +2342,26 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     .map(|s| s.to_string())
                     .unwrap_or_default();
                 solved = Some((win_src, win_script));
-            } else if !search_res.last_diag.is_empty() {
+            } else if !search_res.last_diag.is_empty()
+                && (!search_res.last_diag.ends_with("loop pruned") || last_diag.is_empty())
+            {
                 last_diag = search_res.last_diag;
             }
+        }
+        if solved.is_none()
+            && did_escalate
+            && ood_deadline.is_none_or(|dl| Instant::now() < dl)
+            && let Some(exact_win) = kernel_eval::try_exact_search_fallback(
+                &eval_src,
+                thm,
+                &full_name,
+                lake_root.as_deref(),
+                options.write_in_place || options.strict_lint,
+                options.strict_lint,
+                ood_deadline,
+            )?
+        {
+            solved = Some(exact_win);
         }
         let stuck_goal = if solved.is_none() {
             select_lowest_goal_diag(&unsolved_diags).or_else(|| {
@@ -2202,6 +2435,16 @@ pub fn prove_lean_path_with_artifacts_and_options(
         });
 
         if let Some((_eval_new_src, script)) = solved {
+            let _ = vdb.extend_with_dynamic_entries(vec![(
+                lean_vdb::LemmaMetadata {
+                    name: full_name.clone(),
+                    head_symbol: head_symbol.as_str().to_string(),
+                    module: "__workspace__".to_string(),
+                    arity: thm.binders.len() as u32,
+                    signature: extract_theorem_target(&thm.signature).to_string(),
+                },
+                pred.state_emb.clone(),
+            )]);
             let body = script
                 .iter()
                 .map(|l| format!("  {l}"))
@@ -2415,6 +2658,44 @@ fn parse_unsolved_goal_from_diag(diag: &str) -> Option<(Vec<String>, String)> {
     target.map(|t| (hyps, t))
 }
 
+fn extract_lexical_tokens(text: &str) -> std::collections::HashSet<String> {
+    const STOP: &[&str] = &[
+        "forall", "fun", "let", "in", "by", "Type", "Prop", "Sort", "sorry", "theorem", "lemma",
+    ];
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|tok| tok.len() >= 2 && !STOP.contains(tok))
+        .map(|tok| tok.to_ascii_lowercase())
+        .collect()
+}
+
+fn rerank_vdb_hits_lexical(hits: &mut [lean_vdb::VdbSearchHit], goal_text: &str) {
+    if hits.len() <= 1 {
+        return;
+    }
+    let goal_tokens = extract_lexical_tokens(goal_text);
+    if goal_tokens.is_empty() {
+        return;
+    }
+    let denom = goal_tokens.len().max(1) as f32;
+    hits.sort_by(|a, b| {
+        let score_of = |h: &lean_vdb::VdbSearchHit| -> f32 {
+            let mut cand_tokens = extract_lexical_tokens(&h.metadata.name);
+            cand_tokens.extend(extract_lexical_tokens(&h.metadata.module));
+            cand_tokens.extend(extract_lexical_tokens(&h.metadata.signature));
+            let overlap = goal_tokens.intersection(&cand_tokens).count() as f32 / denom;
+            let ws_bonus = if h.metadata.module == "__workspace__" {
+                0.15
+            } else {
+                0.0
+            };
+            -h.distance + 0.35 * overlap + ws_bonus
+        };
+        score_of(b)
+            .partial_cmp(&score_of(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn synthesize_from_model_and_vdb(
     thm: &DiscoveredTheorem,
     head_symbol: &str,
@@ -2456,80 +2737,78 @@ fn synthesize_from_model_and_vdb(
     let mut bucket_have: Vec<Vec<String>> = Vec::new();
     let mut bucket_induction: Vec<Vec<String>> = Vec::new();
 
-    // 1. Cheap non-inductive hypothesis, prev-theorem, structure-law & early simp_all closers before cases/VDB
+    // 1. Cheap non-inductive hypothesis, prev-theorem, structure-law & early general solvers before cases/VDB
     let mut early_direct: Vec<Vec<String>> = Vec::new();
-    if thm.signature.contains("Matrix") || thm.signature.contains('ᵀ') {
-        early_direct.push(vec!["simp_all [Matrix.mul_assoc]".to_string()]);
-        early_direct.push(vec!["simp [Matrix.mul_assoc, *]".to_string()]);
+    // Probe `ext` / `funext` ahead of `unfold` only when the goal target is equality/function-like
+    let target_only = extract_theorem_target(&thm.signature);
+    if head_symbol == "Eq"
+        || target_only.contains('=')
+        || target_only.starts_with('∀')
+        || target_only.contains("→")
+    {
+        early_direct.push(vec!["ext".to_string()]);
+        early_direct.push(vec!["funext".to_string()]);
+        early_direct.push(vec!["ext <;> simp_all".to_string()]);
+        early_direct.push(vec!["ext <;> rfl".to_string()]);
+        early_direct.push(vec!["funext; simp_all".to_string()]);
         if !all_defs.is_empty() {
             let defs_all = all_defs.join(", ");
-            early_direct.push(vec![format!("simp_all [{defs_all}, Matrix.mul_assoc]")]);
-        }
-        for (hyp, ty) in &thm.binders {
-            if ty.contains('=') {
-                early_direct.push(vec![format!(
-                    "simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc, {hyp}]; simp_all"
-                )]);
-                for (m_var, m_ty) in &thm.binders {
-                    if m_var != hyp && !m_ty.contains('=') && !m_ty.contains('∀') {
-                        early_direct.push(vec![format!(
-                            "simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc {m_var}, {hyp}]; simp_all"
-                        )]);
-                        if !used_defs.is_empty() {
-                            let used_list = used_defs.join(", ");
-                            early_direct.push(vec![format!(
-                                "dsimp only [{used_list}] at *; simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc {m_var}, {hyp}]; simp_all"
-                            )]);
-                        }
-                    }
-                }
-            }
+            early_direct.push(vec![format!("ext <;> simp_all [{defs_all}]")]);
         }
     }
-    if (thm.signature.contains('∑') || thm.signature.contains("Finset.sum"))
-        && (thm.signature.contains("Matrix") || thm.signature.contains('ᵀ'))
-    {
-        let sum_mat_patterns = [
-            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]",
-            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]; rw [Finset.sum_comm]; simp [mul_assoc]",
-            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply, mul_assoc]; rw [Finset.sum_comm]",
-            "ext <;> simp only [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]; rw [Finset.sum_comm]; congr 1; ext; congr 1; ext; ring",
-        ];
-        if !used_defs.is_empty() {
-            let used_list = used_defs.join(", ");
-            for pat in sum_mat_patterns {
-                early_direct.push(vec![format!("simp only [{used_list}]; {pat}")]);
+    // Combine `local_defs` + top VDB lemmas so rewrite lemmas fire immediately after unfolding
+    if !all_defs.is_empty() && !top_lemmas.is_empty() {
+        let mut combined: Vec<String> = all_defs.iter().map(|s| (*s).to_string()).collect();
+        for tl in top_lemmas.iter().take(4) {
+            if !combined.contains(tl) {
+                combined.push(tl.clone());
             }
         }
-        for pat in sum_mat_patterns {
-            early_direct.push(vec![pat.to_string()]);
-        }
+        let combined_list = combined.join(", ");
+        early_direct.push(vec![format!("simp_all [{combined_list}]")]);
+        bucket_rewrite.push(vec![format!("simp_all [{combined_list}]")]);
+        bucket_rewrite.push(vec![format!("simp [{combined_list}]")]);
     }
-    if thm.has_mathlib
-        && (thm.signature.contains('≤')
-            || thm.signature.contains('<')
-            || thm.signature.contains('≥')
-            || thm.signature.contains('>')
-            || thm.signature.contains("<="))
-    {
-        let defs_prefix = if !all_defs.is_empty() {
+    if thm.has_mathlib {
+        let dsimp_prefix = if !all_defs.is_empty() {
             format!("dsimp only [{}] at *; ", all_defs.join(", "))
         } else {
             String::new()
         };
-        for tac in [
-            "field_simp <;> nlinarith",
-            "field_simp <;> linarith",
-            "push_cast at *; field_simp <;> nlinarith",
-            "field_simp <;> (first | nlinarith | linarith | positivity)",
-            "rw [div_le_iff₀ (by positivity)] at *; nlinarith",
-            "rw [le_div_iff₀ (by positivity)] at *; nlinarith",
-            "rw [div_le_div_iff₀ (by positivity) (by positivity)] at *; nlinarith",
-        ] {
-            if !defs_prefix.is_empty() {
-                early_direct.push(vec![format!("{defs_prefix}{tac}")]);
-            }
+        let unfold_prefix = if !all_defs.is_empty() {
+            format!("unfold {} at *; ", all_defs.join(", "))
+        } else {
+            String::new()
+        };
+        let mut mathlib_solvers: Vec<&str> = Vec::new();
+        if thm.signature.contains('≤')
+            || thm.signature.contains('<')
+            || thm.signature.contains('≥')
+            || thm.signature.contains('>')
+            || thm.signature.contains("<=")
+        {
+            mathlib_solvers.extend([
+                "field_simp at * <;> (first | linarith | nlinarith | positivity)",
+                "rify at *; field_simp at * <;> (first | linarith | nlinarith | positivity)",
+                "rify at *; push_cast at *; field_simp at * <;> (first | linarith | nlinarith | positivity)",
+                "linarith",
+                "nlinarith",
+                "positivity",
+                "norm_num",
+                "ring",
+                "aesop",
+            ]);
+        } else {
+            mathlib_solvers.extend(["ring", "norm_num", "positivity", "aesop", "push_cast at *; ring", "linarith", "nlinarith"]);
+        }
+        for tac in mathlib_solvers {
             early_direct.push(vec![tac.to_string()]);
+            if !unfold_prefix.is_empty() {
+                early_direct.push(vec![format!("{unfold_prefix}{tac}")]);
+            }
+            if !dsimp_prefix.is_empty() {
+                early_direct.push(vec![format!("{dsimp_prefix}{tac}")]);
+            }
         }
     }
     for prev_thm in thm.local_theorems.iter().rev().take(8) {
@@ -2616,34 +2895,8 @@ fn synthesize_from_model_and_vdb(
             "simp [{context_list}] <;> all_goals (repeat (first | rfl | (split <;> try simp_all [{context_list}]) | omega))"
         )]);
     }
-    if (thm.signature.contains('≤') || thm.signature.contains("<="))
-        && (thm.signature.contains("List.take")
-            || thm.signature.contains(".take")
-            || thm.signature.contains("List.flatten")
-            || thm.signature.contains(".flatten")
-            || thm.signature.contains("List.sum")
-            || thm.signature.contains(".sum"))
-    {
-        let list_vars: Vec<&str> = thm
-            .binders
-            .iter()
-            .filter(|(_, ty)| ty == "List" || ty.starts_with("List "))
-            .map(|(v, _)| v.as_str())
-            .collect();
-        let nat_vars: Vec<&str> = thm
-            .binders
-            .iter()
-            .filter(|(_, ty)| ty == "Nat")
-            .map(|(v, _)| v.as_str())
-            .collect();
-        if let (Some(&xs), true) = (list_vars.first(), nat_vars.len() >= 2) {
-            let d1 = nat_vars[0];
-            let d2 = nat_vars[1];
-            bucket_rewrite.push(vec![format!(
-                "induction {xs} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all <;> omega"
-            )]);
-        }
-    }
+    bucket_rewrite.push(vec!["contradiction".to_string()]);
+    bucket_rewrite.push(vec!["tauto".to_string()]);
     bucket_rewrite.push(vec!["grind".to_string()]);
 
     // 1c. General existential-conjunction & negation-by-contradiction closers
@@ -2747,10 +3000,7 @@ fn synthesize_from_model_and_vdb(
     }
 
     if !induction_targets.is_empty() {
-        let mut ind_ctx = context_lemmas.clone();
-        if thm.signature.contains("List") || ind_binders.iter().any(|(_, ty)| ty.starts_with("List")) {
-            ind_ctx.push("List.append_assoc".to_string());
-        }
+        let ind_ctx = context_lemmas.clone();
         let ind_ctx_list = ind_ctx.join(", ");
         let thms_list = thm.local_theorems.join(", ");
 
@@ -2787,40 +3037,6 @@ fn synthesize_from_model_and_vdb(
         }
 
         for (v_ind, is_list) in induction_targets {
-            if is_list
-                && (thm.signature.contains('≤') || thm.signature.contains("<="))
-                && (thm.signature.contains("List.take")
-                    || thm.signature.contains(".take")
-                    || thm.signature.contains("List.flatten")
-                    || thm.signature.contains(".flatten")
-                    || thm.signature.contains("List.sum")
-                    || thm.signature.contains(".sum"))
-            {
-                let nat_vars: Vec<&str> = thm
-                    .binders
-                    .iter()
-                    .filter(|(v, ty)| v.as_str() != v_ind && ty == "Nat")
-                    .map(|(v, _)| v.as_str())
-                    .collect();
-                if nat_vars.len() >= 2 {
-                    let d1 = nat_vars[0];
-                    let d2 = nat_vars[1];
-                    bucket_induction.insert(
-                        0,
-                        vec![format!(
-                            "induction {v_ind} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all <;> omega"
-                        )],
-                    );
-                    if !ind_ctx_list.is_empty() {
-                        bucket_induction.insert(
-                            1,
-                            vec![format!(
-                                "induction {v_ind} generalizing {d1} {d2} <;> cases {d1} <;> cases {d2} <;> simp_all [{ind_ctx_list}] <;> omega"
-                            )],
-                        );
-                    }
-                }
-            }
             let other_vars: Vec<&str> = thm
                 .binders
                 .iter()
@@ -2890,7 +3106,10 @@ fn synthesize_from_model_and_vdb(
         if !var_args.is_empty() {
             bucket_apply.push(vec![format!("exact {lemma} {}", var_args.join(" "))]);
         }
-        bucket_apply.push(vec![format!("simp [{lemma}]")]);
+        bucket_apply.push(vec![format!("apply {lemma} <;> assumption")]);
+        bucket_apply.push(vec![format!("rw [{lemma}]")]);
+        bucket_apply.push(vec![format!("rw [← {lemma}]")]);
+        bucket_apply.push(vec![format!("simp_all [{lemma}]")]);
     }
 
     // 5. Structural head-symbol introduction from canonicalizer + model gate
@@ -2905,6 +3124,7 @@ fn synthesize_from_model_and_vdb(
 
     // Order buckets dynamically based on `pred.strategy` while preserving full fallback coverage
     if primary_only {
+        scripts.extend(early_direct.iter().take(8).cloned());
         match pred.strategy {
             lean_sys1_ort::StrategyChoice::AtomicClose => scripts.extend(bucket_atomic),
             lean_sys1_ort::StrategyChoice::Rewrite => scripts.extend(bucket_rewrite),
@@ -3597,8 +3817,9 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
             if !target_path.exists() {
                 return Ok((2, format!("error: path '{}' does not exist", prove_args.target)));
             }
+            let norm_target = normalize_fs_path(target_path);
             let options = ProverConfig::from(&prove_args);
-            let summary = prove_lean_path_with_options(target_path, &options)?;
+            let summary = prove_lean_path_with_options(&norm_target, &options)?;
             if let Some(pat) = &summary.filter_miss {
                 if options.json {
                     return Ok((1, summary.json_events.join("\n")));
@@ -4303,6 +4524,7 @@ mod tests {
                         tree: root_tree.clone(),
                         target_file: node.target_file.clone(),
                         open_subgoal: "_v0 : Nat ⊢ _v0 + 0 = _v0".to_string(),
+                        parent_subgoal: None,
                         partial_script: vec!["step_a".into()],
                         priority: 1.5,
                     };
@@ -4313,6 +4535,7 @@ mod tests {
                         tree: root_tree.clone(),
                         target_file: node.target_file.clone(),
                         open_subgoal: "_v0 : Nat ⊢ _v0 + 0 = _v0".to_string(),
+                        parent_subgoal: None,
                         partial_script: vec!["step_b".into()],
                         priority: 1.4,
                     };
@@ -4379,6 +4602,7 @@ mod tests {
                             tree: child_tree,
                             target_file: f.clone(),
                             open_subgoal: format!("subgoal_depth_{}", node.depth + 1),
+                            parent_subgoal: Some(node.open_subgoal.clone()),
                             partial_script: script,
                             priority: 2.0 - 0.15 * ((node.depth + 1) as f32),
                         }]))
@@ -5506,8 +5730,8 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             .map(|c| c.join("; "))
             .collect();
         assert!(
-            div_cands.iter().any(|s| s == "field_simp <;> linarith"),
-            "missing field_simp <;> linarith candidate: {div_cands:?}"
+            div_cands.iter().any(|s| s == "field_simp at * <;> linarith"),
+            "missing general field_simp at * <;> linarith candidate: {div_cands:?}"
         );
 
         let thm_sum = DiscoveredTheorem {
@@ -5529,19 +5753,14 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             .into_iter()
             .map(|c| c.join("; "))
             .collect();
-        let ext_idx = sum_cands
-            .iter()
-            .position(|s| s.contains("ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]"))
-            .expect("missing Finset.sum_mul + Matrix ext candidate");
-        let unfold_idx = sum_cands
-            .iter()
-            .position(|s| s.starts_with("unfold z"))
-            .unwrap_or(usize::MAX);
-        assert!(ext_idx < unfold_idx, "ext must precede unfold on Matrix+sum");
+        assert!(
+            !sum_cands.iter().any(|s| s.contains("Matrix.") || s.contains("Finset.")),
+            "must not hardcode Matrix/Finset lemmas when VDB is empty: {sum_cands:?}"
+        );
     }
 
     #[test]
-    fn test_m25_mathlib_sum_comm_matrix_reassoc_and_local_def_div_ineq() {
+    fn test_m26_zero_hardcoded_matrix_or_finset_strings_in_synthesizer() {
         let pred = lean_sys1_ort::Sys1Prediction {
             state_emb: vec![0.0; 384],
             strategy: lean_sys1_ort::StrategyChoice::Rewrite,
@@ -5549,19 +5768,13 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             direct_close_prob: 0.3,
             difficulty: lean_sys1_ort::DifficultyBucket::Short,
         };
-
-        let thm_rot = DiscoveredTheorem {
-            file: std::path::PathBuf::from("Rot.lean"),
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Gen.lean"),
             line: 1,
             namespace: None,
-            name: "joint_itq".to_string(),
-            signature: "theorem joint_itq (U Q V : Matrix (Fin 2) (Fin 2) ℝ) (hQ : Q * Qᵀ = 1) : U * Q * (Qᵀ * Vᵀ) = U * Vᵀ := by sorry".to_string(),
-            binders: vec![
-                ("U".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
-                ("Q".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
-                ("V".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
-                ("hQ".to_string(), "Q * Qᵀ = 1".to_string()),
-            ],
+            name: "gen_mat".to_string(),
+            signature: "theorem gen_mat (U Q V : Matrix (Fin 2) (Fin 2) ℝ) : U * Q * V = U * V := by sorry".to_string(),
+            binders: vec![],
             local_defs: vec![],
             local_structures: vec![],
             local_inductives: vec![],
@@ -5570,52 +5783,83 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             has_mathlib: true,
             workspace_deps: vec![],
         };
-        let rot_cands: Vec<String> =
-            synthesize_from_model_and_vdb(&thm_rot, "Eq", &pred, &[], &[], 4, false)
-                .into_iter()
-                .map(|c| c.join("; "))
-                .collect();
+        let without_vdb: Vec<String> = synthesize_from_model_and_vdb(&thm, "Eq", &pred, &[], &[], 4, false)
+            .into_iter()
+            .map(|c| c.join("; "))
+            .collect();
         assert!(
-            rot_cands
-                .iter()
-                .any(|s| s.contains("rw [← Matrix.mul_assoc Q, hQ]; simp_all")),
-            "missing Matrix re-association candidate: {rot_cands:?}"
+            !without_vdb.iter().any(|s| s.contains("Matrix.") || s.contains("Finset.")),
+            "unexpected hardcoded Matrix/Finset tactic without VDB: {without_vdb:?}"
         );
 
-        let thm_sum = DiscoveredTheorem {
-            file: std::path::PathBuf::from("SumSwap.lean"),
-            line: 1,
-            namespace: None,
-            name: "latent_v".to_string(),
-            signature: "theorem latent_v (z_V : Matrix (Fin 2) (Fin 2) ℝ) : ∑ x, ∑ i, z_V x i = ∑ x, ∑ i, z_V i x := by sorry".to_string(),
-            binders: vec![],
-            local_defs: vec!["z_V".to_string()],
-            local_structures: vec![],
-            local_inductives: vec![],
-            local_theorems: vec![],
-            local_struct_laws: vec![],
-            has_mathlib: true,
-            workspace_deps: vec![],
+        let with_vdb: Vec<String> = synthesize_from_model_and_vdb(
+            &thm,
+            "Eq",
+            &pred,
+            &[],
+            &["Matrix.mul_assoc".to_string()],
+            4,
+            false,
+        )
+        .into_iter()
+        .map(|c| c.join("; "))
+        .collect();
+        assert!(
+            with_vdb.iter().any(|s| s == "rw [Matrix.mul_assoc]"),
+            "expected VDB-supplied rewrite: {with_vdb:?}"
+        );
+    }
+
+    #[test]
+    fn test_m26_subgoal_search_chains_two_step_vdb_proof() {
+        let dir = std::env::temp_dir().join("sheaf_m26_subgoal_vdb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("SubgoalVdb.lean");
+        std::fs::write(
+            &f,
+            concat!(
+                "import Init\n",
+                "theorem helper_box (x y : Nat) : (x + 1) * y = y * (x + 1) := by\n",
+                "  exact Nat.mul_comm (x + 1) y\n",
+                "theorem goal_needs_intro (a b : Nat) : True → (a + 1) * b = b * (a + 1) := by\n",
+                "  sorry\n",
+            ),
+        )
+        .unwrap();
+        let summary = prove_lean_path(&f, false).unwrap();
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m27_embedded_vdb_exceeds_seed_corpus() {
+        let emb = embedded_artifacts();
+        let (vdb, _) = lean_vdb::StaticVdbIndex::from_lvdb_bytes(emb.mathlib_sq8_vdb).unwrap();
+        assert!(
+            vdb.metadata.len() > 100,
+            "expected expanded Init/Mathlib VDB (>100 lemmas), got {}",
+            vdb.metadata.len()
+        );
+    }
+
+    #[test]
+    fn test_m27_unfold_before_field_simp_in_mathlib_ineq() {
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
+            answer_confidence: 0.4,
+            direct_close_prob: 0.3,
+            difficulty: lean_sys1_ort::DifficultyBucket::Short,
         };
-        let sum_cands: Vec<String> =
-            synthesize_from_model_and_vdb(&thm_sum, "Eq", &pred, &[], &[], 4, false)
-                .into_iter()
-                .map(|c| c.join("; "))
-                .collect();
-        assert!(
-            sum_cands
-                .iter()
-                .any(|s| s.contains("rw [Finset.sum_comm]; simp [mul_assoc]")),
-            "missing Finset.sum_comm + mul_assoc candidate: {sum_cands:?}"
-        );
-
-        let thm_local_div = DiscoveredTheorem {
-            file: std::path::PathBuf::from("LocalDiv.lean"),
+        let thm = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Ineq.lean"),
             line: 1,
             namespace: None,
             name: "latent_v_smaller".to_string(),
             signature: "theorem latent_v_smaller (d r_eff : ℕ) : latentBits d r_eff ≤ fullBits d := by sorry".to_string(),
-            binders: vec![("d".to_string(), "ℕ".to_string()), ("r_eff".to_string(), "ℕ".to_string())],
+            binders: vec![],
             local_defs: vec!["latentBits".to_string(), "fullBits".to_string()],
             local_structures: vec![],
             local_inductives: vec![],
@@ -5624,16 +5868,15 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             has_mathlib: true,
             workspace_deps: vec![],
         };
-        let div_cands: Vec<String> =
-            synthesize_from_model_and_vdb(&thm_local_div, "LE.le", &pred, &[], &[], 4, false)
-                .into_iter()
-                .map(|c| c.join("; "))
-                .collect();
+        let cands: Vec<String> = synthesize_from_model_and_vdb(&thm, "LE.le", &pred, &[], &[], 4, false)
+            .into_iter()
+            .map(|c| c.join("; "))
+            .collect();
         assert!(
-            div_cands
+            cands
                 .iter()
-                .any(|s| s == "dsimp only [latentBits, fullBits] at *; field_simp <;> nlinarith"),
-            "missing local-def field_simp <;> nlinarith candidate: {div_cands:?}"
+                .any(|s| s == "unfold latentBits, fullBits at *; rify at *; field_simp at * <;> nlinarith"),
+            "missing unfold + rify + field_simp at * candidate: {cands:?}"
         );
     }
 }

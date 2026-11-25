@@ -17,6 +17,7 @@ pub struct SearchNode {
     pub tree: TreeSnapshot,
     pub target_file: PathBuf,
     pub open_subgoal: String,
+    pub parent_subgoal: Option<String>,
     pub partial_script: Vec<String>,
     pub priority: f32,
 }
@@ -64,6 +65,7 @@ pub fn compute_node_priority(
 #[derive(Default, Debug)]
 pub struct TwoTierDedup {
     pub visited_exact: HashSet<(BlobHash, String)>,
+    pub visited_subgoals: HashSet<String>,
     pub episodic: EpisodicCache,
     pub exact_dedup_hits: usize,
     pub semantic_dedup_hits: usize,
@@ -92,6 +94,36 @@ impl TwoTierDedup {
             EpisodicHit::PruneLoop | EpisodicHit::Solved(_) => {
                 self.semantic_dedup_hits += 1;
                 false
+            }
+        }
+    }
+
+    /// Record a `Lean-Sys1` evaluation while never semantically pruning a child whose
+    /// canonical goal string strictly changed or shrank relative to its parent.
+    pub fn record_sys1_and_check_tier2_with_progress(
+        &mut self,
+        state_emb: &[f32],
+        parent_subgoal: Option<&str>,
+        open_subgoal: &str,
+    ) -> bool {
+        self.sys1_calls += 1;
+        if let Some(parent) = parent_subgoal
+            && parent == open_subgoal
+        {
+            self.semantic_dedup_hits += 1;
+            return false;
+        }
+        let is_fresh_progress = parent_subgoal.is_some_and(|p| p != open_subgoal)
+            && self.visited_subgoals.insert(open_subgoal.to_string());
+        match self.episodic.check_or_insert(state_emb) {
+            EpisodicHit::Novel => true,
+            EpisodicHit::PruneLoop | EpisodicHit::Solved(_) => {
+                if is_fresh_progress {
+                    true
+                } else {
+                    self.semantic_dedup_hits += 1;
+                    false
+                }
             }
         }
     }
@@ -138,6 +170,7 @@ where
         tree: root_tree,
         target_file,
         open_subgoal: initial_subgoal,
+        parent_subgoal: None,
         partial_script: Vec::new(),
         priority: 2.0,
     });
@@ -199,4 +232,31 @@ pub enum StepOutcome {
     },
     Progressed(Vec<SearchNode>),
     Pruned(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_m27_parent_child_progress_bypasses_semantic_prune() {
+        let mut dedup = TwoTierDedup::default();
+        let parent_emb = vec![1.0_f32; 8];
+        let child_emb = vec![0.999_f32; 8];
+        assert!(dedup.record_sys1_and_check_tier2_with_progress(
+            &parent_emb,
+            None,
+            "⊢ U * Q = V"
+        ));
+        assert!(dedup.record_sys1_and_check_tier2_with_progress(
+            &child_emb,
+            Some("⊢ U * Q = V"),
+            "⊢ ∀ i j, (U * Q) i j = V i j"
+        ));
+        assert!(!dedup.record_sys1_and_check_tier2_with_progress(
+            &child_emb,
+            Some("⊢ U * Q = V"),
+            "⊢ U * Q = V"
+        ));
+    }
 }
