@@ -9,12 +9,12 @@ members = [
 ]
 
 [workspace.package]
-version = "1.13.0"
+version = "1.14.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/steveSujo/sheaf"
 authors = ["Steve Sujo Pulikottil"]
-description = "CPU-first Lean 4 auto-prover with ONNX System-1 routing, SQ8 HNSW retrieval, and kernel verification"
+description = "Token-saving Lean 4 MCP server and local CPU-only prover with persistent lean --server, ONNX routing, SQ8 HNSW retrieval, and kernel verification"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
