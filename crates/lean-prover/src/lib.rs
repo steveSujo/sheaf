@@ -619,6 +619,7 @@ pub struct DiscoveredTheorem {
     pub local_inductives: Vec<String>,
     pub local_theorems: Vec<String>,
     pub local_struct_laws: Vec<(String, String)>,
+    pub has_mathlib: bool,
     pub workspace_deps: Vec<std::path::PathBuf>,
 }
 
@@ -830,14 +831,19 @@ fn qualify_exported_symbols(
 /// Recursively scan a `.lean` file or `lake` workspace (skipping `.lake/`) for `sorry` theorems
 /// in topological import order with transitive workspace symbols.
 pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredTheorem>, ProverError> {
+    let norm_path = normalize_fs_path(path);
     let mut raw_files = Vec::new();
-    collect_lean_files(path, &mut raw_files)?;
+    collect_lean_files(&norm_path, &mut raw_files)?;
 
-    let base_root = find_lake_workspace_root(path).unwrap_or_else(|| {
-        if path.is_file() {
-            path.parent().unwrap_or(path).to_path_buf()
+    let base_root = find_lake_workspace_root(&norm_path).unwrap_or_else(|| {
+        if norm_path.is_file() {
+            norm_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf()
         } else {
-            path.to_path_buf()
+            norm_path.clone()
         }
     });
     let (files, file_trans_deps) = topo_sort_workspace_files(&raw_files, &base_root)?;
@@ -845,11 +851,20 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
         std::collections::HashMap::new();
 
     let mut found = Vec::new();
+    let mut file_has_mathlib: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
     for (file_idx, file) in files.iter().enumerate() {
         let src = std::fs::read_to_string(file)
             .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-        let (_, opens) = parse_file_imports_and_opens(&src);
+        let (imports, opens) = parse_file_imports_and_opens(&src);
         let deps = &file_trans_deps[file_idx];
+        let direct_mathlib = imports
+            .iter()
+            .any(|imp| imp == "Mathlib" || imp.starts_with("Mathlib."));
+        if direct_mathlib {
+            file_has_mathlib.insert(file.clone());
+        }
+        let has_mathlib = direct_mathlib || deps.iter().any(|d| file_has_mathlib.contains(d));
 
         let mut local_defs: Vec<String> = Vec::new();
         let mut local_structures: Vec<String> = Vec::new();
@@ -958,7 +973,8 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     .unwrap_or("")
                     .to_string();
 
-                let mut decl_parts = vec![trimmed.to_string()];
+                let first_clean = lean_canonicalizer::strip_lean_comments(trimmed).trim().to_string();
+                let mut decl_parts = vec![first_clean];
                 let mut scan = idx;
                 while !decl_parts.last().is_some_and(|l| l.contains(":=")) && scan + 1 < lines.len() {
                     scan += 1;
@@ -966,7 +982,10 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                     if is_top_level_decl_boundary(nt) {
                         break;
                     }
-                    decl_parts.push(nt.to_string());
+                    let clean_nt = lean_canonicalizer::strip_lean_comments(nt).trim().to_string();
+                    if !clean_nt.is_empty() {
+                        decl_parts.push(clean_nt);
+                    }
                 }
                 let full_decl = decl_parts.join(" ");
 
@@ -1001,6 +1020,7 @@ pub fn discover_sorry_theorems(path: &std::path::Path) -> Result<Vec<DiscoveredT
                         local_inductives: local_inductives.clone(),
                         local_theorems: local_theorems.clone(),
                         local_struct_laws: local_struct_laws.clone(),
+                        has_mathlib,
                         workspace_deps: deps.clone(),
                     });
                 }
@@ -1142,14 +1162,55 @@ fn parse_theorem_binders(decl: &str) -> Vec<(String, String)> {
     binders
 }
 
+fn strip_windows_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    p
+}
+
+fn normalize_fs_path(path: &std::path::Path) -> std::path::PathBuf {
+    let abs = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&abs)
+        .map(strip_windows_verbatim_prefix)
+        .unwrap_or(abs)
+}
+
 /// Find the nearest ancestor directory containing `lakefile.toml` or `lakefile.lean`.
 #[must_use]
 pub fn find_lake_workspace_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let start = if path.is_file() { path.parent()? } else { path };
-    let mut cur = Some(start);
+    let norm = normalize_fs_path(path);
+    let start = if norm.is_file() {
+        norm.parent()?
+    } else {
+        norm.as_path()
+    };
+    let mut cur = Some(if start.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        start
+    });
     while let Some(dir) = cur {
-        if dir.join("lakefile.toml").exists() || dir.join("lakefile.lean").exists() {
-            return Some(dir.to_path_buf());
+        let check_dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        if check_dir.join("lakefile.toml").exists() || check_dir.join("lakefile.lean").exists() {
+            return Some(check_dir.to_path_buf());
         }
         cur = dir.parent();
     }
@@ -1569,10 +1630,14 @@ pub fn prove_lean_path_with_artifacts_and_options(
     let initial_tree = vfs::TreeSnapshot::from_map(initial_files);
     let mut root_tree = initial_tree.clone();
     let base_root = find_lake_workspace_root(path).unwrap_or_else(|| {
-        if path.is_file() {
-            path.parent().unwrap_or(path).to_path_buf()
+        let norm = normalize_fs_path(path);
+        if norm.is_file() {
+            norm.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf()
         } else {
-            path.to_path_buf()
+            norm
         }
     });
 
@@ -1744,7 +1809,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
             if fast_candidates.is_empty() {
                 (None, String::new(), Vec::new())
             } else {
-                kernel_eval::verify_candidates_batched_with_options_and_ui(
+                kernel_eval::verify_candidates_batched_with_deadline_and_ui(
                     &eval_src,
                     thm,
                     &full_name,
@@ -1755,14 +1820,21 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     0,
                     options.write_in_place || options.strict_lint,
                     options.strict_lint,
+                    None,
                 )?
             }
         } else {
             (None, String::new(), Vec::new())
         };
 
+        // Anchor OOD escalation budget after pre-flight and any DirectExecute fast-path
+        let ood_deadline = (ood_status == OodStatus::OodDomain)
+            .then(|| Instant::now() + std::time::Duration::from_secs(options.ood_timeout_secs));
+
         // Escalate to FallbackToLeJepa when gated or when DirectExecute fast-path fails
-        if solved.is_none() {
+        if solved.is_none()
+            && ood_deadline.is_none_or(|dl| Instant::now() < dl)
+        {
             did_escalate = true;
             let query_emb = onnx_sess.predict_lejepa_target(&pred.state_emb, pred.strategy);
             vdb_hits = vdb.search_sq8_hnsw(
@@ -1789,7 +1861,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
             let cand_embs: Vec<Vec<f32>> = vdb_hits.iter().map(|h| h.embedding.clone()).collect();
             let cand_names: Vec<String> =
                 vdb_hits.iter().map(|h| h.metadata.name.clone()).collect();
-            let scored = if cand_embs.is_empty() {
+            let mut scored = if cand_embs.is_empty() {
                 Vec::new()
             } else {
                 lean_sys1_ort::score_premise_fit_batch(
@@ -1800,13 +1872,26 @@ pub fn prove_lean_path_with_artifacts_and_options(
                     options.premise_tau,
                 )?
             };
+            if scored.is_empty() && !cand_embs.is_empty() {
+                scored = lean_sys1_ort::score_premise_fit_batch(
+                    &pred.state_emb,
+                    &cand_embs,
+                    onnx_sess.premise_fit_weights(),
+                    temps.t_fit,
+                    0.0,
+                )?;
+            }
             let fallback = lean_sys1_ort::select_fallback_outcome(&scored, options.max_branches);
             top_lemmas = match fallback {
                 lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
                     .iter()
                     .filter_map(|(i, _)| cand_names.get(*i).cloned())
                     .collect(),
-                lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => Vec::new(),
+                lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => cand_names
+                    .iter()
+                    .take(options.max_branches)
+                    .cloned()
+                    .collect(),
             };
 
             let fallback_candidates: Vec<Vec<String>> = synthesize_from_model_and_vdb(
@@ -1824,7 +1909,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
 
             if !fallback_candidates.is_empty() {
                 let (fb_solved, fb_diag, fb_unsolved) =
-                    kernel_eval::verify_candidates_batched_with_options_and_ui(
+                    kernel_eval::verify_candidates_batched_with_deadline_and_ui(
                         &eval_src,
                         thm,
                         &full_name,
@@ -1835,6 +1920,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         tried_scripts.len(),
                         options.write_in_place || options.strict_lint,
                         options.strict_lint,
+                        ood_deadline,
                     )?;
                 solved = fb_solved;
                 if !fb_diag.is_empty() {
@@ -1848,7 +1934,11 @@ pub fn prove_lean_path_with_artifacts_and_options(
         }
 
         // Deep (>= 3-step) Best-First compositional subgoal search backed by BlobStore + TreeSnapshot
-        if solved.is_none() && !unsolved_diags.is_empty() && options.max_depth > 1 {
+        if solved.is_none()
+            && !unsolved_diags.is_empty()
+            && options.max_depth > 1
+            && ood_deadline.is_none_or(|dl| Instant::now() < dl)
+        {
             let search_max_nodes = if ood_status == OodStatus::OodDomain {
                 options.max_nodes.min(16)
             } else {
@@ -1862,9 +1952,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
                 options.max_depth,
                 search_max_nodes,
                 |store, node, dedup| {
-                    if ood_status == OodStatus::OodDomain
-                        && thm_start.elapsed() >= std::time::Duration::from_secs(options.ood_timeout_secs)
-                    {
+                    if ood_deadline.is_some_and(|dl| Instant::now() >= dl) {
                         return Ok(search::StepOutcome::Pruned(format!(
                             "ood escalation budget exceeded ({}s)",
                             options.ood_timeout_secs
@@ -1903,6 +1991,11 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         for lt in &thm.local_theorems {
                             if !search_ctx.contains(lt) {
                                 search_ctx.push(lt.clone());
+                            }
+                        }
+                        for tl in &top_lemmas {
+                            if !search_ctx.contains(tl) {
+                                search_ctx.push(tl.clone());
                             }
                         }
                         let search_ctx_list = search_ctx.join(", ");
@@ -1956,7 +2049,7 @@ pub fn prove_lean_path_with_artifacts_and_options(
                         max_nodes: options.max_nodes,
                     });
                     let (step_solved, step_diag, step_unsolved) =
-                        kernel_eval::verify_candidates_batched_with_options_and_ui(
+                        kernel_eval::verify_candidates_batched_with_deadline_and_ui(
                             &cur_src,
                             thm,
                             &full_name,
@@ -1965,8 +2058,9 @@ pub fn prove_lean_path_with_artifacts_and_options(
                             options.max_heartbeats,
                             &ui,
                             tried_scripts.len() + node.id * 4,
-                            options.write_in_place,
-                            options.strict_lint && options.write_in_place,
+                            options.write_in_place || options.strict_lint,
+                            options.strict_lint,
+                            ood_deadline,
                         )
                         .map_err(|e| e.to_string())?;
 
@@ -2364,6 +2458,80 @@ fn synthesize_from_model_and_vdb(
 
     // 1. Cheap non-inductive hypothesis, prev-theorem, structure-law & early simp_all closers before cases/VDB
     let mut early_direct: Vec<Vec<String>> = Vec::new();
+    if thm.signature.contains("Matrix") || thm.signature.contains('ᵀ') {
+        early_direct.push(vec!["simp_all [Matrix.mul_assoc]".to_string()]);
+        early_direct.push(vec!["simp [Matrix.mul_assoc, *]".to_string()]);
+        if !all_defs.is_empty() {
+            let defs_all = all_defs.join(", ");
+            early_direct.push(vec![format!("simp_all [{defs_all}, Matrix.mul_assoc]")]);
+        }
+        for (hyp, ty) in &thm.binders {
+            if ty.contains('=') {
+                early_direct.push(vec![format!(
+                    "simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc, {hyp}]; simp_all"
+                )]);
+                for (m_var, m_ty) in &thm.binders {
+                    if m_var != hyp && !m_ty.contains('=') && !m_ty.contains('∀') {
+                        early_direct.push(vec![format!(
+                            "simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc {m_var}, {hyp}]; simp_all"
+                        )]);
+                        if !used_defs.is_empty() {
+                            let used_list = used_defs.join(", ");
+                            early_direct.push(vec![format!(
+                                "dsimp only [{used_list}] at *; simp_all [Matrix.transpose_mul]; simp only [Matrix.mul_assoc]; rw [← Matrix.mul_assoc {m_var}, {hyp}]; simp_all"
+                            )]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (thm.signature.contains('∑') || thm.signature.contains("Finset.sum"))
+        && (thm.signature.contains("Matrix") || thm.signature.contains('ᵀ'))
+    {
+        let sum_mat_patterns = [
+            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]",
+            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]; rw [Finset.sum_comm]; simp [mul_assoc]",
+            "ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply, mul_assoc]; rw [Finset.sum_comm]",
+            "ext <;> simp only [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]; rw [Finset.sum_comm]; congr 1; ext; congr 1; ext; ring",
+        ];
+        if !used_defs.is_empty() {
+            let used_list = used_defs.join(", ");
+            for pat in sum_mat_patterns {
+                early_direct.push(vec![format!("simp only [{used_list}]; {pat}")]);
+            }
+        }
+        for pat in sum_mat_patterns {
+            early_direct.push(vec![pat.to_string()]);
+        }
+    }
+    if thm.has_mathlib
+        && (thm.signature.contains('≤')
+            || thm.signature.contains('<')
+            || thm.signature.contains('≥')
+            || thm.signature.contains('>')
+            || thm.signature.contains("<="))
+    {
+        let defs_prefix = if !all_defs.is_empty() {
+            format!("dsimp only [{}] at *; ", all_defs.join(", "))
+        } else {
+            String::new()
+        };
+        for tac in [
+            "field_simp <;> nlinarith",
+            "field_simp <;> linarith",
+            "push_cast at *; field_simp <;> nlinarith",
+            "field_simp <;> (first | nlinarith | linarith | positivity)",
+            "rw [div_le_iff₀ (by positivity)] at *; nlinarith",
+            "rw [le_div_iff₀ (by positivity)] at *; nlinarith",
+            "rw [div_le_div_iff₀ (by positivity) (by positivity)] at *; nlinarith",
+        ] {
+            if !defs_prefix.is_empty() {
+                early_direct.push(vec![format!("{defs_prefix}{tac}")]);
+            }
+            early_direct.push(vec![tac.to_string()]);
+        }
+    }
     for prev_thm in thm.local_theorems.iter().rev().take(8) {
         if !all_defs.is_empty() {
             let defs_all = all_defs.join(", ");
@@ -4502,6 +4670,7 @@ mod tests {
             local_inductives: vec![],
             local_theorems: vec!["step_conserves".to_string()],
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: vec![],
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4543,6 +4712,7 @@ mod tests {
             local_inductives: vec![],
             local_theorems: vec![],
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: vec![],
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4620,6 +4790,7 @@ theorem still_open (a b : Nat) : a + b = b + a := by
             local_inductives: vec![],
             local_theorems: vec![],
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: vec![],
         };
         let cands = synthesize_existential_candidates(&thm);
@@ -4746,6 +4917,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_inductives: vec!["BuildStatus".to_string(), "SanityStatus".to_string()],
             local_theorems: vec!["helper_ok".to_string()],
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: Vec::new(),
         };
         let pred = lean_sys1_ort::Sys1Prediction {
@@ -4854,6 +5026,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_inductives: Vec::new(),
             local_theorems: Vec::new(),
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: Vec::new(),
         };
         assert_eq!(classify_ood_status(&in_dist_thm), OodStatus::InDist);
@@ -4920,6 +5093,7 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             local_inductives: Vec::new(),
             local_theorems: Vec::new(),
             local_struct_laws: Vec::new(),
+            has_mathlib: false,
             workspace_deps: vec![std::path::PathBuf::from("Types.lean")],
         };
         assert_eq!(classify_ood_status(&thm), OodStatus::OodDomain);
@@ -5205,5 +5379,261 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
         assert_eq!(summary.discovered, 1);
         assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m24_windows_relative_single_file_path_no_os_error_123() {
+        let dir = std::env::temp_dir().join("sheaf_m24_rel_path");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("SubPkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(dir.join("lakefile.toml"), "name = \"SubPkg\"\n").unwrap();
+        let lean_file = sub.join("Basic.lean");
+        std::fs::write(
+            &lean_file,
+            "import Init\ntheorem t_rel (n : Nat) : n + 0 = n := by\n  sorry\n",
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let rel = std::path::Path::new("SubPkg/Basic.lean");
+        let root = find_lake_workspace_root(rel).expect("must find lake root");
+        assert!(!root.as_os_str().is_empty(), "lake root must never be empty");
+        assert!(
+            !root.to_string_lossy().starts_with(r"\\?\"),
+            "lake root must not carry Windows verbatim prefix: {root:?}"
+        );
+        let summary = prove_lean_path(rel, false).unwrap();
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        assert_eq!(summary.discovered, 1);
+        assert_eq!(summary.proved, 1, "failed: {:?}", summary.failed_theorems);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_m24_vdb_empty_tau_falls_back_to_hnsw_top_k() {
+        let emb = embedded_artifacts();
+        let onnx_sess = lean_sys1_ort::LeanSys1OnnxSession::from_onnx_bytes(emb.lean_sys1_onnx).unwrap();
+        let temps: lean_sys1_ort::CalibrationTemperatures =
+            serde_json::from_str(emb.temperatures_json).unwrap();
+        let state_emb = vec![0.0_f32; 384];
+        let cand_embs = vec![vec![0.1_f32; 384], vec![-0.1_f32; 384]];
+        let cand_names = vec!["Matrix.mul_assoc".to_string(), "Finset.sum_mul".to_string()];
+
+        let mut scored = lean_sys1_ort::score_premise_fit_batch(
+            &state_emb,
+            &cand_embs,
+            onnx_sess.premise_fit_weights(),
+            temps.t_fit,
+            0.9999,
+        )
+        .unwrap();
+        if scored.is_empty() && !cand_embs.is_empty() {
+            scored = lean_sys1_ort::score_premise_fit_batch(
+                &state_emb,
+                &cand_embs,
+                onnx_sess.premise_fit_weights(),
+                temps.t_fit,
+                0.0,
+            )
+            .unwrap();
+        }
+        let fallback = lean_sys1_ort::select_fallback_outcome(&scored, 4);
+        let top_lemmas: Vec<String> = match fallback {
+            lean_sys1_ort::FallbackOutcome::BranchOnLemmas(idxs) => idxs
+                .iter()
+                .filter_map(|(i, _)| cand_names.get(*i).cloned())
+                .collect(),
+            lean_sys1_ort::FallbackOutcome::ForceIntroduceHave => {
+                cand_names.iter().take(4).cloned().collect()
+            }
+        };
+        assert_eq!(top_lemmas.len(), 2, "expected non-empty fallback top_lemmas");
+    }
+
+    #[test]
+    fn test_m24_mathlib_matrix_field_simp_and_finset_candidates() {
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
+            answer_confidence: 0.4,
+            direct_close_prob: 0.3,
+            difficulty: lean_sys1_ort::DifficultyBucket::Short,
+        };
+        let thm_matrix = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Mat.lean"),
+            line: 1,
+            namespace: None,
+            name: "mat_assoc".to_string(),
+            signature: "theorem mat_assoc (U Q V : Matrix (Fin 2) (Fin 2) ℝ) : U * Q * (Qᵀ * Vᵀ) = U * Vᵀ := by sorry".to_string(),
+            binders: vec![],
+            local_defs: vec!["proj".to_string()],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let mat_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_matrix, "Eq", &pred, &[], &[], 4, false)
+            .into_iter()
+            .map(|c| c.join("; "))
+            .collect();
+        assert!(
+            mat_cands.iter().any(|s| s == "simp_all [Matrix.mul_assoc]"),
+            "missing Matrix.mul_assoc candidate: {mat_cands:?}"
+        );
+
+        let thm_div = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Div.lean"),
+            line: 1,
+            namespace: None,
+            name: "div_ineq".to_string(),
+            signature: "theorem div_ineq (d r : ℝ) : 3 * 2⁻¹ ≤ d * (2 * r)⁻¹ := by sorry".to_string(),
+            binders: vec![],
+            local_defs: vec![],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let div_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_div, "LE.le", &pred, &[], &[], 4, false)
+            .into_iter()
+            .map(|c| c.join("; "))
+            .collect();
+        assert!(
+            div_cands.iter().any(|s| s == "field_simp <;> linarith"),
+            "missing field_simp <;> linarith candidate: {div_cands:?}"
+        );
+
+        let thm_sum = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Sum.lean"),
+            line: 1,
+            namespace: None,
+            name: "sum_mat".to_string(),
+            signature: "theorem sum_mat (z : Matrix (Fin 2) (Fin 2) ℝ) : ∑ t, z t = z 0 := by sorry".to_string(),
+            binders: vec![],
+            local_defs: vec!["z".to_string()],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let sum_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_sum, "Eq", &pred, &[], &[], 4, false)
+            .into_iter()
+            .map(|c| c.join("; "))
+            .collect();
+        let ext_idx = sum_cands
+            .iter()
+            .position(|s| s.contains("ext <;> simp [Finset.sum_mul, Finset.mul_sum, Matrix.mul_apply]"))
+            .expect("missing Finset.sum_mul + Matrix ext candidate");
+        let unfold_idx = sum_cands
+            .iter()
+            .position(|s| s.starts_with("unfold z"))
+            .unwrap_or(usize::MAX);
+        assert!(ext_idx < unfold_idx, "ext must precede unfold on Matrix+sum");
+    }
+
+    #[test]
+    fn test_m25_mathlib_sum_comm_matrix_reassoc_and_local_def_div_ineq() {
+        let pred = lean_sys1_ort::Sys1Prediction {
+            state_emb: vec![0.0; 384],
+            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
+            answer_confidence: 0.4,
+            direct_close_prob: 0.3,
+            difficulty: lean_sys1_ort::DifficultyBucket::Short,
+        };
+
+        let thm_rot = DiscoveredTheorem {
+            file: std::path::PathBuf::from("Rot.lean"),
+            line: 1,
+            namespace: None,
+            name: "joint_itq".to_string(),
+            signature: "theorem joint_itq (U Q V : Matrix (Fin 2) (Fin 2) ℝ) (hQ : Q * Qᵀ = 1) : U * Q * (Qᵀ * Vᵀ) = U * Vᵀ := by sorry".to_string(),
+            binders: vec![
+                ("U".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
+                ("Q".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
+                ("V".to_string(), "Matrix (Fin 2) (Fin 2) ℝ".to_string()),
+                ("hQ".to_string(), "Q * Qᵀ = 1".to_string()),
+            ],
+            local_defs: vec![],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let rot_cands: Vec<String> =
+            synthesize_from_model_and_vdb(&thm_rot, "Eq", &pred, &[], &[], 4, false)
+                .into_iter()
+                .map(|c| c.join("; "))
+                .collect();
+        assert!(
+            rot_cands
+                .iter()
+                .any(|s| s.contains("rw [← Matrix.mul_assoc Q, hQ]; simp_all")),
+            "missing Matrix re-association candidate: {rot_cands:?}"
+        );
+
+        let thm_sum = DiscoveredTheorem {
+            file: std::path::PathBuf::from("SumSwap.lean"),
+            line: 1,
+            namespace: None,
+            name: "latent_v".to_string(),
+            signature: "theorem latent_v (z_V : Matrix (Fin 2) (Fin 2) ℝ) : ∑ x, ∑ i, z_V x i = ∑ x, ∑ i, z_V i x := by sorry".to_string(),
+            binders: vec![],
+            local_defs: vec!["z_V".to_string()],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let sum_cands: Vec<String> =
+            synthesize_from_model_and_vdb(&thm_sum, "Eq", &pred, &[], &[], 4, false)
+                .into_iter()
+                .map(|c| c.join("; "))
+                .collect();
+        assert!(
+            sum_cands
+                .iter()
+                .any(|s| s.contains("rw [Finset.sum_comm]; simp [mul_assoc]")),
+            "missing Finset.sum_comm + mul_assoc candidate: {sum_cands:?}"
+        );
+
+        let thm_local_div = DiscoveredTheorem {
+            file: std::path::PathBuf::from("LocalDiv.lean"),
+            line: 1,
+            namespace: None,
+            name: "latent_v_smaller".to_string(),
+            signature: "theorem latent_v_smaller (d r_eff : ℕ) : latentBits d r_eff ≤ fullBits d := by sorry".to_string(),
+            binders: vec![("d".to_string(), "ℕ".to_string()), ("r_eff".to_string(), "ℕ".to_string())],
+            local_defs: vec!["latentBits".to_string(), "fullBits".to_string()],
+            local_structures: vec![],
+            local_inductives: vec![],
+            local_theorems: vec![],
+            local_struct_laws: vec![],
+            has_mathlib: true,
+            workspace_deps: vec![],
+        };
+        let div_cands: Vec<String> =
+            synthesize_from_model_and_vdb(&thm_local_div, "LE.le", &pred, &[], &[], 4, false)
+                .into_iter()
+                .map(|c| c.join("; "))
+                .collect();
+        assert!(
+            div_cands
+                .iter()
+                .any(|s| s == "dsimp only [latentBits, fullBits] at *; field_simp <;> nlinarith"),
+            "missing local-def field_simp <;> nlinarith candidate: {div_cands:?}"
+        );
     }
 }
