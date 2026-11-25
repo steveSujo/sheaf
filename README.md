@@ -1,33 +1,61 @@
 # sheaf
 
-A local-first, single-binary Lean 4 auto-prover written in Rust.
+A token-saving Lean 4 MCP server and local CPU-only prover written in Rust.
 
-Sheaf embeds a quantized RoPE encoder, a scalar-quantized HNSW premise index, a content-addressed virtual filesystem, and a Lean 4 kernel verifier into a single ~25 MB executable. Everything runs offline in **8 GB RAM, CPU-only** (no GPU, no Python runtime, and no external model downloads).
+Sheaf cuts LLM compiler-loop token burn via a persistent `lean --server` (~35ms warm probes), local leaf auto-close, and delta-only `$/lean/plainGoal` output. It embeds a quantized RoPE encoder, a scalar-quantized HNSW premise index, a content-addressed virtual filesystem, and a Lean 4 kernel verifier into a single ~25 MB executable that runs offline in **8 GB RAM, CPU-only** with no GPU or Python runtime.
 
-[Demo](#30-second-self-verification-demo) • [Benchmarks](#empirical-benchmarks) • [Architecture](docs/ARCHITECTURE.md) • [How to Use](#how-to-use)
+[MCP Setup](#mcp-server-for-llm-agents) • [Demo](#30-second-self-verification-demo) • [Benchmarks](#empirical-benchmarks) • [Architecture](docs/ARCHITECTURE.md) • [How to Use](#how-to-use)
 
 ![sheaf live demo](assets/sheaf-demo.gif)
 
 
 ## Why sheaf?
 
-Closing boilerplate simp, omega, and structural induction sorrys shouldn't require a cloud GPU or burning frontier LLM tokens in a compiler retry loop. Sheaf is an offline, CPU-only prover that closes routine Lean 4 goals locally on a standard laptop, whether you are proving specs by hand or offloading the grunt work from an LLM.
+Closing boilerplate `simp`, `omega`, and structural induction sorrys shouldn't require a cloud GPU or burning frontier LLM tokens in a compiler retry loop. Sheaf pairs fast local proving with an MCP server so frontier models supply proof structure while trivial subgoals and syntax checks resolve locally.
 
-- **System 1 + System 2 routing:** A compact RoPE transformer predicts tactic strategy, difficulty, and calibrated confidence. High-confidence goals execute directly, while uncertain or out-of-distribution goals escalate dynamically to HNSW premise retrieval and Best-First tree search.
+- **Token-saving agent loop:** The LLM writes high-level strategy (`have` or `induction`), while `sheaf` tests batched tactics in ~35ms, auto-closes trivial leaves locally, and returns compact goal deltas only without echoing full files or verbose logs.
+- **Persistent `lean --server` + live `$/lean/plainGoal`:** Pays import load once per workspace so warm `didChange` probes avoid cold CLI restarts.
+- **System 1 + System 2 routing with hybrid VDB:** A compact RoPE transformer predicts tactic strategy, difficulty, and calibrated confidence. Uncertain or out-of-distribution goals escalate to **hybrid lexical + SQ8 HNSW** retrieval plus a **dynamic workspace VDB overlay** that indexes the project's own proved lemmas automatically.
 - **Content-addressed VFS:** Forks workspace states in constant time via SHA-256 hashes and shared strings so dead-end branches roll back cleanly and `--write` commits verified proofs atomically at exit.
-- **Strict kernel and axiom gate:** Every candidate is verified by the real Lean 4 kernel with per-probe heartbeat caps and axiom checks, accepting proofs only under standard axioms (propext, Classical.choice, Quot.sound) with zero sorryAx.
+- **Strict kernel and axiom gate:** Every candidate is verified by the real Lean 4 kernel with per-probe heartbeat caps and axiom checks, accepting proofs only under standard axioms (`propext`, `Classical.choice`, `Quot.sound`) with zero `sorryAx`.
 - **Two-tier loop deduplication:** Short-circuits exact duplicate subgoals before inference and semantic loops in an episodic cache after inference.
 
 For crate topology, VFS internals, and the SQ8 HNSW index layout, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## MCP Server for LLM Agents
+
+Add `sheaf mcp` to Claude Code, Cursor, Zed, or Neovim:
+
+```json
+{
+  "mcpServers": {
+    "sheaf": { "command": "sheaf", "args": ["mcp"] }
+  }
+}
+```
+
+| Tool | Purpose | Key Input / Output |
+| :--- | :--- | :--- |
+| `sheaf_goals` | Sync file into warm `lean --server` and inspect open goal | `{ file, theorem, top_k? }` -> `{ goals, local_defs, vdb_premises }` |
+| `sheaf_try` | Test batched `tactics[]` + `auto_close` in memory (~35ms) | `{ file, theorem, tactics[], auto_close?, timeout_ms? }` -> `{ proved, remaining_goals, diagnostics }` |
+| `sheaf_close` | Apply optional `prefix_tactic` and auto-close leaves locally | `{ file, theorem, prefix_tactic?, timeout_ms? }` -> `{ proved, proof_script?, remaining_goals }` |
+| `sheaf_search` | Canonicalize goal and query merged embedded + workspace VDB | `{ goal, top_k? }` -> `{ premises }` |
+| `sheaf_apply` | Kernel-verify (`#print axioms` + `unusedSimpArgs` prune) before disk write | `{ file, theorem, proof_script }` -> `{ applied, pruned_proof?, axioms }` |
+
+Token-saving mechanics:
+- Tiny tool schemas so tool definitions add minimal prompt overhead.
+- Capped `remaining_goals` (max 3) and truncated errors (~300 chars) to keep compiler feedback tight.
+- Minified JSON responses and read-only in-memory evaluation until `sheaf_apply` passes kernel verification.
+
 ## What sheaf is (and isn't)
 
-- **Good at:** Eliminating sorrys in algebraic laws, list and tree inductions, multi-module structure or state-machine invariants, and self-contained import Init specifications.
-- **Not designed for:** Frontier research mathematics (IMO or deep Mathlib analysis) or open conjectures. When a goal is unprovable within `--max-nodes` or `--max-depth`, sheaf terminates cleanly with exit code 1 rather than hallucinating axioms.
+- **Standalone:** Closes offline boilerplate, algebraic laws, list and tree inductions, multi-module state-machine invariants, and self-contained `import Init` specs.
+- **MCP-guided:** Pairs with your LLM for hard Mathlib or multi-step proofs without burning tokens on syntax retries or leaf cleanup.
+- **Not designed for:** Unassisted frontier research mathematics or open conjectures. When a goal is unprovable within `--max-nodes` or `--max-depth`, sheaf terminates cleanly with exit code 1 rather than hallucinating axioms.
 
 ## 30-Second Self-Verification Demo
 
-The repository includes a standalone import Init specification at `examples/sheaf_self_verify/` modeling sheaf's own axiom gate, routing gate, and VFS invariants with 8 open sorry theorems:
+The repository includes a standalone `import Init` specification at `examples/sheaf_self_verify/` modeling sheaf's own axiom gate, routing gate, and VFS invariants with 8 open `sorry` theorems:
 
 ```bash
 # 1. Build the release binary (requires Rust + Lean 4.36.0 via elan)
@@ -44,7 +72,7 @@ cargo build --release
 ```
 
 ## Empirical Benchmarks
-Evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM, CPU-only, Lean 4.36.0) with zero `sorryAx` accepted:
+Standalone CPU-only baseline evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM, CPU-only, Lean 4.36.0) with zero `sorryAx` accepted:
 
 | Suite | Scope | Proved |
 | :--- | :--- | :---: |
@@ -54,12 +82,20 @@ Evaluated with `--release` on a single consumer laptop (Ryzen 5 4600H, 8 GB RAM,
 | Open-hypothesis (`Test E1..E3`) | 2 provable + 1 unprovable conjecture (exits `1`) | **2 / 3** (`17.2s`) |
 | Self-verification (`examples/sheaf_self_verify`) | `AxiomGate`, `GateSpec`, `VfsSpec` (`import Init`) | **8 / 8** (`38.2s`) |
 
+MCP token-savings comparison (reserved for upcoming end-to-end measurement):
+
+| Workflow | Total Tokens | Compiler Turns | Notes |
+| :--- | :---: | :---: | :--- |
+| Raw LLM + `lake build` retries | *TBD* | *TBD* | Cold CLI restarts and full diagnostics |
+| LLM + `sheaf mcp` | *TBD* | *TBD* | Persistent `lean --server`, delta goals, local leaf close |
+
 ## Operational Modes
 
 - **Interactive TTY (default):** Live 12 Hz branch viewport on stderr, collapsing each proved theorem into a single permanent scrollback line.
-- **Plain / CI (`--plain` or piped stderr):** Disables spinners and ANSI colors automatically (also respects NO_COLOR).
+- **Plain / CI (`--plain` or piped stderr):** Disables spinners and ANSI colors automatically (also respects `NO_COLOR`).
 - **Verbose (`-v` / `--verbose`):** Prints the full 5-stage telemetry tree per theorem and surfaces the lowest-goal-count stuck goal state on failures or OOD budget exhaustion.
 - **Machine JSON (`--json`):** Silences stderr and emits NDJSON events on stdout (`TheoremFinished` includes `status`, `vdb_hits`, and `stuck_goal`, and `--diff --json` emits `WorkspaceDiff` events without breaking NDJSON parsers).
+- **MCP Stdio (`sheaf mcp`):** Newline-delimited JSON-RPC 2.0 over stdin/stdout with strict `stdout` hygiene, lazy ONNX/VDB init for instant handshake, and strict per-call timeout kill/reset.
 
 ## Reproducing Model Training & Calibration
 
@@ -69,8 +105,8 @@ End users building and running sheaf do **not** need Python, because the ONNX we
 
 ### Prerequisites & Setup
 
-- **Lean 4.36.0** (lean and lake on PATH via elan)
-- **Rust** (stable toolchain with cargo)
+- **Lean 4.36.0** (`lean` and `lake` on `PATH` via `elan`)
+- **Rust** (stable toolchain with `cargo`)
 
 ```bash
 cargo build --release
@@ -87,6 +123,7 @@ cargo test --workspace --release       # Run the full Rust test suite
 - `sheaf init [--dir <PATH>]`: Extracts embedded model and index assets to disk.
 - `sheaf check [PATH] [--diagnose]`: Lists every remaining sorry theorem (default: `.`). Passing `--diagnose` runs a zero-ONNX pre-flight build and sanity probe to classify `Trivial`, `ValidOpen`, `FalseSpec`, or compile errors in under 2 seconds.
 - `sheaf prove [PATH] [FLAGS]`: Runs the prover and kernel verifier (default: `.`).
+- `sheaf mcp`: Starts the newline-delimited JSON-RPC 2.0 MCP stdio server for LLM agents.
 
 ### Key Flags (`sheaf prove`)
 
@@ -114,15 +151,16 @@ cargo test --workspace --release       # Run the full Rust test suite
 
 ## Contributing
 
-Contributions are most useful in three areas:
+Contributions are most useful in four areas:
 
-- **Blind benchmark suites:** Multi-module Lean 4 specs, state machines, and algebraic data structures.
-- **Tactic synthesis templates:** General-purpose existential, structural induction, and rewrite patterns.
-- **Cross-platform testing:** Linux and macOS builds plus verification against newer Lean 4.x toolchains.
+- **VDB corpus expansion:** Indexing additional open-source Lean 4 and Mathlib4 theorem corpora into the SQ8 HNSW index.
+- **General search & LeJEPA improvements:** Better Best-First search heuristics, calibration, and next-state embedding prediction.
+- **MCP client recipes:** Tested configurations and workflows for Claude Code, Cursor, Zed, Neovim, and other MCP clients.
+- **Blind benchmark suites & cross-platform testing:** Multi-module Lean 4 specs, Linux/macOS builds, and verification against newer Lean 4.x toolchains.
 
 ## Acknowledgments
 
-- **Lean 4 & Lean FRO:** For the Lean 4 kernel, `lake` build system, and `lean --json` verification toolchain.
+- **Lean 4 & Lean FRO:** For the Lean 4 kernel, `lake` build system, and `lean --server` (`didChange`, `$/lean/plainGoal`) verification toolchain.
 - **Mathlib4:** For the open-source theorem and premise corpus indexed in `mathlib_sq8.vdb`.
 - **LeJEPA:** Architectural inspiration for `FallbackToLeJepa` next-state embedding prediction and SIGReg regularization.
 - **Upstream Rust ecosystem:** For the open-source crates compiled into `sheaf` (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for full crate names, versions, and SPDX licenses).
