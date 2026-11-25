@@ -5,10 +5,11 @@
 use crate::ui::{BranchStatus, UiEvent, UiHandle};
 use crate::vfs::{BlobStore, TreeSnapshot};
 use crate::{DiscoveredTheorem, ProverError, replace_theorem_sorry};
-use std::io::{BufRead, BufReader};
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Result of batched candidate evaluation: `(solved_src_and_script, last_diag, unsolved_goal_diags)`.
@@ -76,51 +77,406 @@ impl KernelBackend for BatchLeanCliBackend {
     }
 }
 
-pub(crate) fn run_lean_json_with_strict(
-    file: &Path,
-    lake_root: Option<&Path>,
-    _strict_lint: bool,
-) -> Result<std::process::Output, ProverError> {
-    let mut cmd = if let Some(root) = lake_root {
-        let mut c = std::process::Command::new("lake");
-        c.args(["env", "lean", "--json"]);
-        c.current_dir(root);
-        c
+enum ServerEvalOutcome {
+    Ndjson(String),
+    TimedOut,
+}
+
+fn path_to_file_uri(dir: &Path, filename: &str) -> String {
+    let joined = dir.join(filename);
+    let raw = joined.to_string_lossy();
+    let no_verbatim = raw
+        .strip_prefix(r"\\?\UNC\")
+        .map(|r| format!(r"\\{r}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| raw.into_owned());
+    let slashes = no_verbatim.replace('\\', "/").replace(' ', "%20");
+    if slashes.starts_with('/') {
+        format!("file://{slashes}")
     } else {
-        let mut c = std::process::Command::new("lean");
-        c.arg("--json");
-        c
-    };
-    cmd.args([
-        "-Dlinter.unusedVariables=true",
-        "-Dlinter.unusedSimpArgs=true",
-    ]);
-    cmd.arg(file)
-        .output()
+        format!("file:///{slashes}")
+    }
+}
+
+fn read_lsp_frame(reader: &mut BufReader<std::process::ChildStdout>) -> Option<serde_json::Value> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).ok()?;
+        if n == 0 {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':')
+            && k.eq_ignore_ascii_case("Content-Length")
+        {
+            content_length = v.trim().parse::<usize>().ok();
+        }
+    }
+    let len = content_length?;
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&buf).ok()
+}
+
+fn write_lsp_frame(stdin: &mut std::process::ChildStdin, msg: &serde_json::Value) -> Result<(), ProverError> {
+    let body = serde_json::to_vec(msg).map_err(|e| {
+        ProverError::Repl(lean_repl::ReplError::Io(std::io::Error::other(
+            e.to_string(),
+        )))
+    })?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    stdin
+        .write_all(header.as_bytes())
+        .and_then(|_| stdin.write_all(&body))
+        .and_then(|_| stdin.flush())
         .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
 }
 
-pub(crate) fn spawn_lean_json_piped(
-    file: &Path,
-    lake_root: Option<&Path>,
-) -> Result<std::process::Child, ProverError> {
-    if let Some(root) = lake_root {
-        std::process::Command::new("lake")
-            .args(["env", "lean", "--json"])
-            .arg(file)
-            .current_dir(root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-    } else {
-        std::process::Command::new("lean")
-            .arg("--json")
-            .arg(file)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+struct LeanServerSession {
+    lake_root: Option<PathBuf>,
+    uri: String,
+    version: u64,
+    next_id: u64,
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: mpsc::Receiver<serde_json::Value>,
+}
+
+impl Drop for LeanServerSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
-    .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))
+}
+
+impl LeanServerSession {
+    fn spawn(lake_root: Option<&Path>) -> Result<Self, ProverError> {
+        let mut cmd = if let Some(root) = lake_root {
+            let mut c = std::process::Command::new("lake");
+            c.args(["env", "lean", "--server"]);
+            c.current_dir(root);
+            c
+        } else {
+            let mut c = std::process::Command::new("lean");
+            c.arg("--server");
+            c
+        };
+        cmd.args([
+            "-Dlinter.unusedVariables=true",
+            "-Dlinter.unusedSimpArgs=true",
+        ]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            ProverError::Repl(lean_repl::ReplError::Io(std::io::Error::other(
+                "missing lean --server stdin",
+            )))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ProverError::Repl(lean_repl::ReplError::Io(std::io::Error::other(
+                "missing lean --server stdout",
+            )))
+        })?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Some(frame) = read_lsp_frame(&mut reader) {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let init_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": serde_json::Value::Null,
+                "rootUri": serde_json::Value::Null,
+                "capabilities": {}
+            }
+        });
+        write_lsp_frame(&mut stdin, &init_msg)?;
+        let init_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let rem = init_deadline.saturating_duration_since(Instant::now());
+            let frame = rx.recv_timeout(rem).map_err(|e| {
+                ProverError::Repl(lean_repl::ReplError::Io(std::io::Error::other(format!(
+                    "lean --server initialize timeout: {e}"
+                ))))
+            })?;
+            if frame.get("id").and_then(|v| v.as_u64()) == Some(1) {
+                break;
+            }
+        }
+        write_lsp_frame(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {}
+            }),
+        )?;
+
+        let doc_dir = lake_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let uri = path_to_file_uri(&doc_dir, "__sheaf_live_worker.lean");
+        Ok(Self {
+            lake_root: lake_root.map(Path::to_path_buf),
+            uri,
+            version: 0,
+            next_id: 2,
+            child,
+            stdin,
+            rx,
+        })
+    }
+
+    fn eval_document(
+        &mut self,
+        src: &str,
+        deadline: Option<Instant>,
+    ) -> Result<ServerEvalOutcome, ProverError> {
+        self.version += 1;
+        let ver = self.version;
+        let msg = if ver == 1 {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": self.uri,
+                        "languageId": "lean4",
+                        "version": ver,
+                        "text": src
+                    }
+                }
+            })
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {
+                        "uri": self.uri,
+                        "version": ver
+                    },
+                    "contentChanges": [{ "text": src }]
+                }
+            })
+        };
+        write_lsp_frame(&mut self.stdin, &msg)?;
+
+        let mut latest_diags: Vec<serde_json::Value> = Vec::new();
+        let max_wait = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(120));
+
+        loop {
+            let now = Instant::now();
+            if now >= max_wait {
+                return Ok(ServerEvalOutcome::TimedOut);
+            }
+            let wait_for = max_wait.saturating_duration_since(now);
+            let frame = match self.rx.recv_timeout(wait_for) {
+                Ok(f) => f,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(ServerEvalOutcome::TimedOut),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProverError::Repl(lean_repl::ReplError::Io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "lean --server stdout closed",
+                        ),
+                    )));
+                }
+            };
+
+            if frame.get("method").is_some()
+                && let Some(req_id) = frame.get("id")
+            {
+                let _ = write_lsp_frame(
+                    &mut self.stdin,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": serde_json::Value::Null
+                    }),
+                );
+                continue;
+            }
+
+            let method = frame.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "textDocument/publishDiagnostics" {
+                let msg_ver = frame
+                    .get("params")
+                    .and_then(|p| p.get("version"))
+                    .and_then(|v| v.as_u64());
+                if msg_ver == Some(ver) {
+                    latest_diags = frame
+                        .get("params")
+                        .and_then(|p| p.get("diagnostics"))
+                        .and_then(|d| d.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            } else if method == "$/lean/fileProgress" {
+                let msg_ver = frame
+                    .get("params")
+                    .and_then(|p| p.get("textDocument"))
+                    .and_then(|t| t.get("version"))
+                    .and_then(|v| v.as_u64());
+                let processing_empty = frame
+                    .get("params")
+                    .and_then(|p| p.get("processing"))
+                    .and_then(|a| a.as_array())
+                    .is_some_and(Vec::is_empty);
+                if msg_ver == Some(ver) && processing_empty {
+                    let drain_cap = if latest_diags.is_empty() { 500 } else { 30 };
+                    let mut drain_until = Instant::now() + Duration::from_millis(drain_cap);
+                    while Instant::now() < drain_until {
+                        let rem = drain_until
+                            .saturating_duration_since(Instant::now())
+                            .min(max_wait.saturating_duration_since(Instant::now()));
+                        if rem.is_zero() {
+                            break;
+                        }
+                        let Ok(extra) = self.rx.recv_timeout(rem) else {
+                            break;
+                        };
+                        if extra.get("method").is_some()
+                            && let Some(req_id) = extra.get("id")
+                        {
+                            let req_method = extra.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                            let _ = write_lsp_frame(
+                                &mut self.stdin,
+                                &serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": req_id,
+                                    "result": serde_json::Value::Null
+                                }),
+                            );
+                            if req_method == "workspace/inlayHint/refresh"
+                                || req_method == "workspace/semanticTokens/refresh"
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        if extra.get("method").and_then(|m| m.as_str())
+                            == Some("textDocument/publishDiagnostics")
+                            && extra
+                                .get("params")
+                                .and_then(|p| p.get("version"))
+                                .and_then(|v| v.as_u64())
+                                == Some(ver)
+                        {
+                            latest_diags = extra
+                                .get("params")
+                                .and_then(|p| p.get("diagnostics"))
+                                .and_then(|d| d.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            drain_until = Instant::now() + Duration::from_millis(20);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        let _ = self.next_id;
+        Ok(ServerEvalOutcome::Ndjson(lsp_diags_to_ndjson(&latest_diags)))
+    }
+}
+
+fn lsp_diags_to_ndjson(diags: &[serde_json::Value]) -> String {
+    let mut lines = Vec::with_capacity(diags.len());
+    for d in diags {
+        let sev = match d.get("severity").and_then(|s| s.as_u64()).unwrap_or(1) {
+            1 => "error",
+            2 => "warning",
+            _ => "information",
+        };
+        let range = d.get("fullRange").or_else(|| d.get("range"));
+        let sl = range
+            .and_then(|r| r.get("start"))
+            .and_then(|p| p.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0)
+            + 1;
+        let sc = range
+            .and_then(|r| r.get("start"))
+            .and_then(|p| p.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        let el = range
+            .and_then(|r| r.get("end"))
+            .and_then(|p| p.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0)
+            + 1;
+        let ec = range
+            .and_then(|r| r.get("end"))
+            .and_then(|p| p.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        let data = d.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let obj = serde_json::json!({
+            "severity": sev,
+            "pos": { "line": sl, "column": sc },
+            "endPos": { "line": el, "column": ec },
+            "data": data,
+        });
+        lines.push(obj.to_string());
+    }
+    lines.join("\n")
+}
+
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    static PERSISTENT_LEAN_SERVER: RefCell<Option<LeanServerSession>> = const { RefCell::new(None) };
+}
+
+fn eval_via_lean_server(
+    src: &str,
+    lake_root: Option<&Path>,
+    deadline: Option<Instant>,
+) -> Result<ServerEvalOutcome, ProverError> {
+    PERSISTENT_LEAN_SERVER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let target_root = lake_root.map(Path::to_path_buf);
+        let needs_spawn = match slot.as_mut() {
+            Some(sess) => {
+                sess.lake_root != target_root
+                    || matches!(sess.child.try_wait(), Ok(Some(_)) | Err(_))
+            }
+            None => true,
+        };
+        if needs_spawn {
+            *slot = None;
+            *slot = Some(LeanServerSession::spawn(lake_root)?);
+        }
+        let outcome = match slot.as_mut().unwrap().eval_document(src, deadline) {
+            Ok(out) => out,
+            Err(_) => {
+                *slot = None;
+                *slot = Some(LeanServerSession::spawn(lake_root)?);
+                slot.as_mut().unwrap().eval_document(src, deadline)?
+            }
+        };
+        if matches!(outcome, ServerEvalOutcome::TimedOut) {
+            *slot = None;
+        }
+        Ok(outcome)
+    })
 }
 
 /// Audit a single candidate script by replacing `sorry` and running `#print axioms` through `verify_allowed_axioms`.
@@ -211,21 +567,13 @@ fn audit_single_candidate_raw(
         .collect::<Vec<_>>()
         .join("\n");
     let candidate_src = replace_theorem_sorry(src, thm_name, &body);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp_file = std::env::temp_dir().join(format!(
-        "sheaf_audit_{thm_name}_{unique}_{:?}.lean",
-        std::thread::current().id()
-    ));
     let audit = format!("{candidate_src}\n\n#print axioms {full_name}\n");
-    std::fs::write(&tmp_file, &audit)
-        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-    let out = run_lean_json_with_strict(&tmp_file, lake_root, strict_lint)?;
-    let _ = std::fs::remove_file(&tmp_file);
+    let stdout = match eval_via_lean_server(&audit, lake_root, None)? {
+        ServerEvalOutcome::Ndjson(s) => s,
+        ServerEvalOutcome::TimedOut => return Ok((Err("audit timed out".to_string()), body, audit, String::new())),
+    };
 
     let (thm_start_line, thm_end_line) = target_theorem_line_span(&audit, thm_name);
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut has_error = false;
     let mut illegal_axiom: Option<String> = None;
     let mut first_error_msg: Option<String> = None;
@@ -263,7 +611,7 @@ fn audit_single_candidate_raw(
         }
     }
 
-    if out.status.success() && !has_error && illegal_axiom.is_none() {
+    if !has_error && illegal_axiom.is_none() {
         Ok((Ok(candidate_src), body, audit, stdout))
     } else {
         let diag = illegal_axiom
@@ -538,18 +886,10 @@ fn run_lean_src_messages(
     src: &str,
     lake_root: Option<&std::path::Path>,
 ) -> Result<Vec<serde_json::Value>, ProverError> {
-    let dir = std::env::temp_dir().join("sheaf_preflight_probe");
-    let _ = std::fs::create_dir_all(&dir);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let tmp_file = dir.join(format!("probe_{}_{nanos}.lean", std::process::id()));
-    std::fs::write(&tmp_file, src)
-        .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-    let out = run_lean_json_with_strict(&tmp_file, lake_root, false);
-    let _ = std::fs::remove_file(&tmp_file);
-    let out = out?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = match eval_via_lean_server(src, lake_root, None)? {
+        ServerEvalOutcome::Ndjson(s) => s,
+        ServerEvalOutcome::TimedOut => String::new(),
+    };
     let mut msgs = Vec::new();
     for line in stdout.lines() {
         if let Ok(m) = serde_json::from_str::<serde_json::Value>(line.trim()) {
@@ -666,7 +1006,7 @@ pub fn verify_candidates_batched_with_heartbeats_and_ui(
     )
 }
 
-/// Evaluate candidate scripts in batches of 8 with optional `--write`-gated `unusedSimpArgs` pruning and `--strict-lint`.
+/// Evaluate candidate scripts in batches with optional `--write`-gated `unusedSimpArgs` pruning and `--strict-lint`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_candidates_batched_with_options_and_ui(
     src: &str,
@@ -679,6 +1019,36 @@ pub fn verify_candidates_batched_with_options_and_ui(
     branch_offset: usize,
     prune_unused_simp: bool,
     strict_lint: bool,
+) -> Result<BatchedVerifyResult, ProverError> {
+    verify_candidates_batched_with_deadline_and_ui(
+        src,
+        thm,
+        full_name,
+        candidates,
+        lake_root,
+        max_heartbeats,
+        ui,
+        branch_offset,
+        prune_unused_simp,
+        strict_lint,
+        None,
+    )
+}
+
+/// Evaluate candidate scripts in batches with optional `unusedSimpArgs` pruning, `--strict-lint`, and a hard wall-clock `deadline`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_candidates_batched_with_deadline_and_ui(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    full_name: &str,
+    candidates: &[Vec<String>],
+    lake_root: Option<&Path>,
+    max_heartbeats: usize,
+    ui: &UiHandle,
+    branch_offset: usize,
+    prune_unused_simp: bool,
+    strict_lint: bool,
+    deadline: Option<Instant>,
 ) -> Result<BatchedVerifyResult, ProverError> {
     let mut last_diag = String::from("model produced no valid kernel-verified tactic");
     let mut unsolved_diags: Vec<(Vec<String>, String)> = Vec::new();
@@ -751,9 +1121,16 @@ pub fn verify_candidates_batched_with_options_and_ui(
     let after_name = &rest[needle.len()..by_rel];
     let hb = max_heartbeats.max(10_000);
 
-    const BATCH_SIZE: usize = 8;
-    for (chunk_idx, chunk) in candidates.chunks(BATCH_SIZE).enumerate() {
-        let chunk_base_id = branch_offset + chunk_idx * BATCH_SIZE;
+    let batch_size: usize = if lake_root.is_some() { 16 } else { 8 };
+    for (chunk_idx, chunk) in candidates.chunks(batch_size).enumerate() {
+        if chunk_idx > 0
+            && let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            last_diag = "ood escalation budget exceeded".to_string();
+            break;
+        }
+        let chunk_base_id = branch_offset + chunk_idx * batch_size;
         let batch_start = Instant::now();
         let mut batch_src = String::from(prefix);
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(chunk.len());
@@ -795,64 +1172,52 @@ pub fn verify_candidates_batched_with_options_and_ui(
             });
         }
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let tmp_file = std::env::temp_dir().join(format!(
-            "sheaf_batch_{}_{unique}_{:?}.lean",
-            thm.name,
-            std::thread::current().id()
-        ));
-        std::fs::write(&tmp_file, &batch_src)
-            .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
-
-        let mut child = spawn_lean_json_piped(&tmp_file, lake_root)?;
+        let chunk_deadline = if chunk_idx > 0 { deadline } else { None };
+        let ndjson = match eval_via_lean_server(&batch_src, lake_root, chunk_deadline)? {
+            ServerEvalOutcome::Ndjson(s) => s,
+            ServerEvalOutcome::TimedOut => {
+                last_diag = "ood escalation budget exceeded".to_string();
+                break;
+            }
+        };
         let mut cand_errors: Vec<Option<String>> = vec![None; chunk.len()];
         let mut has_unmapped_error = false;
 
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line_res in reader.lines() {
-                let Ok(line) = line_res else {
+        for line in ndjson.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
+                if sev != "error" {
                     continue;
-                };
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                    let sev = v.get("severity").and_then(|s| s.as_str()).unwrap_or("");
-                    if sev != "error" {
-                        continue;
+                }
+                let data = v
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let err_line = v
+                    .get("pos")
+                    .and_then(|p| p.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| l as usize);
+                if let Some(el) = err_line
+                    && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
+                {
+                    if cand_errors[idx].is_none() {
+                        ui.send(UiEvent::BranchUpdated {
+                            id: chunk_base_id + idx + 1,
+                            status: BranchStatus::Failed {
+                                reason: data.lines().next().unwrap_or("error").to_string(),
+                            },
+                            elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                        });
+                        cand_errors[idx] = Some(data);
                     }
-                    let data = v
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let err_line = v
-                        .get("pos")
-                        .and_then(|p| p.get("line"))
-                        .and_then(|l| l.as_u64())
-                        .map(|l| l as usize);
-                    if let Some(el) = err_line
-                        && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
-                    {
-                        if cand_errors[idx].is_none() {
-                            ui.send(UiEvent::BranchUpdated {
-                                id: chunk_base_id + idx + 1,
-                                status: BranchStatus::Failed {
-                                    reason: data.lines().next().unwrap_or("error").to_string(),
-                                },
-                                elapsed_ms: batch_start.elapsed().as_millis() as u64,
-                            });
-                            cand_errors[idx] = Some(data);
-                        }
-                    } else {
-                        has_unmapped_error = true;
-                        last_diag = data;
-                    }
+                } else {
+                    has_unmapped_error = true;
+                    last_diag = data;
                 }
             }
         }
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&tmp_file);
 
         if !has_unmapped_error {
             for (i, err) in cand_errors.iter().enumerate() {
@@ -912,6 +1277,12 @@ pub fn verify_candidates_batched_with_options_and_ui(
         } else {
             // Parse-error fallback: re-run candidates individually and collect unsolved goals
             for (i, script) in chunk.iter().enumerate() {
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    last_diag = "ood escalation budget exceeded".to_string();
+                    break;
+                }
                 let branch_id = chunk_base_id + i + 1;
                 match audit_and_prune_unused_simp_args(
                     src,
@@ -1460,5 +1831,73 @@ theorem thm_two (m : Nat) : m = m := by
         for unused in ["d2", "d3", "d4", "d5"] {
             assert!(!joined.contains(unused), "must prune unused {unused}: {joined}");
         }
+    }
+
+    #[test]
+    fn test_m24_ood_deadline_aborts_batched_probes_promptly() {
+        let src = "import Init\ntheorem slow_fail (n : Nat) : n = n + 1 := by\n  sorry\n";
+        let thm = crate::DiscoveredTheorem {
+            file: std::path::PathBuf::from("Slow.lean"),
+            line: 2,
+            namespace: None,
+            name: "slow_fail".to_string(),
+            signature: "theorem slow_fail (n : Nat) : n = n + 1 := by sorry".to_string(),
+            binders: vec![("n".to_string(), "Nat".to_string())],
+            local_defs: Vec::new(),
+            local_structures: Vec::new(),
+            local_inductives: Vec::new(),
+            local_theorems: Vec::new(),
+            local_struct_laws: Vec::new(),
+            has_mathlib: false,
+            workspace_deps: Vec::new(),
+        };
+        let candidates: Vec<Vec<String>> = (0..24)
+            .map(|i| vec![format!("have h_{i} : True := trivial; exact absurd rfl (by simp)")])
+            .collect();
+        let ui = UiHandle::noop();
+        let t0 = Instant::now();
+        let deadline = Some(t0 + std::time::Duration::from_millis(1));
+        let (solved, diag, _) = verify_candidates_batched_with_deadline_and_ui(
+            src,
+            &thm,
+            "slow_fail",
+            &candidates,
+            None,
+            50_000,
+            &ui,
+            0,
+            false,
+            false,
+            deadline,
+        )
+        .unwrap();
+        assert!(solved.is_none());
+        assert!(
+            diag.contains("ood escalation budget exceeded"),
+            "expected budget exceeded diag, got: {diag}"
+        );
+        assert!(
+            t0.elapsed().as_secs_f64() < 20.0,
+            "deadline abort took too long: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_m25_persistent_lean_server_hot_did_change_speedup() {
+        let s1 = "import Init\ndef d1 (x : Nat) : Nat := x\ndef d2 (x : Nat) : Nat := x + 1\ntheorem t_warm (x : Nat) : d1 x = x := by\n  simp [d1, d2]\n#print axioms t_warm\n";
+        let _ = eval_via_lean_server(s1, None, None).unwrap();
+
+        let t_hot = Instant::now();
+        let s2 = "import Init\ndef d1 (x : Nat) : Nat := x\ndef d2 (x : Nat) : Nat := x + 1\ntheorem t_warm (x : Nat) : d1 x = x := by\n  simp [d1]\n#print axioms t_warm\n";
+        let out = eval_via_lean_server(s2, None, None).unwrap();
+        let hot_ms = t_hot.elapsed().as_millis();
+        let ndjson = match out {
+            ServerEvalOutcome::Ndjson(s) => s,
+            ServerEvalOutcome::TimedOut => panic!("unexpected timeout on hot didChange"),
+        };
+        assert!(ndjson.contains("depends on axioms:"), "missing axioms diag: {ndjson}");
+        assert!(!ndjson.contains("unusedSimpArgs"), "unexpected unused simp: {ndjson}");
+        assert!(hot_ms < 1000, "hot didChange took {hot_ms}ms (expected <1000ms)");
     }
 }
