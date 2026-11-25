@@ -198,6 +198,34 @@ fn build_sq8_neighbors(codes: &[Vec<u8>], max_deg: usize) -> Vec<Vec<u32>> {
 }
 
 impl StaticVdbIndex {
+    /// Append workspace-local or runtime-discovered lemmas into a cloned/scoped `StaticVdbIndex`
+    /// without mutating disk artifacts.
+    pub fn extend_with_dynamic_entries(
+        &mut self,
+        entries: Vec<(LemmaMetadata, Vec<f32>)>,
+    ) -> Result<(), VdbError> {
+        let mut added = false;
+        for (meta, emb) in entries {
+            if emb.len() != self.dim {
+                return Err(VdbError::DimensionMismatch {
+                    expected: self.dim,
+                    got: emb.len(),
+                });
+            }
+            if self.metadata.iter().any(|m| m.name == meta.name) {
+                continue;
+            }
+            let code = self.quantizer.quantize(&emb)?;
+            self.metadata.push(meta);
+            self.codes.push(code);
+            added = true;
+        }
+        if added {
+            self.neighbors = build_sq8_neighbors(&self.codes, 8);
+        }
+        Ok(())
+    }
+
     /// Query top-k lemmas directly over SQ8 `u8` codes using the in-memory small-world graph,
     /// dequantizing only the `top_k` surviving hits.
     pub fn search_sq8_hnsw(
@@ -232,7 +260,9 @@ impl StaticVdbIndex {
             let dist = self.quantizer.asymmetric_l2(query, &self.codes[entry])?;
             frontier.push((dist, entry));
             if let Some(meta) = self.metadata.get(entry)
-                && (meta.head_symbol == target_head_symbol || meta.head_symbol == "POLYMORPHIC")
+                && (meta.head_symbol == target_head_symbol
+                    || meta.head_symbol == "POLYMORPHIC"
+                    || meta.module == "__workspace__")
             {
                 results.push((dist, entry));
             }
@@ -253,7 +283,8 @@ impl StaticVdbIndex {
                 frontier.push((dist, nb_idx));
                 if let Some(meta) = self.metadata.get(nb_idx)
                     && (meta.head_symbol == target_head_symbol
-                        || meta.head_symbol == "POLYMORPHIC")
+                        || meta.head_symbol == "POLYMORPHIC"
+                        || meta.module == "__workspace__")
                 {
                     results.push((dist, nb_idx));
                 }
@@ -266,7 +297,10 @@ impl StaticVdbIndex {
                 if visited[idx] {
                     continue;
                 }
-                if meta.head_symbol == target_head_symbol || meta.head_symbol == "POLYMORPHIC" {
+                if meta.head_symbol == target_head_symbol
+                    || meta.head_symbol == "POLYMORPHIC"
+                    || meta.module == "__workspace__"
+                {
                     let dist = self.quantizer.asymmetric_l2(query, &self.codes[idx])?;
                     results.push((dist, idx));
                 }
@@ -303,7 +337,10 @@ impl StaticVdbIndex {
         }
         let mut hits = Vec::new();
         for (meta, code) in self.metadata.iter().zip(self.codes.iter()) {
-            if meta.head_symbol != target_head_symbol && meta.head_symbol != "POLYMORPHIC" {
+            if meta.head_symbol != target_head_symbol
+                && meta.head_symbol != "POLYMORPHIC"
+                && meta.module != "__workspace__"
+            {
                 continue;
             }
             let distance = self.quantizer.asymmetric_l2(query, code)?;
@@ -738,5 +775,38 @@ mod tests {
         assert_eq!(loaded.neighbors, vec![vec![1], vec![0]]);
         let hits = loaded.search_sq8_hnsw(&[0.45, 0.45, 0.45, 0.45], "Eq", 2).unwrap();
         assert_eq!(hits[0].metadata.name, "Nat.add_comm");
+    }
+
+    #[test]
+    fn test_dynamic_overlay_indexes_and_retrieves_workspace_lemmas() {
+        let mut idx = StaticVdbIndex {
+            dim: 4,
+            quantizer: Sq8Quantizer {
+                mins: vec![0.0; 4],
+                maxs: vec![1.0; 4],
+            },
+            metadata: vec![LemmaMetadata {
+                name: "Nat.add_comm".into(),
+                head_symbol: "Eq".into(),
+                module: "Init".into(),
+                arity: 2,
+                signature: "a + b = b + a".into(),
+            }],
+            codes: vec![vec![10, 10, 10, 10]],
+            neighbors: vec![vec![]],
+        };
+        idx.extend_with_dynamic_entries(vec![(
+            LemmaMetadata {
+                name: "MyMod.custom_inv".into(),
+                head_symbol: "MyMod.State".into(),
+                module: "__workspace__".into(),
+                arity: 1,
+                signature: "custom_inv s = true".into(),
+            },
+            vec![0.9, 0.9, 0.9, 0.9],
+        )])
+        .unwrap();
+        let hits = idx.search_sq8_hnsw(&[0.9, 0.9, 0.9, 0.9], "Eq", 2).unwrap();
+        assert_eq!(hits[0].metadata.name, "MyMod.custom_inv");
     }
 }
