@@ -206,9 +206,71 @@ fn strip_balanced_outer_parens(mut s: &str) -> &str {
     }
 }
 
+/// Strip Lean `-- ...` line comments and nested `/- ... -/` block comments while preserving string literals.
+pub fn strip_lean_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut block_depth = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if block_depth == 0 {
+            if in_string {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let ch1 = input[i..].chars().next().unwrap();
+                    out.push(ch1);
+                    i += ch1.len_utf8();
+                    if let Some(ch2) = input[i..].chars().next() {
+                        out.push(ch2);
+                        i += ch2.len_utf8();
+                    }
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    in_string = false;
+                }
+                let ch = input[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = true;
+                out.push('"');
+                i += 1;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+                block_depth += 1;
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            let ch = input[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+            block_depth += 1;
+            i += 2;
+        } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'/' {
+            block_depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Extract the `head_symbol` of target type `T` after stripping outer parens, `∀`, and checking connectives.
 pub fn extract_head_symbol(target: &str) -> Result<HeadSymbol, CanonicalizerError> {
-    let mut s = strip_balanced_outer_parens(target);
+    let stripped = strip_lean_comments(target);
+    let mut s = strip_balanced_outer_parens(&stripped);
     if s.is_empty() {
         return Err(CanonicalizerError::EmptyTarget);
     }
@@ -328,7 +390,13 @@ pub fn canonicalize_goal(
     hypotheses: &[String],
     target: &str,
 ) -> Result<CanonicalGoal, CanonicalizerError> {
-    let (norm_hyps, norm_target) = normalize_alpha_vars(hypotheses, target);
+    let clean_hyps: Vec<String> = hypotheses
+        .iter()
+        .map(|h| strip_lean_comments(h).trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let clean_target = strip_lean_comments(target);
+    let (norm_hyps, norm_target) = normalize_alpha_vars(&clean_hyps, &clean_target);
     let collapsed_hyps: Vec<String> = norm_hyps
         .iter()
         .map(|h| collapse_implicit_instances(h))
@@ -457,5 +525,17 @@ mod tests {
         assert!(pruned.contains(&"_v0 : Nat".to_string()));
         assert!(pruned.contains(&"_v1 : Nat".to_string()));
         assert!(pruned.len() < hyps.len());
+    }
+
+    #[test]
+    fn test_strip_lean_comments_line_and_nested_block() {
+        let raw = "x : Nat -- Left: sum over full projected V_t\n/- outer /- nested -/ still comment -/ y : Nat → Nat";
+        let stripped = strip_lean_comments(raw);
+        assert!(!stripped.contains("Left:"));
+        assert!(!stripped.contains("nested"));
+        assert!(stripped.contains("x : Nat \n y : Nat → Nat"));
+
+        let with_str = "s = \"-- not a comment /- neither -/\" -- real comment";
+        assert_eq!(strip_lean_comments(with_str).trim(), "s = \"-- not a comment /- neither -/\"");
     }
 }
