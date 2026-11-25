@@ -82,6 +82,26 @@ enum ServerEvalOutcome {
     TimedOut,
 }
 
+fn normalize_lake_root(dir: &Path) -> PathBuf {
+    let abs = if dir.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    } else {
+        dir.to_path_buf()
+    };
+    let cleaned: PathBuf = abs.components().collect();
+    let norm = std::fs::canonicalize(&cleaned).unwrap_or(cleaned);
+    let raw = norm.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        norm
+    }
+}
+
 fn path_to_file_uri(dir: &Path, filename: &str) -> String {
     let joined = dir.join(filename);
     let raw = joined.to_string_lossy();
@@ -148,14 +168,16 @@ struct LeanServerSession {
 
 impl Drop for LeanServerSession {
     fn drop(&mut self) {
+        let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 impl LeanServerSession {
-    fn spawn(lake_root: Option<&Path>) -> Result<Self, ProverError> {
-        let mut cmd = if let Some(root) = lake_root {
+    fn spawn(lake_root: Option<&Path>, deadline: Option<Instant>) -> Result<Self, ProverError> {
+        let norm_root = lake_root.map(normalize_lake_root);
+        let mut cmd = if let Some(ref root) = norm_root {
             let mut c = std::process::Command::new("lake");
             c.args(["env", "lean", "--server"]);
             c.current_dir(root);
@@ -206,9 +228,16 @@ impl LeanServerSession {
             }
         });
         write_lsp_frame(&mut stdin, &init_msg)?;
-        let init_deadline = Instant::now() + Duration::from_secs(30);
+        let default_init = Instant::now() + Duration::from_secs(30);
+        let init_deadline = deadline.map_or(default_init, |dl| dl.min(default_init));
         loop {
-            let rem = init_deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            if now >= init_deadline {
+                return Err(ProverError::Repl(lean_repl::ReplError::Io(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "lean --server initialize timeout"),
+                )));
+            }
+            let rem = init_deadline.saturating_duration_since(now);
             let frame = rx.recv_timeout(rem).map_err(|e| {
                 ProverError::Repl(lean_repl::ReplError::Io(std::io::Error::other(format!(
                     "lean --server initialize timeout: {e}"
@@ -227,12 +256,12 @@ impl LeanServerSession {
             }),
         )?;
 
-        let doc_dir = lake_root
-            .map(Path::to_path_buf)
+        let doc_dir = norm_root
+            .clone()
             .unwrap_or_else(std::env::temp_dir);
         let uri = path_to_file_uri(&doc_dir, "__sheaf_live_worker.lean");
         Ok(Self {
-            lake_root: lake_root.map(Path::to_path_buf),
+            lake_root: norm_root,
             uri,
             version: 0,
             next_id: 2,
@@ -395,6 +424,63 @@ impl LeanServerSession {
         let _ = self.next_id;
         Ok(ServerEvalOutcome::Ndjson(lsp_diags_to_ndjson(&latest_diags)))
     }
+
+    fn query_plain_goals_at(
+        &mut self,
+        line_0based: usize,
+        col_0based: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>, ProverError> {
+        let req_id = self.next_id;
+        self.next_id += 1;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "$/lean/plainGoal",
+            "params": {
+                "textDocument": { "uri": self.uri },
+                "position": { "line": line_0based, "character": col_0based }
+            }
+        });
+        write_lsp_frame(&mut self.stdin, &msg)?;
+        let max_wait = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+        loop {
+            let now = Instant::now();
+            if now >= max_wait {
+                return Ok(Vec::new());
+            }
+            let wait_for = max_wait.saturating_duration_since(now);
+            let Ok(frame) = self.rx.recv_timeout(wait_for) else {
+                return Ok(Vec::new());
+            };
+            if frame.get("method").is_some()
+                && let Some(srv_id) = frame.get("id")
+            {
+                let _ = write_lsp_frame(
+                    &mut self.stdin,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": srv_id,
+                        "result": serde_json::Value::Null
+                    }),
+                );
+                continue;
+            }
+            if frame.get("id").and_then(|v| v.as_u64()) == Some(req_id) {
+                let goals = frame
+                    .get("result")
+                    .and_then(|r| r.get("goals"))
+                    .and_then(|g| g.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(goals);
+            }
+        }
+    }
 }
 
 fn lsp_diags_to_ndjson(diags: &[serde_json::Value]) -> String {
@@ -443,6 +529,98 @@ fn lsp_diags_to_ndjson(diags: &[serde_json::Value]) -> String {
 thread_local! {
     #[allow(clippy::missing_const_for_thread_local)]
     static PERSISTENT_LEAN_SERVER: RefCell<Option<LeanServerSession>> = const { RefCell::new(None) };
+    #[allow(clippy::missing_const_for_thread_local)]
+    static SESSION_UNKNOWN_CONSTANTS: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+fn extract_unknown_constants_from_diag(diag: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in ["Unknown constant ", "Unknown identifier "] {
+        let mut rest = diag;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let token = after
+                .trim_start()
+                .trim_start_matches(['`', '\'', '"'])
+                .split(|c: char| c.is_whitespace() || matches!(c, '`' | '\'' | '"' | ',' | ';' | ':' | ')' | ']'))
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !token.is_empty() && !found.iter().any(|x| x == token) {
+                found.push(token.to_string());
+            }
+            rest = after;
+        }
+    }
+    found
+}
+
+pub(crate) fn record_unknown_constants_from_diag(diag: &str) -> Vec<String> {
+    let found = extract_unknown_constants_from_diag(diag);
+    if !found.is_empty() {
+        SESSION_UNKNOWN_CONSTANTS.with(|cell| {
+            let mut set = cell.borrow_mut();
+            for name in &found {
+                set.insert(name.clone());
+            }
+        });
+    }
+    found
+}
+
+pub(crate) fn is_unknown_constant(name: &str) -> bool {
+    SESSION_UNKNOWN_CONSTANTS.with(|cell| cell.borrow().contains(name))
+}
+
+fn strip_unknown_constants_from_script(
+    script: &[String],
+    bad: &std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    if bad.is_empty() {
+        return None;
+    }
+    let mut changed = false;
+    let mut out = Vec::with_capacity(script.len());
+    for line in script {
+        let mut cur = line.clone();
+        if let (Some(open), Some(close)) = (cur.find('['), cur.rfind(']'))
+            && open < close
+        {
+            let before = cur[..open].trim_end();
+            let inside = &cur[open + 1..close];
+            let after = &cur[close + 1..];
+            let items: Vec<&str> = inside
+                .split(',')
+                .map(str::trim)
+                .filter(|item| {
+                    let clean = item.trim_start_matches('←').trim();
+                    !clean.is_empty() && !bad.contains(clean)
+                })
+                .collect();
+            let orig_count = inside.split(',').filter(|s| !s.trim().is_empty()).count();
+            if items.len() < orig_count {
+                changed = true;
+                if items.is_empty() {
+                    if before.ends_with("rw") || before.ends_with("erw") {
+                        return None;
+                    }
+                    cur = format!("{before}{after}");
+                } else {
+                    cur = format!("{before} [{}]{after}", items.join(", "));
+                }
+            }
+        }
+        let trimmed = cur.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_string());
+        }
+    }
+    if changed && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 fn eval_via_lean_server(
@@ -450,9 +628,14 @@ fn eval_via_lean_server(
     lake_root: Option<&Path>,
     deadline: Option<Instant>,
 ) -> Result<ServerEvalOutcome, ProverError> {
+    if let Some(dl) = deadline
+        && Instant::now() >= dl
+    {
+        return Ok(ServerEvalOutcome::TimedOut);
+    }
     PERSISTENT_LEAN_SERVER.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let target_root = lake_root.map(Path::to_path_buf);
+        let target_root = lake_root.map(normalize_lake_root);
         let needs_spawn = match slot.as_mut() {
             Some(sess) => {
                 sess.lake_root != target_root
@@ -462,13 +645,24 @@ fn eval_via_lean_server(
         };
         if needs_spawn {
             *slot = None;
-            *slot = Some(LeanServerSession::spawn(lake_root)?);
+            match LeanServerSession::spawn(lake_root, deadline) {
+                Ok(s) => *slot = Some(s),
+                Err(_) if deadline.is_some_and(|dl| Instant::now() >= dl) => {
+                    return Ok(ServerEvalOutcome::TimedOut);
+                }
+                Err(e) => return Err(e),
+            }
         }
         let outcome = match slot.as_mut().unwrap().eval_document(src, deadline) {
             Ok(out) => out,
             Err(_) => {
                 *slot = None;
-                *slot = Some(LeanServerSession::spawn(lake_root)?);
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    return Ok(ServerEvalOutcome::TimedOut);
+                }
+                *slot = Some(LeanServerSession::spawn(lake_root, deadline)?);
                 slot.as_mut().unwrap().eval_document(src, deadline)?
             }
         };
@@ -477,6 +671,125 @@ fn eval_via_lean_server(
         }
         Ok(outcome)
     })
+}
+
+/// Evaluate `partial_script` followed by `sorry` in `thm_name` and query `$/lean/plainGoal`
+/// anchored directly on the trailing `sorry` token.
+pub(crate) fn query_plain_goals_for_script(
+    src: &str,
+    thm_name: &str,
+    partial_script: &[String],
+    lake_root: Option<&Path>,
+    deadline: Option<Instant>,
+) -> Result<Vec<String>, ProverError> {
+    let mut lines: Vec<String> = partial_script
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect();
+    lines.push("  sorry".to_string());
+    let body = lines.join("\n");
+    let probe_src = replace_theorem_sorry(src, thm_name, &body);
+    let (span_start, span_end) = target_theorem_line_span(&probe_src, thm_name);
+    let mut target_pos: Option<(usize, usize)> = None;
+    for (idx, line) in probe_src.lines().enumerate() {
+        let lnum = idx + 1;
+        if lnum >= span_start && lnum <= span_end
+            && let Some(col) = line.rfind("sorry")
+        {
+            target_pos = Some((idx, col));
+        }
+    }
+    let Some((line_0, col_0)) = target_pos else {
+        return Ok(Vec::new());
+    };
+    if let Some(dl) = deadline
+        && Instant::now() >= dl
+    {
+        return Ok(Vec::new());
+    }
+    PERSISTENT_LEAN_SERVER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let target_root = lake_root.map(normalize_lake_root);
+        let needs_spawn = match slot.as_mut() {
+            Some(sess) => {
+                sess.lake_root != target_root
+                    || matches!(sess.child.try_wait(), Ok(Some(_)) | Err(_))
+            }
+            None => true,
+        };
+        if needs_spawn {
+            *slot = None;
+            match LeanServerSession::spawn(lake_root, deadline) {
+                Ok(s) => *slot = Some(s),
+                Err(_) if deadline.is_some_and(|dl| Instant::now() >= dl) => {
+                    return Ok(Vec::new());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let sess = slot.as_mut().unwrap();
+        match sess.eval_document(&probe_src, deadline)? {
+            ServerEvalOutcome::TimedOut => {
+                *slot = None;
+                Ok(Vec::new())
+            }
+            ServerEvalOutcome::Ndjson(_) => sess.query_plain_goals_at(line_0, col_0, deadline),
+        }
+    })
+}
+
+/// Late OOD fallback: run `exact?` under `deadline`, extract the `"Try this: ..."` term,
+/// and kernel-verify the concrete replacement (never accepting `exact?` itself).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_exact_search_fallback(
+    src: &str,
+    thm: &DiscoveredTheorem,
+    full_name: &str,
+    lake_root: Option<&Path>,
+    prune_unused_simp: bool,
+    strict_lint: bool,
+    deadline: Option<Instant>,
+) -> Result<Option<(String, Vec<String>)>, ProverError> {
+    if let Some(dl) = deadline
+        && Instant::now() >= dl
+    {
+        return Ok(None);
+    }
+    let probe_src = replace_theorem_sorry(src, &thm.name, "  exact?");
+    let ndjson = match eval_via_lean_server(&probe_src, lake_root, deadline)? {
+        ServerEvalOutcome::Ndjson(s) => s,
+        ServerEvalOutcome::TimedOut => return Ok(None),
+    };
+    for line in ndjson.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            if let Some(after_try) = data.split("Try this:").nth(1) {
+                let cleaned = after_try
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .strip_prefix("[apply]")
+                    .map(str::trim)
+                    .unwrap_or_else(|| after_try.lines().next().unwrap_or("").trim());
+                if !cleaned.is_empty() && !cleaned.contains("exact?") && !cleaned.contains("sorry") {
+                    let concrete = vec![cleaned.to_string()];
+                    if let Ok(Ok(verified)) = audit_and_prune_unused_simp_args(
+                        src,
+                        &thm.name,
+                        full_name,
+                        &concrete,
+                        lake_root,
+                        prune_unused_simp,
+                        strict_lint,
+                    ) {
+                        return Ok(Some(verified));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Audit a single candidate script by replacing `sorry` and running `#print axioms` through `verify_allowed_axioms`.
@@ -1123,8 +1436,7 @@ pub fn verify_candidates_batched_with_deadline_and_ui(
 
     let batch_size: usize = if lake_root.is_some() { 16 } else { 8 };
     for (chunk_idx, chunk) in candidates.chunks(batch_size).enumerate() {
-        if chunk_idx > 0
-            && let Some(dl) = deadline
+        if let Some(dl) = deadline
             && Instant::now() >= dl
         {
             last_diag = "ood escalation budget exceeded".to_string();
@@ -1172,8 +1484,7 @@ pub fn verify_candidates_batched_with_deadline_and_ui(
             });
         }
 
-        let chunk_deadline = if chunk_idx > 0 { deadline } else { None };
-        let ndjson = match eval_via_lean_server(&batch_src, lake_root, chunk_deadline)? {
+        let ndjson = match eval_via_lean_server(&batch_src, lake_root, deadline)? {
             ServerEvalOutcome::Ndjson(s) => s,
             ServerEvalOutcome::TimedOut => {
                 last_diag = "ood escalation budget exceeded".to_string();
@@ -1203,6 +1514,7 @@ pub fn verify_candidates_batched_with_deadline_and_ui(
                     && let Some(idx) = ranges.iter().position(|&(s, e)| el >= s && el <= e)
                 {
                     if cand_errors[idx].is_none() {
+                        record_unknown_constants_from_diag(&data);
                         ui.send(UiEvent::BranchUpdated {
                             id: chunk_base_id + idx + 1,
                             status: BranchStatus::Failed {
@@ -1215,6 +1527,78 @@ pub fn verify_candidates_batched_with_deadline_and_ui(
                 } else {
                     has_unmapped_error = true;
                     last_diag = data;
+                }
+            }
+        }
+
+        // Retry any candidates poisoned by unimported VDB constants after stripping blacklisted names
+        let mut retry_scripts: Vec<Vec<String>> = Vec::new();
+        SESSION_UNKNOWN_CONSTANTS.with(|cell| {
+            let bad = cell.borrow();
+            if !bad.is_empty() {
+                for (i, err) in cand_errors.iter().enumerate() {
+                    if let Some(msg) = err
+                        && (msg.contains("Unknown constant") || msg.contains("Unknown identifier"))
+                        && let Some(stripped) = strip_unknown_constants_from_script(&chunk[i], &bad)
+                        && !retry_scripts.contains(&stripped)
+                    {
+                        retry_scripts.push(stripped);
+                    }
+                }
+            }
+        });
+        if !retry_scripts.is_empty() && deadline.is_none_or(|dl| Instant::now() < dl) {
+            let mut retry_src = String::from(prefix);
+            if !retry_src.ends_with('\n') && !retry_src.is_empty() {
+                retry_src.push('\n');
+            }
+            let mut r_line = retry_src.lines().count() + 1;
+            let mut r_ranges = Vec::with_capacity(retry_scripts.len());
+            for (i, r_script) in retry_scripts.iter().enumerate() {
+                let start_l = r_line;
+                let body = r_script
+                    .iter()
+                    .map(|l| format!("  {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let decl = format!(
+                    "set_option maxHeartbeats {hb} in\nprivate theorem __retry_{i}{after_name}:= by\n{body}\n"
+                );
+                r_line += decl.lines().count();
+                r_ranges.push((start_l, r_line.saturating_sub(1)));
+                retry_src.push_str(&decl);
+            }
+            if let Ok(ServerEvalOutcome::Ndjson(r_ndjson)) =
+                eval_via_lean_server(&retry_src, lake_root, deadline)
+            {
+                let mut r_errs: Vec<bool> = vec![false; retry_scripts.len()];
+                for rline in r_ndjson.lines() {
+                    if let Ok(rv) = serde_json::from_str::<serde_json::Value>(rline)
+                        && rv.get("severity").and_then(|s| s.as_str()) == Some("error")
+                        && let Some(el) = rv
+                            .get("pos")
+                            .and_then(|p| p.get("line"))
+                            .and_then(|l| l.as_u64())
+                            .map(|l| l as usize)
+                        && let Some(ridx) = r_ranges.iter().position(|&(s, e)| el >= s && el <= e)
+                    {
+                        r_errs[ridx] = true;
+                    }
+                }
+                for (i, has_err) in r_errs.iter().enumerate() {
+                    if !has_err
+                        && let Ok(Ok((cand_src, final_script))) = audit_and_prune_unused_simp_args(
+                            src,
+                            &thm.name,
+                            full_name,
+                            &retry_scripts[i],
+                            lake_root,
+                            prune_unused_simp,
+                            strict_lint,
+                        )
+                    {
+                        return Ok((Some((cand_src, final_script)), String::new(), unsolved_diags));
+                    }
                 }
             }
         }
@@ -1899,5 +2283,18 @@ theorem thm_two (m : Nat) : m = m := by
         assert!(ndjson.contains("depends on axioms:"), "missing axioms diag: {ndjson}");
         assert!(!ndjson.contains("unusedSimpArgs"), "unexpected unused simp: {ndjson}");
         assert!(hot_ms < 1000, "hot didChange took {hot_ms}ms (expected <1000ms)");
+    }
+
+    #[test]
+    fn test_m26_plain_goal_extracts_live_subgoal() {
+        let src = "import Init\ntheorem swap_goal (a b : Nat) : a + b = b + a := by\n  sorry\n";
+        let goals = query_plain_goals_for_script(src, "swap_goal", &["intro".to_string()], None, None)
+            .unwrap();
+        assert!(!goals.is_empty(), "expected $/lean/plainGoal subgoals");
+        assert!(
+            goals[0].contains("a + b = b + a"),
+            "unexpected plainGoal: {:?}",
+            goals
+        );
     }
 }
