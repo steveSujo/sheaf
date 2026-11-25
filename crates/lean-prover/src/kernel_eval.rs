@@ -1146,6 +1146,194 @@ fn audit_and_prune_unused_simp_args(
     Ok(Ok((cur_src, cur_script)))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InMemoryTryOutcome {
+    pub proved: bool,
+    pub timed_out: bool,
+    pub remaining_goals: Vec<String>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Splice `tactic_script` into `thm_name` in memory and evaluate via persistent `lean --server`.
+/// Distinguishes valid partial progress (`unsolved goals` only) from real tactic/compile errors.
+pub(crate) fn eval_tactic_in_memory(
+    src: &str,
+    thm_name: &str,
+    tactic_script: &str,
+    lake_root: Option<&Path>,
+    deadline: Option<Instant>,
+) -> Result<InMemoryTryOutcome, ProverError> {
+    if let Some(dl) = deadline
+        && Instant::now() >= dl
+    {
+        return Ok(InMemoryTryOutcome {
+            proved: false,
+            timed_out: true,
+            remaining_goals: Vec::new(),
+            diagnostics: vec!["timeout exceeded".to_string()],
+        });
+    }
+
+    let script_lines: Vec<String> = tactic_script
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let body = if script_lines.is_empty() {
+        "  sorry".to_string()
+    } else {
+        script_lines
+            .iter()
+            .map(|l| format!("  {}", l.trim_start()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let probe_src = crate::replace_theorem_sorry(src, thm_name, &body);
+    let ndjson = match eval_via_lean_server(&probe_src, lake_root, deadline)? {
+        ServerEvalOutcome::TimedOut => {
+            return Ok(InMemoryTryOutcome {
+                proved: false,
+                timed_out: true,
+                remaining_goals: Vec::new(),
+                diagnostics: vec!["timeout exceeded".to_string()],
+            });
+        }
+        ServerEvalOutcome::Ndjson(s) => s,
+    };
+
+    let (span_start, span_end) = target_theorem_line_span(&probe_src, thm_name);
+    let mut in_span_errors: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for line in ndjson.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("severity").and_then(|s| s.as_str()) != Some("error") {
+            continue;
+        }
+        let data = v
+            .get("data")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if data.is_empty() {
+            continue;
+        }
+        let err_line = v
+            .get("pos")
+            .and_then(|p| p.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0) as usize;
+        if err_line >= span_start && err_line <= span_end {
+            in_span_errors.push(data);
+        } else {
+            other_errors.push(data);
+        }
+    }
+
+    let relevant_errors = if in_span_errors.is_empty() {
+        other_errors
+    } else {
+        in_span_errors
+    };
+
+    let mut real_errors: Vec<String> = Vec::new();
+    let mut unsolved_blocks: Vec<String> = Vec::new();
+    for err in relevant_errors {
+        if let Some(after) = err.strip_prefix("unsolved goals") {
+            let trimmed = after.trim();
+            if !trimmed.is_empty() {
+                unsolved_blocks.push(trimmed.to_string());
+            } else {
+                unsolved_blocks.push(err);
+            }
+        } else {
+            real_errors.push(err);
+        }
+    }
+
+    let mut bd = 0usize;
+    let has_sorry = crate::contains_standalone_sorry(&body, &mut bd);
+    let mut remaining_goals = Vec::new();
+    if real_errors.is_empty() && (!unsolved_blocks.is_empty() || has_sorry) {
+        let plain = query_plain_goals_for_script(src, thm_name, &script_lines, lake_root, deadline)
+            .unwrap_or_default();
+        if !plain.is_empty() {
+            remaining_goals = plain;
+        } else {
+            remaining_goals = unsolved_blocks;
+        }
+    }
+
+    let proved = real_errors.is_empty() && remaining_goals.is_empty() && !has_sorry;
+    Ok(InMemoryTryOutcome {
+        proved,
+        timed_out: false,
+        remaining_goals,
+        diagnostics: real_errors,
+    })
+}
+
+pub(crate) type ApplyVerifyResult = Result<(String, Vec<String>, Vec<String>), Vec<String>>;
+
+/// Kernel-verify `script_lines` (`#print axioms` + `unusedSimpArgs` prune) before disk write.
+pub(crate) fn verify_and_prune_for_apply(
+    src: &str,
+    thm_name: &str,
+    full_name: &str,
+    script_lines: &[String],
+    lake_root: Option<&Path>,
+    deadline: Option<Instant>,
+) -> Result<ApplyVerifyResult, ProverError> {
+    if let Some(dl) = deadline
+        && Instant::now() >= dl
+    {
+        return Ok(Err(vec!["timeout exceeded".to_string()]));
+    }
+    match audit_and_prune_unused_simp_args(
+        src,
+        thm_name,
+        full_name,
+        script_lines,
+        lake_root,
+        true,
+        false,
+    )? {
+        Ok((updated_src, pruned_script)) => {
+            let (_, _, _, audit_stdout) = audit_single_candidate_raw(
+                src,
+                thm_name,
+                full_name,
+                &pruned_script,
+                lake_root,
+                false,
+            )?;
+            let mut axioms = Vec::new();
+            for line in audit_stdout.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let data = v.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    if let Some((_, rest)) = data.split_once("depends on axioms:") {
+                        for tok in rest
+                            .trim()
+                            .trim_matches(|c| c == '[' || c == ']')
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            if !axioms.iter().any(|a| a == tok) {
+                                axioms.push(tok.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Ok((updated_src, pruned_script, axioms)))
+        }
+        Err(diag) => Ok(Err(vec![diag])),
+    }
+}
+
 fn find_matching_block_comment_start(s: &str) -> Option<usize> {
     if !s.ends_with("-/") {
         return None;

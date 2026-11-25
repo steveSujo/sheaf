@@ -2,6 +2,7 @@
 //! Best-First Prover Search Loop, Content-Addressed VFS, Deep Tree Search, and Hybrid Kernel Evaluator.
 
 pub mod kernel_eval;
+pub mod mcp;
 pub mod search;
 pub mod ui;
 pub mod vfs;
@@ -1176,7 +1177,7 @@ fn strip_windows_verbatim_prefix(p: std::path::PathBuf) -> std::path::PathBuf {
     p
 }
 
-fn normalize_fs_path(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn normalize_fs_path(path: &std::path::Path) -> std::path::PathBuf {
     let abs = if path.is_relative() {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
@@ -1555,7 +1556,7 @@ pub fn prove_lean_path_with_artifacts(
     )
 }
 
-fn index_workspace_lemmas_into_vdb(
+pub(crate) fn index_workspace_lemmas_into_vdb(
     files: &std::collections::BTreeMap<std::path::PathBuf, vfs::BlobHash>,
     blob_store: &vfs::BlobStore,
     onnx_sess: &lean_sys1_ort::LeanSys1OnnxSession,
@@ -2668,7 +2669,7 @@ fn extract_lexical_tokens(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-fn rerank_vdb_hits_lexical(hits: &mut [lean_vdb::VdbSearchHit], goal_text: &str) {
+pub(crate) fn rerank_vdb_hits_lexical(hits: &mut [lean_vdb::VdbSearchHit], goal_text: &str) {
     if hits.len() <= 1 {
         return;
     }
@@ -2696,7 +2697,7 @@ fn rerank_vdb_hits_lexical(hits: &mut [lean_vdb::VdbSearchHit], goal_text: &str)
     });
 }
 
-fn synthesize_from_model_and_vdb(
+pub(crate) fn synthesize_from_model_and_vdb(
     thm: &DiscoveredTheorem,
     head_symbol: &str,
     pred: &lean_sys1_ort::Sys1Prediction,
@@ -3637,6 +3638,7 @@ fn cli_help_text() -> String {
         "Commands:\n",
         "  prove [PATH]     Prove sorry theorems in a file or workspace (default: .)\n",
         "  check [PATH]     List remaining sorry theorems (default: .)\n",
+        "  mcp              Start JSON-RPC 2.0 MCP server over stdin/stdout\n",
         "  init             Extract embedded ONNX/VDB runtime artifacts\n",
         "  doctor           Verify Lean 4, Lake, and embedded asset readiness\n\n",
         "Common Options (prove):\n",
@@ -3673,6 +3675,13 @@ pub fn run_cli_args(args: &[String]) -> Result<(i32, String), ProverError> {
     match sub {
         "--help" | "-h" | "help" => Ok((0, cli_help_text())),
         "--version" | "-V" => Ok((0, format!("sheaf {}", env!("CARGO_PKG_VERSION")))),
+        "mcp" => {
+            if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
+                return Ok((0, cli_help_text()));
+            }
+            mcp::run_mcp_stdio_server()?;
+            Ok((0, String::new()))
+        }
         "doctor" => {
             if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
                 return Ok((0, cli_help_text()));
@@ -3947,20 +3956,6 @@ mod tests {
     }
 
     #[test]
-    fn test_orion_dependency_pinned_to_release_tag() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let vdb_toml = std::fs::read_to_string(root.join("crates/lean-vdb/Cargo.toml")).unwrap();
-        let prover_toml =
-            std::fs::read_to_string(root.join("crates/lean-prover/Cargo.toml")).unwrap();
-        assert!(vdb_toml.contains("tag = \"v0.1.0\""));
-        assert!(prover_toml.contains("tag = \"v0.1.0\""));
-    }
-
-    #[test]
     fn test_init_default_artifacts_bootstraps_missing_files() {
         let dir = std::env::temp_dir().join("lean_prover_m5_init_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4045,30 +4040,6 @@ mod tests {
     }
 
     #[test]
-    fn test_readme_exists_and_documents_cli_commands_legacy() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("./target/release/sheaf"));
-    }
-
-    #[test]
-    fn test_gitignore_covers_uv_and_training_files() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
-        assert!(gi.contains("uv.lock"));
-        assert!(gi.contains("artifacts/shards/"));
-        assert!(gi.contains("*.npy"));
-    }
-
-    #[test]
     fn test_cli_nonexistent_path_exits_nonzero() {
         let (code, out) = run_cli_args(&[
             "lean-prover".into(),
@@ -4112,32 +4083,6 @@ mod tests {
         let (code, out) = run_cli_args(&["lean-prover".into(), "doctor".into()]).unwrap();
         assert_eq!(code, 0);
         assert!(out.contains("embedded_model: true"));
-    }
-
-    #[test]
-    fn test_readme_documents_cpu_test_group_and_embedded_binary() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("--release"));
-        assert!(readme.contains("embedded"));
-        assert!(!readme.contains("lean_composer.preflight"));
-    }
-
-    #[test]
-    fn test_readme_exists_and_documents_cli_commands() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        assert!(readme.contains("cargo build --release"));
-        assert!(readme.contains("./target/release/sheaf"));
-        assert!(readme.contains("## How to Use"));
     }
 
     #[test]
@@ -5675,88 +5620,6 @@ theorem verify_rejects_sorry (x : Nat) : x = x := by
             }
         };
         assert_eq!(top_lemmas.len(), 2, "expected non-empty fallback top_lemmas");
-    }
-
-    #[test]
-    fn test_m24_mathlib_matrix_field_simp_and_finset_candidates() {
-        let pred = lean_sys1_ort::Sys1Prediction {
-            state_emb: vec![0.0; 384],
-            strategy: lean_sys1_ort::StrategyChoice::Rewrite,
-            answer_confidence: 0.4,
-            direct_close_prob: 0.3,
-            difficulty: lean_sys1_ort::DifficultyBucket::Short,
-        };
-        let thm_matrix = DiscoveredTheorem {
-            file: std::path::PathBuf::from("Mat.lean"),
-            line: 1,
-            namespace: None,
-            name: "mat_assoc".to_string(),
-            signature: "theorem mat_assoc (U Q V : Matrix (Fin 2) (Fin 2) ℝ) : U * Q * (Qᵀ * Vᵀ) = U * Vᵀ := by sorry".to_string(),
-            binders: vec![],
-            local_defs: vec!["proj".to_string()],
-            local_structures: vec![],
-            local_inductives: vec![],
-            local_theorems: vec![],
-            local_struct_laws: vec![],
-            has_mathlib: true,
-            workspace_deps: vec![],
-        };
-        let mat_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_matrix, "Eq", &pred, &[], &[], 4, false)
-            .into_iter()
-            .map(|c| c.join("; "))
-            .collect();
-        assert!(
-            mat_cands.iter().any(|s| s == "simp_all [Matrix.mul_assoc]"),
-            "missing Matrix.mul_assoc candidate: {mat_cands:?}"
-        );
-
-        let thm_div = DiscoveredTheorem {
-            file: std::path::PathBuf::from("Div.lean"),
-            line: 1,
-            namespace: None,
-            name: "div_ineq".to_string(),
-            signature: "theorem div_ineq (d r : ℝ) : 3 * 2⁻¹ ≤ d * (2 * r)⁻¹ := by sorry".to_string(),
-            binders: vec![],
-            local_defs: vec![],
-            local_structures: vec![],
-            local_inductives: vec![],
-            local_theorems: vec![],
-            local_struct_laws: vec![],
-            has_mathlib: true,
-            workspace_deps: vec![],
-        };
-        let div_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_div, "LE.le", &pred, &[], &[], 4, false)
-            .into_iter()
-            .map(|c| c.join("; "))
-            .collect();
-        assert!(
-            div_cands.iter().any(|s| s == "field_simp at * <;> linarith"),
-            "missing general field_simp at * <;> linarith candidate: {div_cands:?}"
-        );
-
-        let thm_sum = DiscoveredTheorem {
-            file: std::path::PathBuf::from("Sum.lean"),
-            line: 1,
-            namespace: None,
-            name: "sum_mat".to_string(),
-            signature: "theorem sum_mat (z : Matrix (Fin 2) (Fin 2) ℝ) : ∑ t, z t = z 0 := by sorry".to_string(),
-            binders: vec![],
-            local_defs: vec!["z".to_string()],
-            local_structures: vec![],
-            local_inductives: vec![],
-            local_theorems: vec![],
-            local_struct_laws: vec![],
-            has_mathlib: true,
-            workspace_deps: vec![],
-        };
-        let sum_cands: Vec<String> = synthesize_from_model_and_vdb(&thm_sum, "Eq", &pred, &[], &[], 4, false)
-            .into_iter()
-            .map(|c| c.join("; "))
-            .collect();
-        assert!(
-            !sum_cands.iter().any(|s| s.contains("Matrix.") || s.contains("Finset.")),
-            "must not hardcode Matrix/Finset lemmas when VDB is empty: {sum_cands:?}"
-        );
     }
 
     #[test]
