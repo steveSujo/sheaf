@@ -9,15 +9,17 @@ use crate::{
     vfs,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_MAX_GOALS: usize = 3;
-const MCP_MAX_ERROR_CHARS: usize = 300;
+const MCP_MAX_ERROR_CHARS: usize = 650;
 const MCP_MAX_DIAGNOSTICS: usize = 3;
+const MCP_COLD_TIMEOUT_MS: u64 = 60_000;
+const MCP_WARM_TIMEOUT_MS: u64 = 15_000;
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
@@ -43,8 +45,20 @@ fn cap_diagnostics(diags: Vec<String>) -> Vec<String> {
         .into_iter()
         .take(MCP_MAX_DIAGNOSTICS)
         .map(|d| {
-            let first_line = d.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-            truncate_chars(first_line, MCP_MAX_ERROR_CHARS)
+            let mut kept = Vec::new();
+            for line in d.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !kept.is_empty()
+                    && (trimmed.starts_with('⊢') || trimmed.starts_with("case "))
+                {
+                    break;
+                }
+                kept.push(trimmed);
+            }
+            truncate_chars(&kept.join("\n"), MCP_MAX_ERROR_CHARS)
         })
         .collect()
 }
@@ -61,12 +75,31 @@ struct McpRuntime {
 pub struct McpServerState {
     runtime: Option<McpRuntime>,
     workspace_vdbs: HashMap<PathBuf, lean_vdb::StaticVdbIndex>,
+    warm_workspaces: HashSet<PathBuf>,
 }
 
 impl McpServerState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn workspace_key(ctx: &TheoremContext) -> PathBuf {
+        ctx.lake_root
+            .clone()
+            .unwrap_or_else(|| ctx.norm_file.parent().unwrap_or(Path::new(".")).to_path_buf())
+    }
+
+    fn default_timeout_ms(&self, ws_key: &Path) -> u64 {
+        if self.warm_workspaces.contains(ws_key) {
+            MCP_WARM_TIMEOUT_MS
+        } else {
+            MCP_COLD_TIMEOUT_MS
+        }
+    }
+
+    fn mark_workspace_warm(&mut self, ws_key: PathBuf) {
+        self.warm_workspaces.insert(ws_key);
     }
 
     fn ensure_runtime(&mut self) -> Result<&McpRuntime, ProverError> {
@@ -188,7 +221,7 @@ fn mcp_tool_schemas() -> Value {
                         "tactics": { "type": "array", "items": { "type": "string" }, "description": "Tactic scripts to test in order" },
                         "tactic": { "type": "string", "description": "Single tactic fallback" },
                         "auto_close": { "type": "boolean", "description": "Auto-close open leaves (default true)" },
-                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 300000, "description": "Timeout in ms (default 15000)" }
+                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 300000, "description": "Timeout in ms (60s cold, 15s warm)" }
                     },
                     "required": ["file", "theorem"]
                 }
@@ -202,7 +235,7 @@ fn mcp_tool_schemas() -> Value {
                         "file": { "type": "string", "description": "Path to Lean file" },
                         "theorem": { "type": "string", "description": "Theorem name" },
                         "prefix_tactic": { "type": "string", "description": "Optional leading tactic" },
-                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 300000, "description": "Timeout in ms (default 15000)" }
+                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 300000, "description": "Timeout in ms (60s cold, 15s warm)" }
                     },
                     "required": ["file", "theorem"]
                 }
@@ -358,8 +391,10 @@ fn handle_sheaf_goals(state: &mut McpServerState, args: &Value) -> Result<Value,
         Ok(c) => c,
         Err(msg) => return Ok(mcp_tool_result(json!({ "error": msg }), true)),
     };
-    let deadline = Some(Instant::now() + Duration::from_secs(15));
-    let goals = kernel_eval::query_plain_goals_for_script(
+    let ws_key = McpServerState::workspace_key(&ctx);
+    let timeout_ms = state.default_timeout_ms(&ws_key);
+    let deadline = Some(Instant::now() + Duration::from_millis(timeout_ms));
+    let mut goals = kernel_eval::query_plain_goals_for_script(
         &ctx.eval_src,
         &ctx.thm.name,
         &[],
@@ -367,6 +402,32 @@ fn handle_sheaf_goals(state: &mut McpServerState, args: &Value) -> Result<Value,
         deadline,
     )
     .unwrap_or_default();
+    let mut server_responded = !goals.is_empty();
+    if goals.is_empty()
+        && let Ok(outcome) = kernel_eval::eval_tactic_in_memory(
+            &ctx.eval_src,
+            &ctx.thm.name,
+            "skip",
+            ctx.lake_root.as_deref(),
+            deadline,
+        )
+    {
+        if !outcome.timed_out {
+            server_responded = true;
+        }
+        if !outcome.remaining_goals.is_empty() {
+            goals = outcome.remaining_goals;
+        } else {
+            for d in &outcome.diagnostics {
+                if let Some((hyps, tgt)) = parse_unsolved_goal_from_diag(d) {
+                    goals.push(format!("{} ⊢ {}", hyps.join(", "), tgt));
+                }
+            }
+        }
+    }
+    if server_responded {
+        state.mark_workspace_warm(ws_key.clone());
+    }
 
     let target_str = extract_theorem_target(&ctx.thm.signature);
     let hyp_strs: Vec<String> = ctx
@@ -381,10 +442,9 @@ fn handle_sheaf_goals(state: &mut McpServerState, args: &Value) -> Result<Value,
         .map(|h| h.as_str().to_string())
         .unwrap_or_else(|_| "Eq".to_string());
     let canonical = format!("{} ⊢ {}", norm_hyps.join(", "), norm_target);
-    let ws_key = ctx
-        .lake_root
-        .clone()
-        .unwrap_or_else(|| ctx.norm_file.parent().unwrap_or(Path::new(".")).to_path_buf());
+    if goals.is_empty() {
+        goals.push(canonical.clone());
+    }
 
     let vdb_premises: Vec<Value> = match query_vdb_premises(
         state,
@@ -419,12 +479,48 @@ fn handle_sheaf_goals(state: &mut McpServerState, args: &Value) -> Result<Value,
     ))
 }
 
+enum LocalCloseOutcome {
+    Proved(Vec<String>),
+    Partial {
+        best_prefix: Vec<String>,
+        remaining_goals: Vec<String>,
+    },
+}
+
+fn split_unsolved_goals(diag: &str) -> Vec<String> {
+    let trimmed = diag.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Some((hyps, tgt)) = parse_unsolved_goal_from_diag(trimmed) {
+        return vec![format!("{} ⊢ {}", hyps.join(", "), tgt)];
+    }
+    vec![trimmed.to_string()]
+}
+
+fn record_best_partial(
+    best: &mut Option<(Vec<String>, Vec<String>)>,
+    script: Vec<String>,
+    goals: Vec<String>,
+) {
+    if goals.is_empty() {
+        return;
+    }
+    let replace = best.as_ref().is_none_or(|(prev_script, prev_goals)| {
+        goals.len() < prev_goals.len()
+            || (goals.len() == prev_goals.len() && script.len() < prev_script.len())
+    });
+    if replace {
+        *best = Some((script, goals));
+    }
+}
+
 fn run_local_close(
     state: &mut McpServerState,
     ctx: &TheoremContext,
     prefix_lines: &[String],
     deadline: Option<Instant>,
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<LocalCloseOutcome, String> {
     let ws_key = ctx
         .lake_root
         .clone()
@@ -506,7 +602,16 @@ fn run_local_close(
     .map_err(|e| e.to_string())?;
 
     if let Some((_win_src, win_script)) = solved {
-        return Ok(Some(win_script));
+        return Ok(LocalCloseOutcome::Proved(win_script));
+    }
+
+    let best_partial = std::cell::RefCell::new(None::<(Vec<String>, Vec<String>)>);
+    for (cand_script, gdiag) in &unsolved {
+        record_best_partial(
+            &mut best_partial.borrow_mut(),
+            cand_script.clone(),
+            split_unsolved_goals(gdiag),
+        );
     }
 
     if deadline.is_some_and(|dl| Instant::now() < dl) && !unsolved.is_empty() {
@@ -614,6 +719,11 @@ fn run_local_close(
                 }
                 let mut children = Vec::new();
                 for (cand_script, gdiag) in step_unsolved.into_iter().take(4) {
+                    record_best_partial(
+                        &mut best_partial.borrow_mut(),
+                        cand_script.clone(),
+                        split_unsolved_goals(&gdiag),
+                    );
                     if deadline.is_some_and(|dl| Instant::now() >= dl) {
                         break;
                     }
@@ -648,10 +758,16 @@ fn run_local_close(
             },
         );
         if let Some(win_script) = search_res.winning_script {
-            return Ok(Some(win_script));
+            return Ok(LocalCloseOutcome::Proved(win_script));
         }
     }
-    Ok(None)
+    let (best_prefix, remaining_goals) = best_partial
+        .into_inner()
+        .unwrap_or_else(|| (prefix_lines.to_vec(), Vec::new()));
+    Ok(LocalCloseOutcome::Partial {
+        best_prefix,
+        remaining_goals,
+    })
 }
 
 fn handle_sheaf_try(state: &mut McpServerState, args: &Value) -> Result<Value, Value> {
@@ -692,12 +808,6 @@ fn handle_sheaf_try(state: &mut McpServerState, args: &Value) -> Result<Value, V
         .get("auto_close")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(15_000)
-        .clamp(100, 300_000);
-
     let ctx = match load_theorem_context(file, theorem) {
         Ok(c) => c,
         Err(msg) => {
@@ -707,6 +817,12 @@ fn handle_sheaf_try(state: &mut McpServerState, args: &Value) -> Result<Value, V
             ));
         }
     };
+    let ws_key = McpServerState::workspace_key(&ctx);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| state.default_timeout_ms(&ws_key))
+        .clamp(100, 300_000);
     let t0 = Instant::now();
     let deadline = Some(t0 + Duration::from_millis(timeout_ms));
 
@@ -753,6 +869,7 @@ fn handle_sheaf_try(state: &mut McpServerState, args: &Value) -> Result<Value, V
                 true,
             ));
         }
+        state.mark_workspace_warm(ws_key.clone());
         if outcome.proved {
             return Ok(mcp_tool_result(
                 json!({
@@ -796,7 +913,8 @@ fn handle_sheaf_try(state: &mut McpServerState, args: &Value) -> Result<Value, V
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect();
-                if let Ok(Some(win_script)) = run_local_close(state, &ctx, &prefix_lines, deadline)
+                if let Ok(LocalCloseOutcome::Proved(win_script)) =
+                    run_local_close(state, &ctx, &prefix_lines, deadline)
                 {
                     return Ok(mcp_tool_result(
                         json!({
@@ -858,12 +976,6 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
         return Err(jsonrpc_err(Value::Null, -32602, "missing required parameter 'theorem'"));
     };
     let prefix_tactic = args.get("prefix_tactic").and_then(Value::as_str);
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(15_000)
-        .clamp(100, 300_000);
-
     let ctx = match load_theorem_context(file, theorem) {
         Ok(c) => c,
         Err(msg) => {
@@ -873,6 +985,12 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
             ));
         }
     };
+    let ws_key = McpServerState::workspace_key(&ctx);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| state.default_timeout_ms(&ws_key))
+        .clamp(100, 300_000);
     let t0 = Instant::now();
     let deadline = Some(t0 + Duration::from_millis(timeout_ms));
 
@@ -885,6 +1003,7 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
         })
         .unwrap_or_default();
 
+    let mut prefix_remaining: Vec<String> = Vec::new();
     if !prefix_lines.is_empty() {
         let try_res = kernel_eval::eval_tactic_in_memory(
             &ctx.eval_src,
@@ -906,6 +1025,7 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
                 ));
             }
             Ok(out) if out.proved => {
+                state.mark_workspace_warm(ws_key);
                 return Ok(mcp_tool_result(
                     json!({
                         "proved": true,
@@ -917,10 +1037,12 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
                 ));
             }
             Ok(out) if !out.diagnostics.is_empty() => {
+                state.mark_workspace_warm(ws_key);
                 let (capped, remaining_count) = cap_goals_with_count(out.remaining_goals);
                 return Ok(mcp_tool_result(
                     json!({
                         "proved": false,
+                        "best_prefix": prefix_lines.join("\n"),
                         "remaining_goals": capped,
                         "remaining_count": remaining_count,
                         "diagnostics": cap_diagnostics(out.diagnostics),
@@ -935,34 +1057,62 @@ fn handle_sheaf_close(state: &mut McpServerState, args: &Value) -> Result<Value,
                     true,
                 ));
             }
-            Ok(_) => {}
+            Ok(out) => {
+                state.mark_workspace_warm(ws_key.clone());
+                prefix_remaining = out.remaining_goals;
+            }
         }
     }
 
     match run_local_close(state, &ctx, &prefix_lines, deadline) {
-        Ok(Some(win_script)) => Ok(mcp_tool_result(
-            json!({
-                "proved": true,
-                "proof_script": win_script.join("\n"),
-                "remaining_goals": [],
-                "remaining_count": 0,
-                "elapsed_ms": t0.elapsed().as_millis() as u64,
-            }),
-            false,
-        )),
-        Ok(None) => {
-            let remaining_goals = kernel_eval::query_plain_goals_for_script(
-                &ctx.eval_src,
-                &ctx.thm.name,
-                &prefix_lines,
-                ctx.lake_root.as_deref(),
-                Some(Instant::now() + Duration::from_secs(3)),
-            )
-            .unwrap_or_default();
+        Ok(LocalCloseOutcome::Proved(win_script)) => {
+            state.mark_workspace_warm(ws_key);
+            Ok(mcp_tool_result(
+                json!({
+                    "proved": true,
+                    "proof_script": win_script.join("\n"),
+                    "remaining_goals": [],
+                    "remaining_count": 0,
+                    "elapsed_ms": t0.elapsed().as_millis() as u64,
+                }),
+                false,
+            ))
+        }
+        Ok(LocalCloseOutcome::Partial {
+            mut best_prefix,
+            mut remaining_goals,
+        }) => {
+            state.mark_workspace_warm(ws_key);
+            if remaining_goals.is_empty() {
+                remaining_goals = prefix_remaining;
+                best_prefix = prefix_lines.clone();
+            }
+            if remaining_goals.is_empty() {
+                remaining_goals = kernel_eval::query_plain_goals_for_script(
+                    &ctx.eval_src,
+                    &ctx.thm.name,
+                    &best_prefix,
+                    ctx.lake_root.as_deref(),
+                    Some(Instant::now() + Duration::from_secs(3)),
+                )
+                .unwrap_or_default();
+            }
+            if remaining_goals.is_empty()
+                && let Ok(out) = kernel_eval::eval_tactic_in_memory(
+                    &ctx.eval_src,
+                    &ctx.thm.name,
+                    "skip",
+                    ctx.lake_root.as_deref(),
+                    Some(Instant::now() + Duration::from_secs(3)),
+                )
+            {
+                remaining_goals = out.remaining_goals;
+            }
             let (capped, remaining_count) = cap_goals_with_count(remaining_goals);
             Ok(mcp_tool_result(
                 json!({
                     "proved": false,
+                    "best_prefix": best_prefix.join("\n"),
                     "remaining_goals": capped,
                     "remaining_count": remaining_count,
                     "elapsed_ms": t0.elapsed().as_millis() as u64,
@@ -1148,19 +1298,26 @@ pub fn handle_mcp_jsonrpc_line(state: &mut McpServerState, line: &str) -> Option
     };
 
     match method {
-        "initialize" => Some(jsonrpc_ok(
-            req_id,
-            json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": { "listChanged": false }
-                },
-                "serverInfo": {
-                    "name": "sheaf",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }),
-        )),
+        "initialize" => {
+            let client_ver = req
+                .get("params")
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str)
+                .unwrap_or(MCP_PROTOCOL_VERSION);
+            Some(jsonrpc_ok(
+                req_id,
+                json!({
+                    "protocolVersion": client_ver,
+                    "capabilities": {
+                        "tools": { "listChanged": false }
+                    },
+                    "serverInfo": {
+                        "name": "sheaf",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }),
+            ))
+        }
         "ping" => Some(jsonrpc_ok(req_id, json!({}))),
         "tools/list" => Some(jsonrpc_ok(req_id, mcp_tool_schemas())),
         "tools/call" => {
@@ -1208,7 +1365,8 @@ pub fn run_mcp_stdio_server() -> Result<(), ProverError> {
         if let Some(reply) = handle_mcp_jsonrpc_line(&mut state, &line) {
             let encoded = serde_json::to_string(&reply)
                 .map_err(|e| ProverError::Repl(lean_repl::ReplError::Json(e)))?;
-            writeln!(out, "{encoded}")
+            out.write_all(encoded.as_bytes())
+                .and_then(|_| out.write_all(b"\n"))
                 .and_then(|_| out.flush())
                 .map_err(|e| ProverError::Repl(lean_repl::ReplError::Io(e)))?;
         }
@@ -1225,10 +1383,11 @@ mod tests {
         let mut state = McpServerState::new();
         let init_reply = handle_mcp_jsonrpc_line(
             &mut state,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
         )
         .expect("initialize must reply");
         assert_eq!(init_reply["id"], 1);
+        assert_eq!(init_reply["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(init_reply["result"]["serverInfo"]["name"], "sheaf");
         assert!(state.runtime.is_none(), "runtime must lazy-load after initialize");
 
@@ -1375,10 +1534,11 @@ mod tests {
             cap_goals_with_count(vec!["g1".into(), "g2".into(), "g3".into(), "g4".into()]);
         assert_eq!(capped.len(), 3);
         assert_eq!(count, 4);
-        let long_err = format!("{}\nverbose trace line", "x".repeat(450));
+        let long_err = format!("{}\n⊢ huge goal dump", "x".repeat(720));
         let capped_diags = cap_diagnostics(vec![long_err]);
-        assert_eq!(capped_diags[0].chars().count(), 300);
+        assert_eq!(capped_diags[0].chars().count(), 650);
         assert!(capped_diags[0].ends_with("..."));
+        assert!(!capped_diags[0].contains("huge goal dump"));
 
         let dir = std::env::temp_dir().join("sheaf_test_mcp_batched_ac");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1442,6 +1602,98 @@ mod tests {
                 .unwrap();
         assert_eq!(ac_body["proved"], true);
         assert!(ac_body["remaining_goals"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mcp_goals_skip_fallback_and_partial_close() {
+        let diag_with_types = "type mismatch\n  h\nhas type\n  a = b : Prop\nbut is expected to have type\n  b = a : Prop\ncase h\nx : Nat\n⊢ b = a";
+        let capped = cap_diagnostics(vec![diag_with_types.to_string()]);
+        assert!(capped[0].contains("has type"));
+        assert!(capped[0].contains("but is expected to have type"));
+        assert!(!capped[0].contains("x : Nat"));
+
+        let dir = std::env::temp_dir().join("sheaf_test_mcp_skip_partial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("SkipPartial.lean");
+        std::fs::write(
+            &file,
+            "theorem mcp_unprovable (n : Nat) : n = n -> n = n + 1 := by\n  sorry\n",
+        )
+        .unwrap();
+
+        let mut state = McpServerState::new();
+        assert_eq!(state.default_timeout_ms(&dir), MCP_COLD_TIMEOUT_MS);
+
+        let goals_req = json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {
+                "name": "sheaf_goals",
+                "arguments": { "file": file.to_string_lossy(), "theorem": "mcp_unprovable" }
+            }
+        })
+        .to_string();
+        let goals_reply = handle_mcp_jsonrpc_line(&mut state, &goals_req).unwrap();
+        assert_eq!(goals_reply["result"]["isError"], false);
+        let goals_body: Value =
+            serde_json::from_str(goals_reply["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let goals_arr = goals_body["goals"].as_array().unwrap();
+        assert!(!goals_arr.is_empty());
+        assert!(goals_arr[0].as_str().unwrap().contains('⊢'));
+        assert_eq!(state.default_timeout_ms(&dir), MCP_WARM_TIMEOUT_MS);
+
+        // sorry probe in sheaf_try must return remaining_goals from $/lean/plainGoal
+        let sorry_req = json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "sheaf_try",
+                "arguments": {
+                    "file": file.to_string_lossy(),
+                    "theorem": "mcp_unprovable",
+                    "tactics": ["intro _h\nsorry"],
+                    "auto_close": false
+                }
+            }
+        })
+        .to_string();
+        let sorry_reply = handle_mcp_jsonrpc_line(&mut state, &sorry_req).unwrap();
+        assert_eq!(sorry_reply["result"]["isError"], false);
+        let sorry_body: Value =
+            serde_json::from_str(sorry_reply["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(sorry_body["proved"], false);
+        assert!(!sorry_body["remaining_goals"].as_array().unwrap().is_empty());
+
+        // sheaf_close on unprovable theorem returns best_prefix and non-empty remaining_goals
+        let close_req = json!({
+            "jsonrpc": "2.0",
+            "id": 32,
+            "method": "tools/call",
+            "params": {
+                "name": "sheaf_close",
+                "arguments": {
+                    "file": file.to_string_lossy(),
+                    "theorem": "mcp_unprovable",
+                    "prefix_tactic": "intro _h"
+                }
+            }
+        })
+        .to_string();
+        let close_reply = handle_mcp_jsonrpc_line(&mut state, &close_req).unwrap();
+        assert_eq!(close_reply["result"]["isError"], false);
+        let close_body: Value =
+            serde_json::from_str(close_reply["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(close_body["proved"], false);
+        assert!(close_body.get("best_prefix").is_some());
+        assert!(!close_body["remaining_goals"].as_array().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

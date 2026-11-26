@@ -682,11 +682,16 @@ pub(crate) fn query_plain_goals_for_script(
     lake_root: Option<&Path>,
     deadline: Option<Instant>,
 ) -> Result<Vec<String>, ProverError> {
+    let joined = partial_script.join("\n");
+    let mut bd = 0usize;
+    let already_has_sorry = crate::contains_standalone_sorry(&joined, &mut bd);
     let mut lines: Vec<String> = partial_script
         .iter()
         .map(|l| format!("  {l}"))
         .collect();
-    lines.push("  sorry".to_string());
+    if !already_has_sorry {
+        lines.push("  sorry".to_string());
+    }
     let body = lines.join("\n");
     let probe_src = replace_theorem_sorry(src, thm_name, &body);
     let (span_start, span_end) = target_theorem_line_span(&probe_src, thm_name);
